@@ -8,4 +8,5 @@ venv/
 bgm.mp3
 bgm_fallback.wav
 *.mp4
+outputs/
 .DS_Store
