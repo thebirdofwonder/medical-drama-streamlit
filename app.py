@@ -2516,13 +2516,21 @@ def init_state() -> None:
         if saved_ref:
             st.session_state.reference_text = saved_ref
 
-    # 読み上げ速度の既定は 1.2（未設定・異常値のときだけ）
+    # 読み上げ速度の既定は 1.2
+    # ・範囲外 → 1.2
+    # ・旧既定のままの 1.0 → 一度だけ 1.2 に更新（手動で変えた 1.5 などは残す）
     try:
         cur_speed = float(st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE))
     except (TypeError, ValueError):
         cur_speed = VOICEVOX_SPEED_SCALE
     if cur_speed < VOICEVOX_SPEED_MIN or cur_speed > VOICEVOX_SPEED_MAX:
-        st.session_state.vvox_speed_scale = VOICEVOX_SPEED_SCALE
+        st.session_state.vvox_speed_scale = float(VOICEVOX_SPEED_SCALE)
+    elif (
+        st.session_state.get("_vvox_speed_default_v12") is not True
+        and abs(cur_speed - 1.0) < 1e-9
+    ):
+        st.session_state.vvox_speed_scale = float(VOICEVOX_SPEED_SCALE)
+    st.session_state["_vvox_speed_default_v12"] = True
 
     # 声優初期値の移行（旧・青山龍星 → No.7 ノーマル）を一度だけ
     if st.session_state.get("_vvox_default_v2") is not True:
