@@ -434,6 +434,7 @@ DEFAULT_RUBY_DICT: list[tuple[str, str]] = [
 
 
 def collect_default_ruby_annotations(script: str) -> list[dict[str, str]]:
+    """辞書ルビ候補を集める。※自動付与は現在OFFのため、呼び出し元なし。"""
     found: list[dict[str, str]] = []
     for surface, reading in sorted(DEFAULT_RUBY_DICT, key=lambda x: len(x[0]), reverse=True):
         if surface in script and surface != reading:
@@ -469,7 +470,8 @@ def prepare_script_for_voicevox(
 ) -> tuple[str, int]:
     """
     音声生成直前にルビを整える。
-    enabled=True（既定）: 辞書＋追加注釈のルビを付与して返す
+    enabled=True（既定）: 追加注釈（レビュー等）のルビだけ付与して返す
+      ※辞書ルビの自動付与は行わない
     enabled=False: ルビを外した文を返す
     戻り値: (台本, ルビ件数)
     """
@@ -477,10 +479,8 @@ def prepare_script_for_voicevox(
     if not enabled:
         plain = strip_voicevox_ruby(text)
         return plain, 0
-    annotations = merge_ruby_annotations(
-        list(extra_annotations or []),
-        collect_default_ruby_annotations(text),
-    )
+    # 辞書ルビは付けない。台本に既にあるルビと、追加注釈だけ使う
+    annotations = merge_ruby_annotations(list(extra_annotations or []))
     out = apply_voicevox_ruby(text, annotations)
     return out, count_voicevox_ruby(out)
 
@@ -820,7 +820,8 @@ def heuristic_review(script: str) -> dict[str, Any]:
             "medical_contradictions": medical,
             "awkward_for_doctors": awkward,
             "immersion_improvements": immersion,
-            "ruby_annotations": collect_default_ruby_annotations(script),
+            # 辞書ルビの自動付与はOFF
+            "ruby_annotations": [],
             "mode": "heuristic",
         }
     )
@@ -886,12 +887,10 @@ def run_script_review(script: str) -> dict[str, Any]:
         result = heuristic_review(review_text)
     result["review_truncated"] = truncated
 
-    # AIのルビ + 辞書ルビを統合し、全文へ付与
+    # AIが提案したルビだけ付与（辞書ルビの自動付与はOFF）
     merged: list[dict[str, str]] = []
     seen: set[str] = set()
-    for item in (result.get("ruby_annotations") or []) + collect_default_ruby_annotations(
-        script
-    ):
+    for item in result.get("ruby_annotations") or []:
         surface = str(item.get("surface") or "").strip()
         if not surface or surface in seen:
             continue
@@ -2491,6 +2490,7 @@ def init_state() -> None:
         "final_script": "",
         "review_done": False,
         "script_confirmed": False,
+        "skip_review": False,
         "mp4_bytes": None,
         "mp4_path": "",
         "mp4_name": "medical_drama.mp4",
@@ -2548,7 +2548,7 @@ def main() -> None:
     st.title("医学ドラマ動画メーカー")
     st.write(
         "台本（テキストまたはWord）を上げると、"
-        "AIレビュー → VOICEVOX音声 → 静止画背景・BGM合成 → MP4ダウンロード、まで進めます。"
+        "（任意で）AIレビュー → VOICEVOX音声 → 静止画背景・BGM合成 → MP4ダウンロード、まで進めます。"
         "台本は30分前後の長さにも対応しています。"
     )
 
@@ -2622,6 +2622,7 @@ def main() -> None:
                 st.session_state.final_script_editor = text
                 st.session_state.review = None
                 st.session_state.review_done = False
+                st.session_state.skip_review = False
                 st.session_state.script_confirmed = False
                 st.session_state.mp4_bytes = None
                 st.session_state.mp4_path = ""
@@ -2641,14 +2642,31 @@ def main() -> None:
         with st.expander("読み込んだ台本（原文）", expanded=False):
             st.text(st.session_state.raw_script)
 
-    col1, _ = st.columns([1, 2])
-    with col1:
-        review_clicked = st.button(
-            "1. 台本をレビューする",
-            type="primary",
-            disabled=not bool(st.session_state.raw_script.strip()),
-            use_container_width=True,
+        st.markdown("**次の進め方を選んでください**")
+        st.caption(
+            "レビューする: AIが医学表現などをチェックします。"
+            "レビューしない: チェックを飛ばして動画制作へ進みます。"
         )
+        col_rev, col_skip = st.columns(2)
+        with col_rev:
+            review_clicked = st.button(
+                "1. AIで台本をレビューする",
+                type="primary",
+                disabled=not bool(st.session_state.raw_script.strip()),
+                use_container_width=True,
+                key="btn_do_review",
+            )
+        with col_skip:
+            skip_clicked = st.button(
+                "1′. レビューせずに進む",
+                type="secondary",
+                disabled=not bool(st.session_state.raw_script.strip()),
+                use_container_width=True,
+                key="btn_skip_review",
+            )
+    else:
+        review_clicked = False
+        skip_clicked = False
 
     if review_clicked:
         with st.spinner("台本をレビューしています…"):
@@ -2657,6 +2675,7 @@ def main() -> None:
                 clear_review_decision_widgets(st.session_state.get("review"))
                 st.session_state.review = run_script_review(st.session_state.raw_script)
                 st.session_state.review_done = True
+                st.session_state.skip_review = False
                 st.session_state.script_confirmed = False
                 st.session_state.mp4_bytes = None
                 st.session_state.mp4_path = ""
@@ -2674,105 +2693,165 @@ def main() -> None:
                 st.session_state.last_error = str(e)
                 st.error(f"レビューに失敗しました: {e}")
 
-    # ----- Step 2: レビュー結果と採否 -----
-    if st.session_state.review_done and st.session_state.review:
-        st.header("ステップ2: レビュー結果を確認し、最終台本を確定")
-        review = st.session_state.review
-        mode = review.get("mode", "claude")
-        if mode == "heuristic":
-            st.info(
-                "いまは簡易レビューです。"
-                "より本格的な医学チェックには Anthropic API キーを設定してください。"
-            )
-        else:
-            st.success(
-                "Claude によるレビュー結果です。"
-                "各指摘で ①承諾／②却下／③別案 を選んでください。"
-            )
-        st.caption(
-            "※医学用語・専門用語のカタカナ表記は、読み上げ誤読防止のため意図的なものとして"
-            "指摘対象外にしています。"
+    if skip_clicked:
+        clear_review_decision_widgets(st.session_state.get("review"))
+        # 辞書ルビの自動付与はOFF。アップロードした台本をそのまま使う
+        plain_script = st.session_state.raw_script
+        st.session_state.review = None
+        st.session_state.review_done = True
+        st.session_state.skip_review = True
+        st.session_state.script_confirmed = False
+        st.session_state.mp4_bytes = None
+        st.session_state.mp4_path = ""
+        st.session_state.review_apply_log = []
+        st.session_state.review_manual_log = []
+        st.session_state.last_error = ""
+        st.session_state.final_script = plain_script
+        st.session_state.final_script_editor = plain_script
+        st.success(
+            "レビューをスキップしました。下で台本を確認してください。"
         )
-        ruby_list = review.get("ruby_annotations") or []
-        if ruby_list:
+
+    # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
+    if st.session_state.review_done:
+        if st.session_state.get("skip_review"):
+            st.header("ステップ2: 最終台本を確認して確定")
             st.info(
-                f"VOICEVOX用ルビを {len(ruby_list)} 件、最終台本へ自動付与しました"
-                "（形式: {{表記|よみ}}）。下の最終台本で確認・手直しできます。"
+                "AIレビューは行っていません。"
+                "必要なら下の台本を直してから、動画制作へ進んでください。"
             )
-            with st.expander("付与したルビ一覧", expanded=False):
-                for item in ruby_list:
-                    st.write(
-                        f"- {{{item.get('surface')}|{item.get('reading')}}}"
+            st.subheader("最終台本（ここで直してから確定）")
+            if "final_script_editor" not in st.session_state:
+                st.session_state.final_script_editor = (
+                    st.session_state.final_script or st.session_state.raw_script
+                )
+            st.text_area(
+                "台本を編集できます（レビューなし）",
+                height=320,
+                key="final_script_editor",
+            )
+            if st.button("2. この台本で動画制作に進む", type="primary", key="btn_confirm_skip"):
+                edited = (st.session_state.get("final_script_editor") or "").strip()
+                if not edited:
+                    st.error("最終台本が空です。文章を入れてください。")
+                else:
+                    st.session_state.final_script = edited
+                    st.session_state.script_confirmed = True
+                    st.success("台本を確定しました。次のステップで動画を生成できます。")
+
+        elif st.session_state.review:
+            st.header("ステップ2: レビュー結果を確認し、最終台本を確定")
+            review = st.session_state.review
+            mode = review.get("mode", "claude")
+            if mode == "heuristic":
+                st.info(
+                    "いまは簡易レビューです。"
+                    "より本格的な医学チェックには Anthropic API キーを設定してください。"
+                )
+            else:
+                st.success(
+                    "Claude によるレビュー結果です。"
+                    "各指摘で ①承諾／②却下／③別案 を選んでください。"
+                )
+            st.caption(
+                "※医学用語・専門用語のカタカナ表記は、読み上げ誤読防止のため意図的なものとして"
+                "指摘対象外にしています。"
+            )
+            ruby_list = review.get("ruby_annotations") or []
+            if ruby_list:
+                st.info(
+                    f"VOICEVOX用ルビを {len(ruby_list)} 件、最終台本へ自動付与しました"
+                    "（形式: {{表記|よみ}}）。下の最終台本で確認・手直しできます。"
+                )
+                with st.expander("付与したルビ一覧", expanded=False):
+                    for item in ruby_list:
+                        st.write(
+                            f"- {{{item.get('surface')}|{item.get('reading')}}}"
+                        )
+            else:
+                st.caption("今回、追加ルビの候補はありませんでした。")
+            if review.get("review_truncated"):
+                st.warning(
+                    "台本がとても長いため、レビューは先頭部分のみです。"
+                    "最終台本は全文を確認・編集してください。"
+                )
+
+            for section_key, section_title in REVIEW_SECTION_DEFS:
+                render_review_section_interactive(
+                    section_key,
+                    section_title,
+                    review.get(section_key, []),
+                )
+
+            st.subheader("採択した内容を台本へ反映")
+            st.caption(
+                "①承諾 → 修正案をそのまま反映　／　"
+                "②却下 → 何もしない　／　"
+                "③別案 → 入力した文章で置き換え"
+            )
+            if st.button("採択・別案を台本に反映する", type="secondary"):
+                base = (
+                    st.session_state.get("final_script_editor")
+                    or st.session_state.get("final_script")
+                    or st.session_state.raw_script
+                )
+                new_text, applied, manual = apply_review_decisions_to_script(
+                    base, review
+                )
+                st.session_state.final_script = new_text
+                st.session_state.final_script_editor = new_text
+                st.session_state.review_apply_log = applied
+                st.session_state.review_manual_log = manual
+                if applied:
+                    st.success(
+                        f"{len(applied)} 件を台本に反映しました。"
+                        "下の最終台本を確認してください。"
                     )
-        else:
-            st.caption("今回、追加ルビの候補はありませんでした。")
-        if review.get("review_truncated"):
-            st.warning(
-                "台本がとても長いため、レビューは先頭部分のみです。"
-                "最終台本は全文を確認・編集してください。"
+                else:
+                    st.info(
+                        "自動反映できた項目はありません"
+                        "（却下のみ、または手修正が必要）。"
+                    )
+                if manual:
+                    st.warning(
+                        "次の項目は自動反映できませんでした。"
+                        "最終台本を手で直してください。"
+                    )
+
+            if st.session_state.get("review_apply_log"):
+                with st.expander("反映した内容", expanded=False):
+                    for line in st.session_state.review_apply_log:
+                        st.write(f"- {line}")
+            if st.session_state.get("review_manual_log"):
+                with st.expander("手修正が必要な内容", expanded=True):
+                    for line in st.session_state.review_manual_log:
+                        st.write(f"- {line}")
+
+            st.subheader("最終台本（ここで直してから確定）")
+            if "final_script_editor" not in st.session_state:
+                st.session_state.final_script_editor = (
+                    st.session_state.final_script or st.session_state.raw_script
+                )
+            st.text_area(
+                "レビューを反映した文章を編集できます",
+                height=320,
+                key="final_script_editor",
             )
 
-        for section_key, section_title in REVIEW_SECTION_DEFS:
-            render_review_section_interactive(
-                section_key,
-                section_title,
-                review.get(section_key, []),
-            )
-
-        st.subheader("採択した内容を台本へ反映")
-        st.caption(
-            "①承諾 → 修正案をそのまま反映　／　"
-            "②却下 → 何もしない　／　"
-            "③別案 → 入力した文章で置き換え"
-        )
-        if st.button("採択・別案を台本に反映する", type="secondary"):
-            base = (
-                st.session_state.get("final_script_editor")
-                or st.session_state.get("final_script")
-                or st.session_state.raw_script
-            )
-            new_text, applied, manual = apply_review_decisions_to_script(
-                base, review
-            )
-            st.session_state.final_script = new_text
-            st.session_state.final_script_editor = new_text
-            st.session_state.review_apply_log = applied
-            st.session_state.review_manual_log = manual
-            if applied:
-                st.success(f"{len(applied)} 件を台本に反映しました。下の最終台本を確認してください。")
-            else:
-                st.info("自動反映できた項目はありません（却下のみ、または手修正が必要）。")
-            if manual:
-                st.warning("次の項目は自動反映できませんでした。最終台本を手で直してください。")
-
-        if st.session_state.get("review_apply_log"):
-            with st.expander("反映した内容", expanded=False):
-                for line in st.session_state.review_apply_log:
-                    st.write(f"- {line}")
-        if st.session_state.get("review_manual_log"):
-            with st.expander("手修正が必要な内容", expanded=True):
-                for line in st.session_state.review_manual_log:
-                    st.write(f"- {line}")
-
-        st.subheader("最終台本（ここで直してから確定）")
-        if "final_script_editor" not in st.session_state:
-            st.session_state.final_script_editor = (
-                st.session_state.final_script or st.session_state.raw_script
-            )
-        st.text_area(
-            "レビューを反映した文章を編集できます",
-            height=320,
-            key="final_script_editor",
-        )
-
-        if st.button("2. この台本で動画制作に進む", type="primary"):
-            edited = (st.session_state.get("final_script_editor") or "").strip()
-            if not edited:
-                st.error("最終台本が空です。文章を入れてください。")
-            else:
-                st.session_state.final_script = edited
-                st.session_state.script_confirmed = True
-                st.success("台本を確定しました。次のステップで動画を生成できます。")
+            if st.button(
+                "2. この台本で動画制作に進む",
+                type="primary",
+                key="btn_confirm_review",
+            ):
+                edited = (st.session_state.get("final_script_editor") or "").strip()
+                if not edited:
+                    st.error("最終台本が空です。文章を入れてください。")
+                else:
+                    st.session_state.final_script = edited
+                    st.session_state.script_confirmed = True
+                    st.success(
+                        "台本を確定しました。次のステップで動画を生成できます。"
+                    )
 
     # ----- Step 3: 動画生成 -----
     if st.session_state.script_confirmed:
@@ -3033,7 +3112,7 @@ def main() -> None:
                     extra_ruby = (
                         st.session_state.review.get("ruby_annotations") or []
                     )
-                # ルビは常にON（台本には {表記|よみ} を付与）
+                # 辞書ルビは付けない。台本内の手書きルビ＋レビュー提案ルビのみ
                 voice_script, ruby_count = prepare_script_for_voicevox(
                     st.session_state.final_script,
                     extra_annotations=extra_ruby,
