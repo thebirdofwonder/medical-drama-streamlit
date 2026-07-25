@@ -923,12 +923,11 @@ def create_ending_credits_frame(
             else:
                 blocks.append(("text", p))
 
-    body_font = load_jp_font(34, bold=False)
-    heading_font = load_jp_font(42, bold=True)
+    # 全部同じ・小さめのフォント（見出しを大きくしない）
+    body_font = load_jp_font(28, bold=False)
     max_w = int(w * 0.86)
     y = int(h * 0.08)
     fill = (220, 225, 230)
-    heading_fill = (245, 245, 248)
 
     def _draw_centered(line: str, font: ImageFont.ImageFont, color: tuple[int, int, int]) -> int:
         nonlocal y
@@ -938,29 +937,29 @@ def create_ending_credits_frame(
         x = (w - tw) // 2
         draw.text((x + 2, y + 2), line, font=font, fill=(0, 0, 0))
         draw.text((x, y), line, font=font, fill=color)
-        y += th + 14
+        y += th + 12
         return th
 
     for kind, content in blocks:
         if y > h - 48:
             break
         if kind == "gap":
-            y += 48
+            y += 40
             continue
         if kind == "gap_sm":
-            y += 22
+            y += 18
             continue
         if kind == "rule":
             # 横線の上下に余白を確保（見出し・本文と絶対に重ねない）
-            y += 16
+            y += 14
             rule_w = int(w * 0.22)
             x0 = (w - rule_w) // 2
             draw.line([(x0, y), (x0 + rule_w, y)], fill=(140, 150, 165), width=2)
-            y += 44
+            y += 36
             continue
         if kind == "heading":
-            _draw_centered(content, heading_font, heading_fill)
-            y += 10
+            # 見出しも本文と同じ大きさ・同じ色
+            _draw_centered(content, body_font, fill)
             continue
         # text: 長い行は折り返し、各行を中央寄せ
         wrapped = wrap_text_to_width(content, body_font, max_w, draw) or [""]
@@ -971,7 +970,7 @@ def create_ending_credits_frame(
             if y > h - 48:
                 break
             if not line:
-                y += 12
+                y += 10
                 continue
             _draw_centered(line, body_font, fill)
 
