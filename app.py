@@ -144,18 +144,15 @@ REVIEW_SCRIPT_MAX_CHARS = 12000
 # ---------------------------------------------------------------------------
 # ユーティリティ: 台本読み込み
 # ---------------------------------------------------------------------------
-def extract_text_from_upload(uploaded_file) -> str:
-    """アップロードされた .txt / .docx からテキストを取り出す。"""
-    name = (uploaded_file.name or "").lower()
-    # getvalue() を使う（.read() は一度読むと空になり、台本が消える原因になる）
-    if hasattr(uploaded_file, "getvalue"):
-        raw = uploaded_file.getvalue()
-    else:
-        raw = uploaded_file.read()
+def extract_text_from_bytes(name: str, raw: bytes) -> str:
+    """ファイル名と中身（バイト列）から台本テキストを取り出す。"""
+    fname = (name or "").lower().strip()
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw or b"")
 
-    if name.endswith(".txt") or name.endswith(".text"):
+    if fname.endswith(".txt") or fname.endswith(".text") or fname.endswith(".md"):
         for encoding in ("utf-8", "utf-8-sig", "cp932", "shift_jis"):
             try:
                 return raw.decode(encoding)
@@ -163,7 +160,7 @@ def extract_text_from_upload(uploaded_file) -> str:
                 continue
         return raw.decode("utf-8", errors="replace")
 
-    if name.endswith(".docx"):
+    if fname.endswith(".docx"):
         doc = Document(io.BytesIO(raw))
         parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
         # 表の中の文章も拾う
@@ -175,7 +172,66 @@ def extract_text_from_upload(uploaded_file) -> str:
                         parts.append(t)
         return "\n".join(parts)
 
-    raise ValueError("対応形式は .txt または .docx のみです。")
+    raise ValueError(
+        f"対応形式は .txt または .docx のみです（受け取ったファイル: {name or '不明'}）。"
+    )
+
+
+def extract_text_from_path(path: str | Path) -> str:
+    """パソコン内のファイルパスから台本を読み込む。"""
+    p = Path(str(path).strip().strip('"').strip("'")).expanduser()
+    if not p.is_file():
+        raise FileNotFoundError(f"ファイルが見つかりません: {p}")
+    return extract_text_from_bytes(p.name, p.read_bytes())
+
+
+def pick_local_script_path() -> str:
+    """macOS のファイル選択画面を開いて、台本ファイルのパスを返す。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "ファイル選択画面を開けませんでした。"
+            "下の「パス」欄か、文章の貼り付けを使ってください。"
+        ) from e
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        path = filedialog.askopenfilename(
+            title="台本ファイルを選んでください（.txt / .docx）",
+            filetypes=[
+                ("台本（txt / docx）", "*.txt *.docx"),
+                ("テキスト", "*.txt"),
+                ("Word", "*.docx"),
+                ("すべてのファイル", "*.*"),
+            ],
+        )
+    finally:
+        root.destroy()
+    return str(path or "")
+
+
+def commit_loaded_script(text: str, source_id: str) -> None:
+    """読み込んだ台本をセッションに入れ、以降の工程を最初からにする。"""
+    clear_review_decision_widgets(st.session_state.get("review"))
+    st.session_state.raw_script = text
+    st.session_state.final_script = text
+    st.session_state.final_script_editor = text
+    st.session_state.review = None
+    st.session_state.review_done = False
+    st.session_state.skip_review = False
+    st.session_state.script_confirmed = False
+    st.session_state.mp4_bytes = None
+    st.session_state.mp4_path = ""
+    st.session_state.review_apply_log = []
+    st.session_state.review_manual_log = []
+    st.session_state._script_file_id = source_id
 
 
 # ---------------------------------------------------------------------------
@@ -2619,78 +2675,78 @@ def main() -> None:
         else:
             st.caption("キーが無いときは簡易レビューで動きます。")
 
-    # ----- Step 1: アップロード -----
-    st.header("ステップ1: 台本をアップロード")
+    # ----- Step 1: 台本を読み込む（ドラッグ＆ドロップは使わない） -----
+    st.header("ステップ1: 台本を読み込む")
     st.caption(
-        "ファイルを枠にドラッグ＆ドロップするか、「Browse files」で選んでください。"
-        "対応形式は .txt / .docx です。"
-    )
-    uploaded = st.file_uploader(
-        "台本ファイル（.txt または .docx）",
-        type=["txt", "docx"],
-        key="script_file_upload",
-        help="ファイルをここにドロップするか、クリックして選択します。",
+        "次のいずれかで台本を入れてください。.txt または .docx に対応しています。"
     )
 
-    if uploaded is not None:
-        file_id = f"{uploaded.name}-{uploaded.size}"
-        # 同じファイルを毎回読み直さない（空読み込みで台本が消えるのを防ぐ）
-        if st.session_state.get("_script_file_id") != file_id:
-            try:
-                text = extract_text_from_upload(uploaded)
+    if st.button(
+        "台本ファイルを選ぶ",
+        type="primary",
+        key="btn_pick_script_file",
+        use_container_width=True,
+    ):
+        try:
+            picked = pick_local_script_path()
+            if not picked:
+                st.warning("ファイルが選ばれませんでした。")
+            else:
+                text = extract_text_from_path(picked)
                 if not text.strip():
-                    st.error(
-                        "ファイルの中身が空でした。"
-                        "別の .txt / .docx を試すか、下の欄に文章を貼り付けてください。"
-                    )
+                    st.error("ファイルの中身が空でした。")
                 else:
-                    clear_review_decision_widgets(st.session_state.get("review"))
-                    st.session_state.raw_script = text
-                    st.session_state.final_script = text
-                    st.session_state.final_script_editor = text
-                    st.session_state.review = None
-                    st.session_state.review_done = False
-                    st.session_state.skip_review = False
-                    st.session_state.script_confirmed = False
-                    st.session_state.mp4_bytes = None
-                    st.session_state.mp4_path = ""
-                    st.session_state.review_apply_log = []
-                    st.session_state.review_manual_log = []
-                    st.session_state._script_file_id = file_id
+                    commit_loaded_script(text, f"path-{picked}-{len(text)}")
                     st.success(
-                        f"台本を読み込みました: {uploaded.name}"
+                        f"台本を読み込みました: {Path(picked).name}"
                         f"（約 {len(text):,} 字）"
                     )
-            except Exception as e:  # noqa: BLE001
-                st.error(f"ファイルの読み込みに失敗しました: {e}")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"ファイルの読み込みに失敗しました: {e}")
 
-    # ドラッグ＆ドロップが使えないとき用の予備（貼り付け）
-    with st.expander("ファイルが上げられないとき：ここに台本を貼り付け", expanded=False):
-        pasted = st.text_area(
-            "台本テキストを貼り付け",
-            height=200,
-            key="script_paste_area",
-            placeholder="ここに台本をコピー＆ペーストして、「貼り付けた台本を使う」を押してください。",
+    st.markdown("**または：ファイルの場所（パス）を貼る**")
+    path_col, path_btn_col = st.columns([3, 1])
+    with path_col:
+        local_path = st.text_input(
+            "パソコン内のファイルパス",
+            key="script_local_path",
+            placeholder="/Users/あなた/Desktop/台本.txt",
+            label_visibility="collapsed",
+            help="Finderでファイルを選んで Optionキーを押しながら右クリック →「パス名をコピー」",
         )
-        if st.button("貼り付けた台本を使う", key="btn_use_pasted_script"):
-            text = (pasted or "").strip()
-            if not text:
-                st.error("文章が空です。貼り付けてから押してください。")
+    with path_btn_col:
+        load_path_clicked = st.button(
+            "パスから読む",
+            key="btn_load_script_path",
+            use_container_width=True,
+        )
+    if load_path_clicked:
+        try:
+            text = extract_text_from_path(local_path or "")
+            if not text.strip():
+                st.error("ファイルの中身が空でした。")
             else:
-                clear_review_decision_widgets(st.session_state.get("review"))
-                st.session_state.raw_script = text
-                st.session_state.final_script = text
-                st.session_state.final_script_editor = text
-                st.session_state.review = None
-                st.session_state.review_done = False
-                st.session_state.skip_review = False
-                st.session_state.script_confirmed = False
-                st.session_state.mp4_bytes = None
-                st.session_state.mp4_path = ""
-                st.session_state.review_apply_log = []
-                st.session_state.review_manual_log = []
-                st.session_state._script_file_id = f"paste-{len(text)}"
-                st.success(f"貼り付けた台本を使います（約 {len(text):,} 字）")
+                commit_loaded_script(
+                    text, f"path-{local_path}-{len(text)}"
+                )
+                st.success(f"台本を読み込みました（約 {len(text):,} 字）")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"パスからの読み込みに失敗しました: {e}")
+
+    st.markdown("**または：文章をそのまま貼り付け**")
+    pasted = st.text_area(
+        "台本テキストを貼り付け",
+        height=180,
+        key="script_paste_area",
+        placeholder="ここに台本をコピー＆ペーストして、「貼り付けた台本を使う」を押してください。",
+    )
+    if st.button("貼り付けた台本を使う", key="btn_use_pasted_script"):
+        text = (pasted or "").strip()
+        if not text:
+            st.error("文章が空です。貼り付けてから押してください。")
+        else:
+            commit_loaded_script(text, f"paste-{len(text)}")
+            st.success(f"貼り付けた台本を使います（約 {len(text):,} 字）")
 
     if st.session_state.raw_script:
         n_chars = len(st.session_state.raw_script)
