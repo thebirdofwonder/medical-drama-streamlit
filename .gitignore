@@ -9,4 +9,5 @@ bgm.mp3
 bgm_fallback.wav
 *.mp4
 outputs/
+outputs/landscapes/
 .DS_Store

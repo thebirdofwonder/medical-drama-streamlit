@@ -24,9 +24,29 @@ from PIL import Image, ImageDraw, ImageFont
 # 定数
 # ---------------------------------------------------------------------------
 VOICEVOX_URL = "http://127.0.0.1:50021"
-SPEAKER_ID = 84  # 青山龍星
+# 初期値（UIで変更可）。声優「No.7」のノーマル
+DEFAULT_SPEAKER_ID = 29
+DEFAULT_SPEAKER_NAME = "No.7"
+DEFAULT_STYLE_NAME = "ノーマル"
 VIDEO_SIZE = (1920, 1080)
-CREDIT_TEXT = "音声: VOICEVOX 青山龍星"
+CREDIT_TEXT = f"音声\nVOICEVOX：{DEFAULT_SPEAKER_NAME}"
+# 後方互換（古いコード参照用）
+SPEAKER_ID = DEFAULT_SPEAKER_ID
+DISCLAIMER_TEXT = (
+    "本動画は、公開された症例報告を参考に制作した医学教育用フィクションです。"
+    "人物、会話、状況設定は創作であり、ナレーションには合成音声を使用しています。"
+)
+# エンディング固定文
+ENDING_FICTION_NOTICE = (
+    "本動画は医学教育用フィクションです。\n"
+    "人物・会話・状況・一部の医学的経過を改変しています。"
+)
+ENDING_FOOTER = "詳細な出典・ライセンスは動画説明欄に記載しています。"
+DEFAULT_REFERENCE_EXAMPLE = (
+    "Hashimoto E, Nagasaki K. Cureus. 2024;16(4):e58441. / CC BY 4.0"
+)
+SCENE_INTERVAL_SEC = 60.0  # 1分ごとに背景切替
+ENDING_DURATION_SEC = 10.0  # 著作権・出典表示のエンディング秒数
 BGM_FILENAME = "bgm.mp3"
 # Pixabay のフリー音源（暗め・シリアス寄り）。取得失敗時は簡易BGMを自動生成します。
 BGM_CANDIDATE_URLS = [
@@ -35,7 +55,26 @@ BGM_CANDIDATE_URLS = [
 ]
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
-MAX_VOICEVOX_CHARS = 180  # 長文を分割して送る目安（30分級向けにやや短め）
+LANDSCAPE_DIR = OUTPUT_DIR / "landscapes"
+# Unsplash のフリー利用可能な風景写真（表示用。出典はエンディングに記載推奨）
+LANDSCAPE_IMAGE_URLS = [
+    "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1469474968028-56623f02e42e?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1433086966358-54859d0ed716?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1519681393784-d120267933ba?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1475924156734-496f6cac6ec1?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1418065460487-3e41a6c84dc5?auto=format&fit=crop&w=1920&h=1080&q=80",
+    "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1920&h=1080&q=80",
+]
+# 1区間＝1字幕にするため短め（句点で区切り、長文のみここで切る）
+MAX_VOICEVOX_CHARS = 90
+# 字幕切替の時間精度（低いと最大で約 1/fps 秒ずれる）
+SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # Anthropic の現行モデル（旧 claude-sonnet-4-20250514 は引退済み）
 CLAUDE_MODEL_CANDIDATES = [
@@ -95,25 +134,53 @@ def get_api_key() -> str:
 
 def build_review_prompt(script: str) -> str:
     return f"""あなたは現役の救急・集中治療に詳しい医療監修医です。
+あわせて VOICEVOX（音声合成）向けの読み付けも行います。
 以下の医学ドラマ台本を検証し、JSONオブジェクトだけを返してください。
 前後に説明文・Markdown・コードフェンスは付けないでください。
 
 厳守ルール:
 - 有効なJSONのみ（末尾カンマ禁止）
 - 文字列内に半角ダブルクォート " を書かない（必要なら『』や「」を使う）
-- 各配列は最大5件
+- 各指摘配列は最大5件
 - original は40文字以内、issue/suggestion は120文字以内
+- suggestion は「台本にそのまま差し替える完成文」だけを書く
+  （禁止例: 「編集メモを削除する」「確定文にして」「地の文として採用」などの作業手順・解説）
+
+【最重要・禁止事項（レビュー指摘について）】
+この台本では、音声合成の誤読を防ぐため、医学用語・専門用語を意図的にカタカナ表記しています。
+したがって次は絶対に指摘しないでください（medical_contradictions / awkward_for_doctors / immersion_improvements のいずれにも含めない）:
+- 医学用語・専門用語がカタカナであること
+- カタカナを漢字に直す提案
+- 「医師なら漢字で書く」「カタカナは不自然」といった表記スタイルの指摘
+内容の医学的正しさ・現場表現・臨場感のみを見てください。
+
+【VOICEVOXルビ付与（必須）】
+読み間違えやすい漢字の医学用語・専門用語・難読語について、ruby_annotations に列挙してください。
+- surface: 台本中の表記そのもの（漢字など。すでにカタカナだけの語は原則不要）
+- reading: 正しい読み（ひらがな、またはカタカナ）
+- すでに {{表記|よみ}} 形式のものがある場合は重複させない
+- 人名の難読、薬品名、疾患名、手技名、略語の読みなどを優先（最大40件）
+- 読みは実際の医療現場の読みに合わせる（例: 心筋梗塞→しんきんこうそく）
+
+観点:
+1. medical_contradictions … 医学的に矛盾している箇所
+2. awkward_for_doctors … 現役医師が聞くと違和感がある表現（カタカナ表記そのものは対象外）
+3. immersion_improvements … 臨場感が増す修正（カタカナを漢字にする案は出さない）
+4. ruby_annotations … VOICEVOX用ルビ一覧
 
 形式:
 {{
   "medical_contradictions": [
-    {{"original": "引用", "issue": "問題", "suggestion": "修正案"}}
+    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
   ],
   "awkward_for_doctors": [
-    {{"original": "引用", "issue": "問題", "suggestion": "修正案"}}
+    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
   ],
   "immersion_improvements": [
-    {{"original": "引用", "issue": "問題", "suggestion": "修正案"}}
+    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
+  ],
+  "ruby_annotations": [
+    {{"surface": "心筋梗塞", "reading": "しんきんこうそく"}}
   ]
 }}
 
@@ -124,6 +191,148 @@ def build_review_prompt(script: str) -> str:
 {script}
 ---
 """
+
+
+def normalize_voicevox_reading(reading: str) -> str:
+    """ルビの読みから余計な記号を除く。"""
+    reading = (reading or "").strip()
+    reading = reading.replace(" ", "").replace("　", "")
+    reading = reading.replace("{", "").replace("}", "").replace("｛", "").replace("｝", "")
+    if "|" in reading:
+        reading = reading.split("|")[-1]
+    if "｜" in reading:
+        reading = reading.split("｜")[-1]
+    return reading.strip()
+
+
+def apply_voicevox_ruby(script: str, annotations: list[dict[str, str]]) -> str:
+    """
+    VOICEVOXルビ {表記|よみ} を台本へ付与する。
+    既にあるルビは壊さない。長い表記から順に置換する。
+    """
+    text = script or ""
+    if not annotations:
+        return text
+
+    protected: dict[str, str] = {}
+
+    def _protect(match: re.Match) -> str:
+        key = f"\x00RUBY{len(protected)}\x00"
+        protected[key] = match.group(0)
+        return key
+
+    def protect_existing(src: str) -> str:
+        return re.sub(r"[{｛][^|｜\n]+[|｜][^}｝\n]+[}｝]", _protect, src)
+
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in annotations:
+        surface = str(item.get("surface") or "").strip()
+        reading = normalize_voicevox_reading(str(item.get("reading") or ""))
+        if not surface or not reading:
+            continue
+        if surface in seen:
+            continue
+        if surface == reading:
+            continue
+        if len(reading) < 1:
+            continue
+        seen.add(surface)
+        pairs.append((surface, reading))
+
+    pairs.sort(key=lambda x: len(x[0]), reverse=True)
+    text = protect_existing(text)
+    for surface, reading in pairs:
+        # 直前までに付与したルビも保護し、入れ子置換を防ぐ
+        text = protect_existing(text)
+        if surface not in text:
+            continue
+        ruby = "{" + surface + "|" + reading + "}"
+        text = text.replace(surface, ruby)
+
+    for key, val in protected.items():
+        text = text.replace(key, val)
+    return text
+
+
+# 簡易モード用: よく誤読されやすい医学用語のルビ辞書（必要に応じて増やす）
+DEFAULT_RUBY_DICT: list[tuple[str, str]] = [
+    ("心筋梗塞", "しんきんこうそく"),
+    ("心不全", "しんふぜん"),
+    ("心房細動", "しんぼうさいどう"),
+    ("心室細動", "しんしつさいどう"),
+    ("心静止", "しんせいし"),
+    ("肺塞栓", "はいそくせん"),
+    ("敗血症", "はいけつしょう"),
+    ("呼吸不全", "こきゅうふぜん"),
+    ("気管内挿管", "きかんないそうかん"),
+    ("気管挿管", "きかんそうかん"),
+    ("胸骨圧迫", "きょうこつあっぱく"),
+    ("昇圧剤", "しょうあつざい"),
+    ("降圧", "こうあつ"),
+    ("輸液", "ゆえき"),
+    ("造影剤", "ぞうえいざい"),
+    ("心電図", "しんでんず"),
+    ("動脈血", "どうみゃくけつ"),
+    ("静脈血", "じょうみゃくけつ"),
+    ("酸素飽和度", "さんそほうわど"),
+    ("意識障害", "いしきしょうがい"),
+    ("昏睡", "こんすい"),
+    ("痙攣", "けいれん"),
+    ("麻痺", "まひ"),
+    ("梗塞", "こうそく"),
+    ("出血", "しゅっけつ"),
+    ("麻酔", "ますい"),
+    ("開腹", "かいふく"),
+    ("開胸", "かいきょう"),
+    ("縫合", "ほうごう"),
+    ("抜管", "ばっかん"),
+    ("挿管", "そうかん"),
+    ("透析", "とうせき"),
+    ("血糖", "けっとう"),
+    ("白血球", "はっけっきゅう"),
+    ("赤血球", "せっけっきゅう"),
+    ("血小板", "けっしょうばん"),
+    ("凝固", "ぎょうこ"),
+    ("抗凝固", "こうぎょうこ"),
+    ("抗生剤", "こうせいざい"),
+    ("抗菌薬", "こうきんやく"),
+    ("ステロイド", "ステロイド"),
+    ("アドレナリン", "アドレナリン"),
+    ("ノルアドレナリン", "ノルアドレナリン"),
+]
+
+
+def collect_default_ruby_annotations(script: str) -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+    for surface, reading in sorted(DEFAULT_RUBY_DICT, key=lambda x: len(x[0]), reverse=True):
+        if surface in script and surface != reading:
+            found.append({"surface": surface, "reading": reading})
+    return found
+
+
+def is_katakana_notation_complaint(item: dict[str, str]) -> bool:
+    """カタカナ表記そのものを問題にしている指摘なら True（除外用）。"""
+    blob = " ".join(
+        [
+            str(item.get("issue") or ""),
+            str(item.get("suggestion") or ""),
+            str(item.get("original") or ""),
+        ]
+    )
+    patterns = [
+        r"カタカナ",
+        r"漢字(に|へ|で|表記|に直|に直し|に修正|で書)",
+        r"漢字表記",
+        r"かな表記",
+        r"仮名表記",
+        r"読み仮名",
+        r"ルビ",
+        r"正式な漢字",
+        r"漢字のほうが",
+        r"漢字に(直し|変え|置換|修正)",
+    ]
+    return any(re.search(p, blob) for p in patterns)
 
 
 def strip_code_fence(text: str) -> str:
@@ -199,7 +408,8 @@ def ask_claude_fix_json(api_key: str, model: str, broken: str) -> str:
                     "次のテキストを、有効なJSONオブジェクトだけに直してください。"
                     "説明文やコードフェンスは不要です。"
                     "キーは medical_contradictions / awkward_for_doctors / "
-                    "immersion_improvements を維持してください。\n\n"
+                    "immersion_improvements / ruby_annotations を維持してください。"
+                    "医学用語のカタカナ表記を問題にする指摘があれば削除してください。\n\n"
                     f"{broken[:12000]}"
                 ),
             }
@@ -406,6 +616,7 @@ def heuristic_review(script: str) -> dict[str, Any]:
             "medical_contradictions": medical,
             "awkward_for_doctors": awkward,
             "immersion_improvements": immersion,
+            "ruby_annotations": collect_default_ruby_annotations(script),
             "mode": "heuristic",
         }
     )
@@ -418,19 +629,39 @@ def normalize_review(data: dict[str, Any]) -> dict[str, Any]:
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            out.append(
-                {
-                    "original": str(item.get("original", "")).strip(),
-                    "issue": str(item.get("issue", "")).strip(),
-                    "suggestion": str(item.get("suggestion", "")).strip(),
-                }
-            )
+            original = str(item.get("original", "")).strip()
+            raw_suggestion = str(item.get("suggestion", "")).strip()
+            cleaned = clean_script_replacement_text(raw_suggestion, original)
+            normalized = {
+                "original": original,
+                "issue": str(item.get("issue", "")).strip(),
+                # 解説付き修正案は本文だけ残す（反映ミス防止）
+                "suggestion": cleaned or raw_suggestion,
+                "suggestion_raw": raw_suggestion,
+            }
+            # カタカナ医学用語の表記指摘は採用しない
+            if is_katakana_notation_complaint(normalized):
+                continue
+            out.append(normalized)
         return out
+
+    ruby_out: list[dict[str, str]] = []
+    seen_surface: set[str] = set()
+    for item in data.get("ruby_annotations", []) or []:
+        if not isinstance(item, dict):
+            continue
+        surface = str(item.get("surface", "")).strip()
+        reading = normalize_voicevox_reading(str(item.get("reading", "")))
+        if not surface or not reading or surface in seen_surface:
+            continue
+        seen_surface.add(surface)
+        ruby_out.append({"surface": surface, "reading": reading})
 
     return {
         "medical_contradictions": _items("medical_contradictions"),
         "awkward_for_doctors": _items("awkward_for_doctors"),
         "immersion_improvements": _items("immersion_improvements"),
+        "ruby_annotations": ruby_out,
         "mode": data.get("mode", "claude"),
     }
 
@@ -450,6 +681,25 @@ def run_script_review(script: str) -> dict[str, Any]:
     else:
         result = heuristic_review(review_text)
     result["review_truncated"] = truncated
+
+    # AIのルビ + 辞書ルビを統合し、全文へ付与
+    merged: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in (result.get("ruby_annotations") or []) + collect_default_ruby_annotations(
+        script
+    ):
+        surface = str(item.get("surface") or "").strip()
+        if not surface or surface in seen:
+            continue
+        seen.add(surface)
+        merged.append(
+            {
+                "surface": surface,
+                "reading": normalize_voicevox_reading(str(item.get("reading") or "")),
+            }
+        )
+    result["ruby_annotations"] = merged
+    result["script_with_ruby"] = apply_voicevox_ruby(script, merged)
     return result
 
 
@@ -466,12 +716,109 @@ def check_voicevox() -> tuple[bool, str]:
         return False, str(e)
 
 
+def fetch_voicevox_speakers() -> list[dict[str, Any]]:
+    """
+    VOICEVOXにインストール済み（ダウンロード済み）の声優一覧を取得。
+    各要素: {name, speaker_uuid, styles: [{name, id, type}, ...]}
+    """
+    try:
+        r = requests.get(f"{VOICEVOX_URL}/speakers", timeout=8)
+    except requests.RequestException as e:
+        raise RuntimeError(f"VOICEVOXの声優一覧を取得できません: {e}") from e
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"VOICEVOXの声優一覧取得に失敗: HTTP {r.status_code} / {r.text[:200]}"
+        )
+    data = r.json()
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("VOICEVOXに利用可能な声優がありません。")
+    return data
+
+
+def talk_styles_for_speaker(speaker: dict[str, Any]) -> list[dict[str, Any]]:
+    """読み上げ用スタイルだけ（歌唱などは除外）。"""
+    styles = speaker.get("styles") or []
+    talk = [
+        s
+        for s in styles
+        if isinstance(s, dict)
+        and s.get("id") is not None
+        and str(s.get("type") or "talk") == "talk"
+    ]
+    if talk:
+        return talk
+    # type が無い古いエンジン向け
+    return [s for s in styles if isinstance(s, dict) and s.get("id") is not None]
+
+
+def format_voicevox_credit(speaker_name: str, style_name: str = "") -> str:
+    """エンディング用。声調名は表示せず、選択した声優名だけを出す。"""
+    _ = style_name
+    name = (speaker_name or "").strip() or DEFAULT_SPEAKER_NAME
+    return f"VOICEVOX：{name}"
+
+
+def build_ending_credits_text(reference_text: str, speaker_name: str) -> str:
+    """
+    エンディング全文を組み立てる。
+    参考文献ラベルは「参考文献」（医学的参考文献 ではない）。
+    音声行は選択した声優名。
+    """
+    ref = (reference_text or "").strip()
+    if not ref:
+        ref = "（参考文献未入力）"
+    voice_line = format_voicevox_credit(speaker_name)
+    return "\n".join(
+        [
+            ENDING_FICTION_NOTICE,
+            "----------",
+            "参考文献",
+            ref,
+            "----------",
+            "音声",
+            voice_line,
+            "",
+            ENDING_FOOTER,
+        ]
+    )
+
+
+def resolve_default_voice_selection(
+    speakers: list[dict[str, Any]],
+) -> tuple[str, str, int]:
+    """
+    初期選択: できれば No.7 ＋ ノーマル。無ければ先頭の声優＋ノーマル優先。
+    戻り値: (声優名, 声調名, style_id)
+    """
+    by_name = {str(s.get("name") or ""): s for s in speakers}
+    speaker = by_name.get(DEFAULT_SPEAKER_NAME) or speakers[0]
+    speaker_name = str(speaker.get("name") or DEFAULT_SPEAKER_NAME)
+    styles = talk_styles_for_speaker(speaker)
+    if not styles:
+        raise RuntimeError(f"「{speaker_name}」に読み上げ用の声調がありません。")
+    preferred = (DEFAULT_STYLE_NAME, "ノーマル")
+    style = None
+    for want in preferred:
+        for s in styles:
+            if str(s.get("name") or "") == want:
+                style = s
+                break
+        if style is not None:
+            break
+    if style is None:
+        style = styles[0]
+    return speaker_name, str(style.get("name") or "ノーマル"), int(style["id"])
+
+
 def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> list[str]:
-    """句点などで区切り、長すぎる場合はさらに分割。"""
+    """
+    句点単位で分割する（文章同士はくっつけない）。
+    理由: 1音声区間＝1字幕にすると、読み上げと表示がズレにくい。
+    1文が長すぎるときだけ max_chars でさらに切る。
+    """
     text = text.replace("\r\n", "\n").strip()
     if not text:
         return []
-    # 空行は短い間として扱う
     blocks = re.split(r"\n+", text)
     chunks: list[str] = []
     for block in blocks:
@@ -479,29 +826,36 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
         if not block:
             continue
         parts = re.split(r"(?<=[。！？!?])", block)
-        buf = ""
         for part in parts:
             part = part.strip()
             if not part:
                 continue
-            if len(buf) + len(part) <= max_chars:
-                buf += part
+            if len(part) <= max_chars:
+                chunks.append(part)
             else:
+                # 読点などでも切れなければ、文字数で強制分割
+                buf = ""
+                for piece in re.split(r"(?<=[、,，])", part):
+                    piece = piece.strip()
+                    if not piece:
+                        continue
+                    if len(buf) + len(piece) <= max_chars:
+                        buf += piece
+                    else:
+                        if buf:
+                            chunks.append(buf)
+                        if len(piece) <= max_chars:
+                            buf = piece
+                        else:
+                            for i in range(0, len(piece), max_chars):
+                                chunks.append(piece[i : i + max_chars])
+                            buf = ""
                 if buf:
                     chunks.append(buf)
-                if len(part) <= max_chars:
-                    buf = part
-                else:
-                    # さらに強制分割
-                    for i in range(0, len(part), max_chars):
-                        chunks.append(part[i : i + max_chars])
-                    buf = ""
-        if buf:
-            chunks.append(buf)
     return chunks
 
 
-def synthesize_wav_bytes(text: str, speaker: int = SPEAKER_ID) -> bytes:
+def synthesize_wav_bytes(text: str, speaker: int = DEFAULT_SPEAKER_ID) -> bytes:
     q = requests.post(
         f"{VOICEVOX_URL}/audio_query",
         params={"text": text, "speaker": speaker},
@@ -553,14 +907,91 @@ def concat_wav_files(wav_paths: list[Path], out_path: Path, pause_ms: int = 350)
     return out_path
 
 
+def strip_voicevox_ruby(text: str) -> str:
+    """
+    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ を外し、
+    人間が自然に読める表記だけ残す。
+    """
+    if not text:
+        return ""
+    return re.sub(
+        r"[{｛]([^|｜\n]+)[|｜][^}｝\n]+[}｝]",
+        r"\1",
+        text,
+    )
+
+
+def create_subtitle_png(text: str, path: Path) -> Path:
+    """画面下部中央に載せる字幕PNG（透過・縁取り）。"""
+    w, h = VIDEO_SIZE
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = load_jp_font(52, bold=True)
+    lines = wrap_text_to_width((text or "").strip(), font, int(w * 0.86), draw)[:3]
+    if not lines:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(path, format="PNG")
+        return path
+
+    line_sizes = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_sizes.append((bbox[2] - bbox[0], bbox[3] - bbox[1]))
+    pad_x, pad_y = 28, 18
+    box_w = max(s[0] for s in line_sizes) + pad_x * 2
+    box_h = sum(s[1] for s in line_sizes) + 12 * (len(lines) - 1) + pad_y * 2
+    box_x = (w - box_w) // 2
+    # 注意書きより上
+    box_y = int(h * 0.72) - box_h
+
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    try:
+        od.rounded_rectangle(
+            [box_x, box_y, box_x + box_w, box_y + box_h],
+            radius=16,
+            fill=(0, 0, 0, 160),
+        )
+    except Exception:
+        od.rectangle(
+            [box_x, box_y, box_x + box_w, box_y + box_h],
+            fill=(0, 0, 0, 160),
+        )
+    img = Image.alpha_composite(img, overlay)
+    draw = ImageDraw.Draw(img)
+
+    y = box_y + pad_y
+    for line, (lw, lh) in zip(lines, line_sizes):
+        x = (w - lw) // 2
+        draw_outlined_text(
+            draw,
+            (x, y),
+            line,
+            font,
+            fill=(255, 255, 255),
+            outline=(0, 0, 0),
+            outline_width=4,
+        )
+        y += lh + 12
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path, format="PNG")
+    return path
+
+
 def generate_narration_wav_to_file(
     script: str,
     out_wav: Path,
     progress_callback=None,
-) -> Path:
+    pause_ms: int = 280,
+    speaker: int = DEFAULT_SPEAKER_ID,
+) -> tuple[Path, list[dict[str, Any]]]:
     """
-    長い台本（30分前後）向け: 分割してVOICEVOXへ送り、1本のWAVに結合する。
-    progress_callback(done, total) があれば進捗を伝える。
+    長い台本向け: VOICEVOXで音声生成し、字幕用タイミングも返す。
+    1音声区間＝1字幕（開始・終了はWAVの実時間）なので音声とズレにくい。
+    戻り値: (wavパス, 字幕キュー[{start,end,text}, ...])
+    text はルビを外した人間向け表記。
+    speaker: VOICEVOXの style_id（APIでは speaker という名前）
     """
     chunks = split_text_for_voicevox(script)
     if not chunks:
@@ -570,17 +1001,40 @@ def generate_narration_wav_to_file(
     part_dir = out_wav.parent / "_voice_parts"
     part_dir.mkdir(parents=True, exist_ok=True)
     part_paths: list[Path] = []
+    subtitle_cues: list[dict[str, Any]] = []
+    t = 0.0
+    pause_sec = max(0.0, pause_ms / 1000.0)
 
     try:
         for i, chunk in enumerate(chunks):
             if progress_callback:
                 progress_callback(i, len(chunks))
             part = part_dir / f"part_{i:05d}.wav"
-            part.write_bytes(synthesize_wav_bytes(chunk))
+            part.write_bytes(synthesize_wav_bytes(chunk, speaker=speaker))
             part_paths.append(part)
+            with wave.open(str(part), "rb") as w:
+                dur = w.getnframes() / float(w.getframerate())
+            display = strip_voicevox_ruby(chunk).strip()
+            if display and dur > 0:
+                # 区間の実時間そのまま（文字数按分はしない＝ズレ防止）
+                subtitle_cues.append(
+                    {"start": t, "end": t + dur, "text": display}
+                )
+            t += dur
+            if i < len(chunks) - 1:
+                t += pause_sec
         if progress_callback:
             progress_callback(len(chunks), len(chunks))
-        concat_wav_files(part_paths, out_wav)
+        concat_wav_files(part_paths, out_wav, pause_ms=pause_ms)
+
+        # 連結後の実時間に合わせて、ごく小さい誤差を補正
+        with wave.open(str(out_wav), "rb") as w:
+            actual_dur = w.getnframes() / float(w.getframerate())
+        if subtitle_cues and t > 0 and abs(actual_dur - t) > 0.01:
+            scale = actual_dur / t
+            for cue in subtitle_cues:
+                cue["start"] = float(cue["start"]) * scale
+                cue["end"] = float(cue["end"]) * scale
     finally:
         for p in part_paths:
             try:
@@ -591,7 +1045,7 @@ def generate_narration_wav_to_file(
             part_dir.rmdir()
         except OSError:
             pass
-    return out_wav
+    return out_wav, subtitle_cues
 
 
 def generate_narration_wav(script: str) -> bytes:
@@ -737,6 +1191,365 @@ def paste_centered(
     base.paste(overlay, (x, y), overlay)
 
 
+def _dark_gradient_base(accent: tuple[int, int, int] = (20, 50, 80)) -> Image.Image:
+    """著作権フリーの暗い医療背景ベース（自作図形のみ）。"""
+    w, h = VIDEO_SIZE
+    img = Image.new("RGB", (w, h), (6, 10, 18))
+    draw = ImageDraw.Draw(img)
+    ar, ag, ab = accent
+    for y in range(h):
+        t = y / max(h - 1, 1)
+        r = int(6 + ar * 0.35 * t)
+        g = int(10 + ag * 0.35 * t)
+        b = int(18 + ab * 0.45 * t)
+        draw.line([(0, y), (w, y)], fill=(r, g, b))
+    return img
+
+
+def _draw_ecg_wave(draw: ImageDraw.ImageDraw, y0: int, color=(80, 220, 160)) -> None:
+    w, _ = VIDEO_SIZE
+    points = []
+    x = 80
+    while x < w - 80:
+        points.extend(
+            [
+                (x, y0),
+                (x + 20, y0),
+                (x + 28, y0 - 18),
+                (x + 36, y0 + 70),
+                (x + 44, y0 - 90),
+                (x + 52, y0 + 20),
+                (x + 60, y0),
+                (x + 100, y0),
+            ]
+        )
+        x += 120
+    if len(points) >= 2:
+        draw.line(points, fill=color, width=3)
+
+
+def draw_medical_scene(theme: str) -> Image.Image:
+    """シンプルな医学イメージを自作（写真不使用＝著作権フリー）。"""
+    w, h = VIDEO_SIZE
+    themes = {
+        "er": ((40, 20, 30), "救急・初療"),
+        "icu": ((15, 35, 55), "集中治療"),
+        "surgery": ((25, 25, 40), "手術・処置"),
+        "lab": ((20, 40, 45), "検査・画像"),
+        "ward": ((25, 35, 30), "病棟・経過"),
+        "consult": ((35, 30, 45), "説明・決断"),
+        "pharma": ((30, 40, 35), "治療・投与"),
+        "ambulance": ((45, 25, 25), "搬送・現場"),
+    }
+    accent, label = themes.get(theme, themes["icu"])
+    img = _dark_gradient_base(accent)
+    draw = ImageDraw.Draw(img)
+    cx, cy = w // 2, int(h * 0.42)
+
+    if theme == "er":
+        draw.rectangle([cx - 420, cy - 220, cx + 420, cy + 220], outline=(180, 60, 70), width=4)
+        draw.line([(cx - 200, cy), (cx + 200, cy)], fill=(200, 70, 80), width=6)
+        draw.line([(cx, cy - 160), (cx, cy + 160)], fill=(200, 70, 80), width=6)
+        _draw_ecg_wave(draw, cy + 40, (220, 120, 120))
+    elif theme == "icu":
+        draw.ellipse([cx - 260, cy - 260, cx + 260, cy + 260], outline=(50, 120, 160), width=3)
+        draw.rectangle([cx - 380, cy - 200, cx + 380, cy + 200], outline=(70, 140, 180), width=3)
+        _draw_ecg_wave(draw, cy, (80, 220, 180))
+        for i, val in enumerate(["HR", "BP", "SpO2"]):
+            x = cx - 300 + i * 220
+            draw.text((x, cy + 120), val, fill=(160, 200, 220), font=load_jp_font(36, bold=True))
+    elif theme == "surgery":
+        draw.ellipse([cx - 180, cy - 120, cx + 180, cy + 120], outline=(200, 200, 210), width=5)
+        draw.arc([cx - 280, cy - 200, cx + 280, cy + 200], 200, 340, fill=(160, 170, 190), width=8)
+        draw.line([(cx - 40, cy - 40), (cx + 120, cy + 80)], fill=(210, 210, 220), width=5)
+    elif theme == "lab":
+        for i in range(3):
+            x0 = cx - 420 + i * 300
+            draw.rectangle([x0, cy - 180, x0 + 240, cy + 180], outline=(100, 180, 190), width=3)
+            draw.line([(x0 + 20, cy - 100), (x0 + 220, cy + 100)], fill=(80, 150, 160), width=2)
+            draw.line([(x0 + 20, cy + 80), (x0 + 220, cy - 60)], fill=(80, 150, 160), width=2)
+    elif theme == "ward":
+        try:
+            draw.rounded_rectangle(
+                [cx - 400, cy - 40, cx + 400, cy + 120],
+                radius=30,
+                outline=(90, 140, 110),
+                width=4,
+            )
+        except Exception:
+            draw.rectangle([cx - 400, cy - 40, cx + 400, cy + 120], outline=(90, 140, 110), width=4)
+        draw.rectangle([cx - 380, cy - 160, cx - 300, cy - 40], outline=(90, 140, 110), width=3)
+        _draw_ecg_wave(draw, cy - 100, (100, 190, 140))
+    elif theme == "consult":
+        draw.ellipse([cx - 320, cy - 80, cx - 120, cy + 120], outline=(160, 140, 200), width=4)
+        draw.ellipse([cx + 120, cy - 80, cx + 320, cy + 120], outline=(140, 160, 210), width=4)
+        draw.line([(cx - 100, cy + 20), (cx + 100, cy + 20)], fill=(170, 160, 200), width=3)
+    elif theme == "pharma":
+        draw.line([(cx - 80, cy - 220), (cx - 80, cy + 200)], fill=(140, 190, 160), width=6)
+        draw.polygon(
+            [(cx - 40, cy - 180), (cx + 80, cy - 180), (cx + 60, cy - 40), (cx - 20, cy - 40)],
+            outline=(140, 190, 160),
+        )
+        draw.ellipse([cx + 40, cy + 40, cx + 160, cy + 160], outline=(140, 190, 160), width=4)
+    elif theme == "ambulance":
+        try:
+            draw.rounded_rectangle(
+                [cx - 360, cy - 80, cx + 360, cy + 160],
+                radius=40,
+                outline=(200, 80, 80),
+                width=5,
+            )
+        except Exception:
+            draw.rectangle([cx - 360, cy - 80, cx + 360, cy + 160], outline=(200, 80, 80), width=5)
+        draw.rectangle([cx + 80, cy - 80, cx + 360, cy + 40], outline=(200, 80, 80), width=4)
+        draw.ellipse([cx - 220, cy + 120, cx - 100, cy + 240], outline=(200, 120, 120), width=4)
+        draw.ellipse([cx + 100, cy + 120, cx + 220, cy + 240], outline=(200, 120, 120), width=4)
+    else:
+        _draw_ecg_wave(draw, cy, (80, 200, 180))
+
+    label_font = load_jp_font(42, bold=True)
+    # 場面ラベル（病棟・経過など）は表示しない
+    _ = label
+    _ = label_font
+    return img.convert("RGBA")
+
+
+THEME_KEYWORDS: dict[str, list[str]] = {
+    "er": ["救急", "ER", "ショック", "心肺停止", "CPA", "挿管", "外傷", "一次評価", "トリアージ"],
+    "icu": ["ICU", "集中治療", "モニター", "人工呼吸", "昇圧", "敗血症", "鎮静", "カテコラミン"],
+    "surgery": ["手術", "オペ", "開胸", "開腹", "麻酔", "執刀", "縫合", "ドレーン"],
+    "lab": ["検査", "採血", "CT", "MRI", "レントゲン", "培養", "病理", "エコー", "画像"],
+    "ward": ["病棟", "回診", "退院", "入院", "経過", "ナース", "ベッド"],
+    "consult": ["説明", "同意", "家族", "インフォームド", "外来", "決断", "選択"],
+    "pharma": ["投与", "点滴", "抗生", "抗菌", "薬", "輸液", "ステロイド", "抗凝固"],
+    "ambulance": ["救急隊", "救急車", "現場", "ドクターカー", "搬送", "通報"],
+}
+THEME_CYCLE = ["er", "icu", "lab", "consult", "pharma", "surgery", "ward", "ambulance"]
+
+
+def infer_theme_from_text(segment: str, index: int) -> str:
+    text = segment or ""
+    scores = {k: 0 for k in THEME_KEYWORDS}
+    for theme, words in THEME_KEYWORDS.items():
+        for word in words:
+            if word in text:
+                scores[theme] += 1
+    best = max(scores, key=lambda k: scores[k])
+    if scores[best] == 0:
+        return THEME_CYCLE[index % len(THEME_CYCLE)]
+    return best
+
+
+def split_script_for_scenes(script: str, n_scenes: int) -> list[str]:
+    text = (script or "").strip()
+    if n_scenes <= 1:
+        return [text]
+    if not text:
+        return [""] * n_scenes
+    paras = [p for p in re.split(r"\n+", text) if p.strip()]
+    if len(paras) >= n_scenes:
+        buckets = [""] * n_scenes
+        for i, p in enumerate(paras):
+            idx = min(i * n_scenes // len(paras), n_scenes - 1)
+            buckets[idx] += (("\n" if buckets[idx] else "") + p)
+        return buckets
+    size = max(1, len(text) // n_scenes)
+    parts = []
+    for i in range(n_scenes):
+        start = i * size
+        end = len(text) if i == n_scenes - 1 else (i + 1) * size
+        parts.append(text[start:end])
+    return parts
+
+
+
+def make_fallback_landscape(index: int) -> Image.Image:
+    """ダウンロード失敗時の控えめな風景風グラデーション。"""
+    accents = [
+        (30, 60, 100),
+        (40, 70, 50),
+        (70, 50, 40),
+        (50, 50, 80),
+        (35, 55, 70),
+    ]
+    return _dark_gradient_base(accents[index % len(accents)]).convert("RGB")
+
+
+def ensure_landscape_images(needed: int) -> list[Path]:
+    """
+    著作権フリーの風景画像を取得してキャッシュする。
+    足りない分はネットから取得。失敗時は自作グラデーション。
+    """
+    LANDSCAPE_DIR.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    n = max(1, int(needed))
+    for i in range(n):
+        out = LANDSCAPE_DIR / f"landscape_{i:03d}.jpg"
+        if out.exists() and out.stat().st_size > 8000:
+            paths.append(out)
+            continue
+        url = LANDSCAPE_IMAGE_URLS[i % len(LANDSCAPE_IMAGE_URLS)]
+        ok = False
+        try:
+            r = http_session_direct().get(url, timeout=60, allow_redirects=True)
+            if r.status_code == 200 and len(r.content) > 8000:
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if "html" not in ctype:
+                    with Image.open(io.BytesIO(r.content)) as im:
+                        im.load()
+                    out.write_bytes(r.content)
+                    ok = True
+        except Exception:
+            ok = False
+        if not ok:
+            img = make_fallback_landscape(i)
+            img.save(out, format="JPEG", quality=90)
+        paths.append(out)
+    return paths
+
+
+def plan_scene_schedule(script: str, total_duration: float) -> list[dict[str, Any]]:
+    """約1分ごとに風景背景を切り替えるスケジュール。"""
+    total_duration = max(float(total_duration), 1.0)
+    n = max(1, int((total_duration + SCENE_INTERVAL_SEC - 0.01) // SCENE_INTERVAL_SEC))
+    segments = split_script_for_scenes(script, n)
+    schedule = []
+    for i in range(n):
+        start = i * SCENE_INTERVAL_SEC
+        end = min((i + 1) * SCENE_INTERVAL_SEC, total_duration)
+        dur = max(0.5, end - start)
+        schedule.append(
+            {
+                "index": i,
+                "landscape_index": i,
+                "duration": dur,
+                "segment": segments[i] if i < len(segments) else "",
+            }
+        )
+    spent = sum(s["duration"] for s in schedule[:-1]) if len(schedule) > 1 else 0
+    if schedule:
+        schedule[-1]["duration"] = max(0.5, total_duration - spent)
+    return schedule
+
+
+
+def create_scene_frame(
+    path: Path,
+    landscape_path: Path | None = None,
+    title: str = "",
+    title_img: Image.Image | None = None,
+    show_title: bool = True,
+    disclaimer: str = DISCLAIMER_TEXT,
+    landscape_index: int = 0,
+) -> Path:
+    """
+    風景写真背景＋タイトル＋注意書き。
+    本編には VOICEVOX クレジット・サブタイトル・場面ラベルを出さない。
+    """
+    w, h = VIDEO_SIZE
+    if landscape_path is not None and Path(landscape_path).exists():
+        try:
+            photo = Image.open(landscape_path).convert("RGB")
+            base = fit_image_cover(photo, VIDEO_SIZE).convert("RGBA")
+        except Exception:
+            base = make_fallback_landscape(landscape_index).convert("RGBA")
+    else:
+        base = make_fallback_landscape(landscape_index).convert("RGBA")
+
+    # 下部を少し暗くして注意書きを読みやすく
+    shade = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shade)
+    sd.rectangle([0, int(h * 0.82), w, h], fill=(0, 0, 0, 140))
+    if show_title:
+        sd.rectangle([0, 0, w, int(h * 0.28)], fill=(0, 0, 0, 70))
+    base = Image.alpha_composite(base, shade)
+    draw = ImageDraw.Draw(base)
+
+    if show_title:
+        if title_img is not None:
+            paste_centered(
+                base,
+                title_img,
+                max_width_ratio=0.92,
+                max_height_ratio=0.28,
+                y_ratio=0.06,
+            )
+            draw = ImageDraw.Draw(base)
+        else:
+            max_text_w = int(w * 0.88)
+            title = (title or "").strip() or "医学ドラマ"
+            title_font = load_jp_font(88, bold=True)
+            pink = (255, 80, 160)
+            y_cursor = int(h * 0.08)
+            for line in wrap_text_to_width(title, title_font, max_text_w, draw)[:3]:
+                bbox = draw.textbbox((0, 0), line, font=title_font)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+                draw_outlined_text(
+                    draw,
+                    ((w - tw) // 2, y_cursor),
+                    line,
+                    title_font,
+                    fill=pink,
+                    outline=(0, 0, 0),
+                    outline_width=8,
+                )
+                y_cursor += th + 14
+
+    # 注意書きのみ（一番下）。VOICEVOXクレジットは本編に出さない
+    margin = 36
+    disc_font = load_jp_font(22, bold=False)
+    disc = (disclaimer or DISCLAIMER_TEXT).strip()
+    disc_lines = wrap_text_to_width(disc, disc_font, int(w * 0.94), draw)
+    y_disc = h - margin
+    for line in reversed(disc_lines[-3:]):
+        bbox = draw.textbbox((0, 0), line, font=disc_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        y_disc -= th + 4
+        x = (w - tw) // 2
+        draw.text((x + 1, y_disc + 1), line, font=disc_font, fill=(0, 0, 0))
+        draw.text((x, y_disc), line, font=disc_font, fill=(210, 215, 220))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base.convert("RGB").save(path, format="PNG")
+    return path
+
+
+def create_ending_credits_frame(
+    path: Path,
+    ending_text: str,
+    voicevox_credit: str = CREDIT_TEXT,
+) -> Path:
+    """エンディング約10秒用。フィクション表示・参考文献・音声クレジットを表示。"""
+    _ = voicevox_credit  # 本文に含める想定のため、二重描画しない
+    w, h = VIDEO_SIZE
+    img = _dark_gradient_base((20, 25, 40))
+    draw = ImageDraw.Draw(img)
+
+    body = (ending_text or "").strip()
+    if not body:
+        body = "（エンディング文未設定）"
+
+    body_font = load_jp_font(34, bold=False)
+    y = int(h * 0.10)
+    max_w = int(w * 0.88)
+    for line in wrap_text_to_width(body, body_font, max_w, draw)[:22]:
+        bbox = draw.textbbox((0, 0), line, font=body_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        x = (w - tw) // 2
+        draw.text((x + 2, y + 2), line, font=body_font, fill=(0, 0, 0))
+        draw.text((x, y), line, font=body_font, fill=(210, 215, 220))
+        y += th + 8
+        if y > h - 40:
+            break
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.convert("RGB").save(path, format="PNG")
+    return path
+
+
 def create_background_image(
     path: Path,
     title: str = "",
@@ -746,140 +1559,19 @@ def create_background_image(
     footnote_text: str = "",
     voicevox_credit: str = CREDIT_TEXT,
 ) -> Path:
-    """
-    YouTube向け静止画フレームを作る。
-    - 背景: アップロード画像 or 自動生成の暗い医療ドラマ背景
-    - タイトル: アップロード画像優先。無ければ文字タイトル
-    - 脚注: 出典テキスト（著作権表示）
-    - 右下: VOICEVOX クレジット（消さない）
-    """
-    w, h = VIDEO_SIZE
+    _ = background_img
+    _ = footnote_text
+    _ = subtitle
+    _ = voicevox_credit
+    return create_scene_frame(
+        path,
+        landscape_path=None,
+        title=title,
+        title_img=title_img,
+        show_title=True,
+        landscape_index=0,
+    )
 
-    if background_img is not None:
-        base = fit_image_cover(background_img.convert("RGB"), VIDEO_SIZE).convert("RGBA")
-        # 文字を読みやすくするため薄い暗幕
-        shade = Image.new("RGBA", (w, h), (0, 0, 0, 90))
-        base = Image.alpha_composite(base, shade)
-    else:
-        img = Image.new("RGB", (w, h), (8, 12, 22))
-        draw_tmp = ImageDraw.Draw(img)
-        for y in range(h):
-            t = y / max(h - 1, 1)
-            r = int(6 + 18 * t)
-            g = int(10 + 28 * t)
-            b = int(20 + 40 * t)
-            draw_tmp.line([(0, y), (w, y)], fill=(r, g, b))
-        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        od = ImageDraw.Draw(overlay)
-        cx, cy = w // 2, int(h * 0.42)
-        for radius, alpha in ((520, 28), (360, 40), (200, 55)):
-            od.ellipse(
-                [cx - radius, cy - radius, cx + radius, cy + radius],
-                fill=(30, 80, 120, alpha),
-            )
-        base = Image.alpha_composite(img.convert("RGBA"), overlay)
-        draw_tmp = ImageDraw.Draw(base.convert("RGB"))
-        # 水平線は RGB 版に描いて戻す
-        rgb = base.convert("RGB")
-        d2 = ImageDraw.Draw(rgb)
-        for i in range(8):
-            yy = int(h * 0.25) + i * 70
-            d2.line([(80, yy), (w - 80, yy)], fill=(40, 70, 90), width=1)
-        base = rgb.convert("RGBA")
-
-    draw = ImageDraw.Draw(base)
-
-    # タイトル画像があれば優先
-    if title_img is not None:
-        paste_centered(
-            base,
-            title_img,
-            max_width_ratio=0.92,
-            max_height_ratio=0.38,
-            y_ratio=0.06,
-        )
-        draw = ImageDraw.Draw(base)
-    else:
-        max_text_w = int(w * 0.88)
-        title = (title or "").strip() or "医学ドラマ"
-        subtitle = (subtitle or "").strip()
-        title_font = load_jp_font(92, bold=True)
-        sub_font = load_jp_font(64, bold=True)
-        pink = (255, 80, 160)
-        yellow = (255, 230, 60)
-        cyan = (80, 210, 255)
-
-        title_lines = wrap_text_to_width(title, title_font, max_text_w, draw)
-        y_cursor = int(h * 0.10)
-        for line in title_lines[:4]:
-            bbox = draw.textbbox((0, 0), line, font=title_font)
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-            x = (w - tw) // 2
-            draw_outlined_text(
-                draw,
-                (x, y_cursor),
-                line,
-                title_font,
-                fill=pink,
-                outline=(0, 0, 0),
-                outline_width=8,
-            )
-            y_cursor += th + 18
-
-        if subtitle:
-            sub_lines = wrap_text_to_width(subtitle, sub_font, max_text_w, draw)
-            y_sub = int(h * 0.58)
-            for i, line in enumerate(sub_lines[:4]):
-                bbox = draw.textbbox((0, 0), line, font=sub_font)
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
-                x = (w - tw) // 2
-                color = yellow if i % 2 == 0 else cyan
-                draw_outlined_text(
-                    draw,
-                    (x, y_sub),
-                    line,
-                    sub_font,
-                    fill=color,
-                    outline=(0, 0, 0),
-                    outline_width=7,
-                )
-                y_sub += th + 14
-
-    # --- 脚注（出典・著作権表示）左下 ---
-    footnote = (footnote_text or "").strip()
-    footnote_font = load_jp_font(28, bold=False)
-    margin = 40
-    y_foot = h - margin - 80
-    if footnote:
-        foot_lines = wrap_text_to_width(footnote, footnote_font, int(w * 0.62), draw)
-        # 下から積み上げ
-        line_heights = []
-        for line in foot_lines[-6:]:
-            bbox = draw.textbbox((0, 0), line, font=footnote_font)
-            line_heights.append(bbox[3] - bbox[1] + 6)
-        total_h = sum(line_heights) if line_heights else 0
-        y = h - margin - 50 - total_h
-        for line in foot_lines[-6:]:
-            draw.text((margin + 2, y + 2), line, font=footnote_font, fill=(0, 0, 0))
-            draw.text((margin, y), line, font=footnote_font, fill=(200, 205, 210))
-            bbox = draw.textbbox((0, 0), line, font=footnote_font)
-            y += bbox[3] - bbox[1] + 6
-
-    # --- VOICEVOX クレジット（消さない）右下 ---
-    credit_font = load_jp_font(36, bold=False)
-    credit = (voicevox_credit or CREDIT_TEXT).strip() or CREDIT_TEXT
-    bbox = draw.textbbox((0, 0), credit, font=credit_font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x = w - tw - margin
-    y = h - th - margin
-    draw.text((x + 2, y + 2), credit, font=credit_font, fill=(0, 0, 0))
-    draw.text((x, y), credit, font=credit_font, fill=(210, 220, 230))
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    base.convert("RGB").save(path, format="PNG")
-    return path
 
 
 # ---------------------------------------------------------------------------
@@ -937,16 +1629,25 @@ def ensure_bgm(work_dir: Path = WORK_DIR) -> Path:
 # ---------------------------------------------------------------------------
 def build_mp4(
     narration_wav: Path,
-    background_png: Path,
+    scene_clips: list[tuple[Path, float]],
     bgm_path: Path,
     output_mp4: Path,
+    ending_png: Path | None = None,
+    ending_duration: float = ENDING_DURATION_SEC,
+    subtitle_cues: list[dict[str, Any]] | None = None,
+    subtitle_dir: Path | None = None,
 ) -> Path:
-    """静止画＋長尺音声向け。fpsは1（YouTube静止画でOK・高速）。"""
-    # moviepy 1.x
+    """
+    風景静止画シーン + 長尺音声 + 同期字幕 + エンディング著作権表示。
+    scene_clips: [(画像パス, 秒数), ...]
+    subtitle_cues: [{start, end, text}, ...]  textはルビなし
+    """
     from moviepy.editor import (
         AudioFileClip,
         CompositeAudioClip,
+        CompositeVideoClip,
         ImageClip,
+        concatenate_videoclips,
         afx,
     )
 
@@ -955,29 +1656,97 @@ def build_mp4(
     if duration <= 0:
         voice.close()
         raise RuntimeError("音声の長さが 0 です。")
+    if not scene_clips:
+        voice.close()
+        raise RuntimeError("シーン画像がありません。")
 
-    bgm = AudioFileClip(str(bgm_path))
-    # BGMを本編長さに合わせ、音量を下げる
-    if bgm.duration < duration:
-        bgm = afx.audio_loop(bgm, duration=duration)
+    # 字幕キューが wave 計測ベースのとき、moviepy の音声長と微小差が出ることがあるので合わせる
+    if subtitle_cues:
+        last_end = max(float(c.get("end", 0) or 0) for c in subtitle_cues)
+        if last_end > 0.5 and abs(last_end - duration) > 0.05:
+            scale = duration / last_end
+            for c in subtitle_cues:
+                c["start"] = float(c.get("start", 0)) * scale
+                c["end"] = float(c.get("end", 0)) * scale
+
+    bgm_src = AudioFileClip(str(bgm_path))
+    if bgm_src.duration < duration:
+        bgm_main = afx.audio_loop(bgm_src, duration=duration)
     else:
-        bgm = bgm.subclip(0, duration)
-    bgm = bgm.volumex(0.18)
+        bgm_main = bgm_src.subclip(0, duration)
+    bgm_main = bgm_main.volumex(0.18)
+    mixed = CompositeAudioClip([voice, bgm_main])
 
-    mixed = CompositeAudioClip([voice, bgm])
+    # 字幕切替のため本編は高めのfps（低すぎると字幕が最大で約1/fps秒ずれる）
+    still_fps = SUBTITLE_VIDEO_FPS
+    clips = []
+    for img_path, dur in scene_clips:
+        clips.append(
+            ImageClip(str(img_path)).set_duration(float(dur)).set_fps(still_fps)
+        )
+    main_video = concatenate_videoclips(clips, method="compose")
+    # シーン合計と音声長さの差を吸収（字幕時刻は音声基準）
+    if abs(float(main_video.duration) - duration) > 0.05:
+        main_video = main_video.set_duration(duration)
 
-    # 静止画なので fps=1 で十分（30分でも処理が軽い）
-    still_fps = 1
-    video = (
-        ImageClip(str(background_png))
-        .set_duration(duration)
-        .set_fps(still_fps)
-        .set_audio(mixed)
-    )
+    # 字幕オーバーレイ（ルビなしの自然文）
+    # 開始時刻をフレーム境界に揃えて、見た目のズレを抑える
+    def _snap_to_frame(sec: float) -> float:
+        return round(float(sec) * still_fps) / float(still_fps)
+
+    sub_clips = []
+    if subtitle_cues:
+        sub_dir = subtitle_dir or (output_mp4.parent / "_subs")
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        for i, cue in enumerate(subtitle_cues):
+            start = _snap_to_frame(cue.get("start", 0))
+            end = float(cue.get("end", 0))
+            text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
+            if not text or end <= start:
+                continue
+            # 本編長さを超えない
+            if start >= duration:
+                continue
+            end = min(end, duration)
+            end = max(end, start + (1.0 / still_fps))
+            png = sub_dir / f"sub_{i:05d}.png"
+            create_subtitle_png(text, png)
+            sub_clips.append(
+                ImageClip(str(png), ismask=False)
+                .set_start(start)
+                .set_duration(max(1.0 / still_fps, end - start))
+                .set_fps(still_fps)
+                .set_position((0, 0))
+            )
+
+    if sub_clips:
+        main_video = CompositeVideoClip(
+            [main_video] + sub_clips, size=VIDEO_SIZE
+        ).set_duration(duration)
+
+    main_video = main_video.set_audio(mixed)
+
+    parts = [main_video]
+    ending_clip = None
+    ending_audio = None
+    if ending_png is not None and ending_duration > 0:
+        end_dur = float(ending_duration)
+        if bgm_src.duration < end_dur:
+            ending_audio = afx.audio_loop(bgm_src, duration=end_dur).volumex(0.12)
+        else:
+            ending_audio = bgm_src.subclip(0, end_dur).volumex(0.12)
+        ending_clip = (
+            ImageClip(str(ending_png))
+            .set_duration(end_dur)
+            .set_fps(still_fps)
+            .set_audio(ending_audio)
+        )
+        parts.append(ending_clip)
+
+    video = concatenate_videoclips(parts, method="compose")
 
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
     tried_errors: list[str] = []
-
     encode_attempts = [
         {
             "codec": "h264_videotoolbox",
@@ -1006,11 +1775,10 @@ def build_mp4(
                 kwargs["preset"] = opts["preset"]
             if "ffmpeg_params" in opts:
                 kwargs["ffmpeg_params"] = opts["ffmpeg_params"]
-
             video.write_videofile(str(output_mp4), **kwargs)
             last_err = None
             break
-        except Exception as e:  # noqa: BLE001 — エンコード失敗時に次の設定へ
+        except Exception as e:  # noqa: BLE001
             tried_errors.append(f"{opts['codec']}: {e}")
             last_err = e
             if output_mp4.exists():
@@ -1020,9 +1788,32 @@ def build_mp4(
                     pass
 
     voice.close()
-    bgm.close()
+    bgm_src.close()
+    try:
+        bgm_main.close()
+    except Exception:
+        pass
     mixed.close()
     video.close()
+    try:
+        main_video.close()
+    except Exception:
+        pass
+    if ending_clip is not None:
+        try:
+            ending_clip.close()
+        except Exception:
+            pass
+    for c in clips:
+        try:
+            c.close()
+        except Exception:
+            pass
+    for c in sub_clips:
+        try:
+            c.close()
+        except Exception:
+            pass
 
     if last_err is not None:
         raise RuntimeError(
@@ -1033,19 +1824,236 @@ def build_mp4(
 
 
 # ---------------------------------------------------------------------------
-# UI ヘルパー
+# UI ヘルパー（レビュー採否）
 # ---------------------------------------------------------------------------
-def render_review_section(title: str, items: list[dict[str, str]]) -> None:
+REVIEW_SECTION_DEFS = [
+    ("medical_contradictions", "(1) 医学的に矛盾している箇所"),
+    ("awkward_for_doctors", "(2) 現役の医師が聞くと違和感がある表現"),
+    ("immersion_improvements", "(3) 修正すると臨場感が増す箇所"),
+]
+
+CHOICE_ACCEPT = "accept"
+CHOICE_REJECT = "reject"
+CHOICE_REVISE = "revise"
+CHOICE_LABELS = {
+    CHOICE_ACCEPT: "①承諾（そのまま反映）",
+    CHOICE_REJECT: "②却下",
+    CHOICE_REVISE: "③別案にて修正",
+}
+
+
+def decision_widget_key(section_key: str, index: int) -> str:
+    return f"review_choice__{section_key}__{index}"
+
+
+def alt_widget_key(section_key: str, index: int) -> str:
+    return f"review_alt__{section_key}__{index}"
+
+
+def clear_review_decision_widgets(review: dict[str, Any] | None) -> None:
+    """新しいレビュー結果に合わせて、古い採否ウィジェット状態を消す。"""
+    if not review:
+        return
+    for section_key, _ in REVIEW_SECTION_DEFS:
+        items = review.get(section_key, []) or []
+        for i in range(len(items)):
+            for k in (decision_widget_key(section_key, i), alt_widget_key(section_key, i)):
+                if k in st.session_state:
+                    del st.session_state[k]
+
+
+def render_review_section_interactive(
+    section_key: str, title: str, items: list[dict[str, str]]
+) -> None:
+    """各指摘に 承諾／却下／別案 を選べるUI。"""
     st.subheader(title)
     if not items:
         st.caption("該当なし")
         return
-    for i, item in enumerate(items, start=1):
-        with st.expander(f"{i}. {item.get('original') or '（箇所）'}", expanded=(i == 1)):
+
+    for i, item in enumerate(items):
+        label = item.get("original") or "（箇所）"
+        with st.expander(f"{i + 1}. {label}", expanded=(i == 0)):
             st.markdown("**問題点**")
             st.write(item.get("issue") or "（なし）")
             st.markdown("**修正案**")
             st.write(item.get("suggestion") or "（なし）")
+            raw_sug = (item.get("suggestion_raw") or "").strip()
+            sug = (item.get("suggestion") or "").strip()
+            if raw_sug and raw_sug != sug:
+                st.caption("※ AIの解説文は除き、台本に入れる文だけを表示しています")
+
+            choice_key = decision_widget_key(section_key, i)
+            if choice_key not in st.session_state:
+                st.session_state[choice_key] = CHOICE_REJECT
+
+            st.radio(
+                "この指摘への対応",
+                options=[CHOICE_ACCEPT, CHOICE_REJECT, CHOICE_REVISE],
+                format_func=lambda x: CHOICE_LABELS.get(x, x),
+                key=choice_key,
+                horizontal=True,
+            )
+
+            if st.session_state.get(choice_key) == CHOICE_ACCEPT:
+                preview = clean_script_replacement_text(
+                    item.get("suggestion") or "", item.get("original") or ""
+                )
+                if preview:
+                    st.info(f"承諾すると台本に入る文: {preview}")
+                else:
+                    st.warning(
+                        "この修正案は解説だけのため自動反映できません。"
+                        "「別案で直す」で本文を書いてください。"
+                    )
+
+            if st.session_state.get(choice_key) == CHOICE_REVISE:
+                alt_key = alt_widget_key(section_key, i)
+                if alt_key not in st.session_state:
+                    st.session_state[alt_key] = item.get("suggestion") or ""
+                st.text_area(
+                    "別案を入力（この文章で台本の該当箇所を置き換えます）",
+                    key=alt_key,
+                    height=100,
+                )
+
+
+def clean_script_replacement_text(suggestion: str, original: str = "") -> str:
+    """
+    レビュー修正案から、台本へ入れる本文だけを取り出す。
+    「編集メモを削除する」「確定文にして」などの解説・手順は捨てる。
+    """
+    text = (suggestion or "").strip()
+    if not text:
+        return ""
+
+    # 「」『』内の本文を優先（解説付き提案でよく使われる）
+    quoted = re.findall(r"[「『]([^」』]+)[」』]", text)
+    quoted = [q.strip() for q in quoted if q.strip()]
+    meta_hint = re.compile(
+        r"(編集メモ|編集注|編集コメント|確定文|地の文|削除する|してください|採用し)"
+    )
+    usable_quotes = [q for q in quoted if not meta_hint.search(q)]
+    if usable_quotes:
+        text = max(usable_quotes, key=len)
+
+    # 末尾〜文中の作業指示を除去
+    strip_patterns = [
+        r"[、,]?\s*と確定文にして編集メモを削除する。?",
+        r"[、,]?\s*と確定文に書き直し[、,]?編集メモを削除する。?",
+        r"[、,]?\s*と確定文に書き直す。?",
+        r"[、,]?\s*と確定文にして。?",
+        r"[、,]?\s*のみを地の文として採用し[、,]?編集注を削除する。?",
+        r"[、,]?\s*を地の文として採用し[、,]?編集注を削除する。?",
+        r"[、,]?\s*地の文として採用し[、,]?編集注を削除する。?",
+        r"編集メモを削除する。?",
+        r"編集注を削除する。?",
+        r"編集コメントを削除する。?",
+        r"[。．]?[、,]?\s*編集(?:メモ|注|コメント).*$",
+        r"[。．]?[、,]?\s*確定文に.*$",
+        r"[。．]?[、,]?\s*地の文として.*$",
+        r"に修正してください。?",
+        r"に言い換えてください。?",
+        r"に直してください。?",
+        r"を推奨します。?",
+        r"が自然です。?",
+        r"がよいです。?",
+        r"など具体的に。?",
+        r"など具体値を1か所入れてください。?",
+        r"してください。?",
+    ]
+    for pat in strip_patterns:
+        text = re.sub(pat, "", text)
+
+    text = text.strip(" 　\n\r\t「」『』\"'、,")
+
+    # まだ作業指示だけの文章なら空にする（自動反映しない）
+    if re.search(
+        r"(編集メモ|編集注|確定文|地の文として|削除する|してください|手修正)",
+        text,
+    ):
+        # 引用抽出に失敗し、指示文が残っている
+        if original and original in text and len(text) > len(original) + 10:
+            # 原文の後に指示が続く場合は原文側だけ残さない（危険なので空）
+            return ""
+        if not usable_quotes:
+            return ""
+
+    return text.strip()
+
+
+def apply_review_decisions_to_script(
+    script: str, review: dict[str, Any]
+) -> tuple[str, list[str], list[str]]:
+    """
+    採択／別案を台本に反映する。
+    戻り値: (新しい台本, 反映できた一覧, 手動編集が必要な一覧)
+    """
+    text = script
+    applied: list[str] = []
+    manual: list[str] = []
+
+    jobs: list[tuple[int, str, str, str]] = []
+    for section_key, section_title in REVIEW_SECTION_DEFS:
+        items = review.get(section_key, []) or []
+        for i, item in enumerate(items):
+            choice = st.session_state.get(
+                decision_widget_key(section_key, i), CHOICE_REJECT
+            )
+            if choice == CHOICE_REJECT:
+                continue
+
+            original = (item.get("original") or "").strip()
+            suggestion = (item.get("suggestion") or "").strip()
+            if choice == CHOICE_ACCEPT:
+                replacement = clean_script_replacement_text(suggestion, original)
+            else:
+                raw_alt = (
+                    st.session_state.get(alt_widget_key(section_key, i), suggestion)
+                    or ""
+                ).strip()
+                # 別案も解説文が混ざっていたら除去（ユーザーが書いた文はできるだけ残す）
+                replacement = clean_script_replacement_text(raw_alt, original)
+                if not replacement and raw_alt and not re.search(
+                    r"(編集メモ|編集注|確定文|地の文として採用)", raw_alt
+                ):
+                    replacement = raw_alt
+
+            label = f"{section_title} #{i + 1}"
+            if not original or not replacement:
+                manual.append(
+                    f"{label}: 差し替え本文を取り出せませんでした"
+                    f"（修正案に解説だけがある可能性があります。手修正してください）\n"
+                    f"→ 元の修正案: {suggestion}"
+                )
+                continue
+            if original in ("（全体）", "（バイタル表記なし）", "（箇所）"):
+                manual.append(
+                    f"{label}: 全体向けの指摘のため自動反映できません"
+                    f"（別案/修正案を手で入れてください）\n→ {replacement}"
+                )
+                continue
+            pos = text.find(original)
+            if pos < 0:
+                manual.append(
+                    f"{label}: 台本内に『{original}』が見つかりません"
+                    f"（手修正してください）\n→ {replacement}"
+                )
+                continue
+            jobs.append((pos, original, replacement, label))
+
+    jobs.sort(key=lambda x: x[0], reverse=True)
+    for pos, original, replacement, label in jobs:
+        if text[pos : pos + len(original)] != original:
+            pos2 = text.find(original)
+            if pos2 < 0:
+                manual.append(f"{label}: 反映中に原文が見つからなくなりました")
+                continue
+            pos = pos2
+        text = text[:pos] + replacement + text[pos + len(original) :]
+        applied.append(f"{label}: 『{original}』→『{replacement}』")
+
+    return text, applied, manual
 
 
 def init_state() -> None:
@@ -1060,13 +2068,27 @@ def init_state() -> None:
         "mp4_name": "medical_drama.mp4",
         "last_error": "",
         "video_title": "命を賭けた決断",
-        "video_subtitle": "その一言が、すべてを変えた",
-        "footnote_text": "",
+        "ending_credits_text": "",
+        "reference_text": "",
         "last_script_path": "",
+        "review_apply_log": [],
+        "review_manual_log": [],
+        "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
+        "vvox_style_name": DEFAULT_STYLE_NAME,
+        "vvox_style_id": DEFAULT_SPEAKER_ID,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+    # 声優初期値の移行（旧・青山龍星 → No.7 ノーマル）を一度だけ
+    if st.session_state.get("_vvox_default_v2") is not True:
+        old_name = st.session_state.get("vvox_speaker_name")
+        if old_name in (None, "", "青山龍星"):
+            st.session_state.vvox_speaker_name = DEFAULT_SPEAKER_NAME
+            st.session_state.vvox_style_name = DEFAULT_STYLE_NAME
+            st.session_state.vvox_style_id = DEFAULT_SPEAKER_ID
+        st.session_state["_vvox_default_v2"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +2146,7 @@ def main() -> None:
         try:
             text = extract_text_from_upload(uploaded)
             if text.strip() != st.session_state.raw_script.strip():
+                clear_review_decision_widgets(st.session_state.get("review"))
                 st.session_state.raw_script = text
                 st.session_state.final_script = text
                 st.session_state.final_script_editor = text
@@ -1131,6 +2154,9 @@ def main() -> None:
                 st.session_state.review_done = False
                 st.session_state.script_confirmed = False
                 st.session_state.mp4_bytes = None
+                st.session_state.mp4_path = ""
+                st.session_state.review_apply_log = []
+                st.session_state.review_manual_log = []
         except Exception as e:  # noqa: BLE001
             st.error(f"ファイルの読み込みに失敗しました: {e}")
 
@@ -1157,11 +2183,23 @@ def main() -> None:
     if review_clicked:
         with st.spinner("台本をレビューしています…"):
             try:
+                # 古い採否の選択を消してから新しいレビューを入れる
+                clear_review_decision_widgets(st.session_state.get("review"))
                 st.session_state.review = run_script_review(st.session_state.raw_script)
                 st.session_state.review_done = True
                 st.session_state.script_confirmed = False
                 st.session_state.mp4_bytes = None
+                st.session_state.mp4_path = ""
+                st.session_state.review_apply_log = []
+                st.session_state.review_manual_log = []
                 st.session_state.last_error = ""
+                # ルビ付き台本を最終台本の初期値にする
+                ruby_script = (
+                    st.session_state.review.get("script_with_ruby")
+                    or st.session_state.raw_script
+                )
+                st.session_state.final_script = ruby_script
+                st.session_state.final_script_editor = ruby_script
             except Exception as e:  # noqa: BLE001
                 st.session_state.last_error = str(e)
                 st.error(f"レビューに失敗しました: {e}")
@@ -1177,25 +2215,74 @@ def main() -> None:
                 "より本格的な医学チェックには Anthropic API キーを設定してください。"
             )
         else:
-            st.success("Claude によるレビュー結果です。採否を判断して台本を直してください。")
+            st.success(
+                "Claude によるレビュー結果です。"
+                "各指摘で ①承諾／②却下／③別案 を選んでください。"
+            )
+        st.caption(
+            "※医学用語・専門用語のカタカナ表記は、読み上げ誤読防止のため意図的なものとして"
+            "指摘対象外にしています。"
+        )
+        ruby_list = review.get("ruby_annotations") or []
+        if ruby_list:
+            st.info(
+                f"VOICEVOX用ルビを {len(ruby_list)} 件、最終台本へ自動付与しました"
+                "（形式: {{表記|よみ}}）。下の最終台本で確認・手直しできます。"
+            )
+            with st.expander("付与したルビ一覧", expanded=False):
+                for item in ruby_list:
+                    st.write(
+                        f"- {{{item.get('surface')}|{item.get('reading')}}}"
+                    )
+        else:
+            st.caption("今回、追加ルビの候補はありませんでした。")
         if review.get("review_truncated"):
             st.warning(
                 "台本がとても長いため、レビューは先頭部分のみです。"
                 "最終台本は全文を確認・編集してください。"
             )
 
-        render_review_section(
-            "(1) 医学的に矛盾している箇所",
-            review.get("medical_contradictions", []),
+        for section_key, section_title in REVIEW_SECTION_DEFS:
+            render_review_section_interactive(
+                section_key,
+                section_title,
+                review.get(section_key, []),
+            )
+
+        st.subheader("採択した内容を台本へ反映")
+        st.caption(
+            "①承諾 → 修正案をそのまま反映　／　"
+            "②却下 → 何もしない　／　"
+            "③別案 → 入力した文章で置き換え"
         )
-        render_review_section(
-            "(2) 現役の医師が聞くと違和感がある表現",
-            review.get("awkward_for_doctors", []),
-        )
-        render_review_section(
-            "(3) 修正すると臨場感が増す箇所",
-            review.get("immersion_improvements", []),
-        )
+        if st.button("採択・別案を台本に反映する", type="secondary"):
+            base = (
+                st.session_state.get("final_script_editor")
+                or st.session_state.get("final_script")
+                or st.session_state.raw_script
+            )
+            new_text, applied, manual = apply_review_decisions_to_script(
+                base, review
+            )
+            st.session_state.final_script = new_text
+            st.session_state.final_script_editor = new_text
+            st.session_state.review_apply_log = applied
+            st.session_state.review_manual_log = manual
+            if applied:
+                st.success(f"{len(applied)} 件を台本に反映しました。下の最終台本を確認してください。")
+            else:
+                st.info("自動反映できた項目はありません（却下のみ、または手修正が必要）。")
+            if manual:
+                st.warning("次の項目は自動反映できませんでした。最終台本を手で直してください。")
+
+        if st.session_state.get("review_apply_log"):
+            with st.expander("反映した内容", expanded=False):
+                for line in st.session_state.review_apply_log:
+                    st.write(f"- {line}")
+        if st.session_state.get("review_manual_log"):
+            with st.expander("手修正が必要な内容", expanded=True):
+                for line in st.session_state.review_manual_log:
+                    st.write(f"- {line}")
 
         st.subheader("最終台本（ここで直してから確定）")
         if "final_script_editor" not in st.session_state:
@@ -1221,60 +2308,201 @@ def main() -> None:
     if st.session_state.script_confirmed:
         st.header("ステップ3: 素材を用意してMP4を作る")
         st.caption(
-            "VOICEVOX（青山龍星）＋ 静止画背景 ＋ BGM → MP4"
-            "（YouTube向けは静止画でOK。30分級も対応）"
+            "VOICEVOX 音声 ＋ 同期字幕 ＋ 風景写真（約1分ごと）＋ BGM → MP4"
+        )
+        st.info(
+            "背景はフリー風景写真を約1分ごとに切り替えます。"
+            "字幕は音声に合わせて表示し、VOICEVOXルビは外した読みやすい文章にします。"
         )
 
-        st.subheader("① 背景画像（任意）")
-        bg_upload = st.file_uploader(
-            "背景画像をアップロード（.png / .jpg / .webp）",
-            type=["png", "jpg", "jpeg", "webp"],
-            key="bg_image_upload",
-            help="未設定なら自動の暗い医療ドラマ背景を使います",
-        )
-        if bg_upload is not None:
-            st.image(bg_upload, caption="背景プレビュー", use_container_width=True)
-
-        st.subheader("② タイトル（画像 or 文字）")
+        st.subheader("① タイトル（画像 or 文字）")
         title_upload = st.file_uploader(
             "タイトル画像をアップロード（.png 推奨・透明OK）",
             type=["png", "jpg", "jpeg", "webp"],
             key="title_image_upload",
-            help="画像があれば文字タイトルより優先されます",
+            help="画像があれば文字タイトルより優先されます（最初のシーンに表示）",
         )
         if title_upload is not None:
             st.image(title_upload, caption="タイトル画像プレビュー", use_container_width=True)
 
         st.text_input(
-            "タイトル文字（画像が無いとき用・ピンク）",
+            "タイトル文字（画像が無いとき用）",
             key="video_title",
         )
-        st.text_input(
-            "サブタイトル文字（黄／水色）",
-            key="video_subtitle",
+
+        st.subheader("② エンディング（フィクション表示・参考文献・音声）")
+        st.caption(
+            f"本編には出さず、動画の最後に約 {int(ENDING_DURATION_SEC)} 秒だけ表示します。"
+        )
+        st.markdown("**固定で入る文（フィクション表示）**")
+        st.info(ENDING_FICTION_NOTICE)
+
+        st.markdown("**参考文献**（ここに入力した内容がエンディングに入ります）")
+        ref_upload = st.file_uploader(
+            "参考文献をファイルから入れる（.txt）",
+            type=["txt"],
+            key="reference_upload",
+            help="例: 論文名・DOI・ライセンスなど",
+        )
+        if ref_upload is not None:
+            file_id = f"{ref_upload.name}-{ref_upload.size}"
+            if st.session_state.get("_reference_file_id") != file_id:
+                st.session_state.reference_text = load_text_from_upload(
+                    ref_upload
+                ).strip()
+                st.session_state["_reference_file_id"] = file_id
+
+        # 旧・脚注／自由文からの移行（一度だけ。生成済みエンディング全文は取り込まない）
+        if st.session_state.get("_reference_migrated") is not True:
+            if not (st.session_state.get("reference_text") or "").strip():
+                legacy = (st.session_state.get("footnote_text") or "").strip()
+                if not legacy:
+                    old = (st.session_state.get("ending_credits_text") or "").strip()
+                    if old and not old.startswith("本動画は医学教育用フィクション"):
+                        legacy = old
+                if legacy:
+                    st.session_state.reference_text = legacy.replace(
+                        "医学的参考文献", "参考文献"
+                    )
+            st.session_state["_reference_migrated"] = True
+
+        st.text_area(
+            "参考文献の内容",
+            key="reference_text",
+            height=120,
+            placeholder=DEFAULT_REFERENCE_EXAMPLE,
+            help="論文名・雑誌名・DOI・ライセンスなどを書いてください",
+        )
+        st.caption(
+            "エンディングでは見出しが「参考文献」になります"
+            "（「医学的参考文献」にはしません）。"
+        )
+        st.caption(
+            "音声行は次の③で選んだ声優名が自動で入ります"
+            f"（例: {format_voicevox_credit(DEFAULT_SPEAKER_NAME)}）。"
         )
 
-        st.subheader("③ 脚注・出典（著作権表示）")
-        footnote_upload = st.file_uploader(
-            "出典テキストをアップロード（.txt）",
-            type=["txt"],
-            key="footnote_upload",
-            help="例: 画像提供 ○○ / BGM: Pixabay など",
+        st.subheader("③ 読み上げ音声（VOICEVOX）")
+        st.caption(
+            "VOICEVOXアプリに入っている（ダウンロード済みの）声優と声調から選びます。"
+            "一覧はVOICEVOXから自動取得します。"
         )
-        if footnote_upload is not None:
-            file_id = f"{footnote_upload.name}-{footnote_upload.size}"
-            if st.session_state.get("_footnote_file_id") != file_id:
-                st.session_state.footnote_text = load_text_from_upload(
-                    footnote_upload
-                ).strip()
-                st.session_state["_footnote_file_id"] = file_id
-        st.text_area(
-            "脚注に入れる出典の文字（左下に表示）",
-            key="footnote_text",
-            height=100,
-            placeholder="例）背景写真: ○○（利用許諾済） / 参考資料: △△",
+        selected_style_id = int(
+            st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID)
         )
-        st.caption(f"右下のVOICEVOXクレジットは残します: {CREDIT_TEXT}")
+        selected_speaker_name = str(
+            st.session_state.get("vvox_speaker_name", DEFAULT_SPEAKER_NAME)
+        )
+        selected_style_name = str(
+            st.session_state.get("vvox_style_name", DEFAULT_STYLE_NAME)
+        )
+        try:
+            ok_vv, _ver = check_voicevox()
+            if not ok_vv:
+                st.warning(
+                    "VOICEVOXに接続できないため、声の一覧を表示できません。"
+                    "VOICEVOXを起動してから、このページを再読み込みしてください。"
+                )
+            else:
+                speakers = fetch_voicevox_speakers()
+                speaker_names = [
+                    str(s.get("name") or "").strip()
+                    for s in speakers
+                    if str(s.get("name") or "").strip()
+                ]
+                if not speaker_names:
+                    st.error("利用できる声優がありません。")
+                else:
+                    default_name, default_style, _default_id = (
+                        resolve_default_voice_selection(speakers)
+                    )
+                    cur_name = st.session_state.get("vvox_speaker_name", default_name)
+                    if cur_name not in speaker_names:
+                        cur_name = default_name
+                    name_index = speaker_names.index(cur_name)
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        chosen_name = st.selectbox(
+                            "声優（キャラクター）",
+                            options=speaker_names,
+                            index=name_index,
+                            key="vvox_speaker_select",
+                            help="VOICEVOXにインストール済みの声優一覧です",
+                        )
+                    speaker_obj = next(
+                        s for s in speakers if str(s.get("name") or "") == chosen_name
+                    )
+                    styles = talk_styles_for_speaker(speaker_obj)
+                    style_labels = [
+                        str(s.get("name") or f"ID:{s.get('id')}") for s in styles
+                    ]
+                    style_ids = [int(s["id"]) for s in styles]
+
+                    prev_name = st.session_state.get("_vvox_prev_speaker_name")
+                    if prev_name != chosen_name:
+                        prefer = (
+                            DEFAULT_STYLE_NAME
+                            if chosen_name == DEFAULT_SPEAKER_NAME
+                            else "ノーマル"
+                        )
+                        if prefer in style_labels:
+                            st.session_state.vvox_style_select = prefer
+                        elif style_labels:
+                            st.session_state.vvox_style_select = style_labels[0]
+                        st.session_state._vvox_prev_speaker_name = chosen_name
+
+                    cur_style = st.session_state.get("vvox_style_select")
+                    if cur_style not in style_labels:
+                        prefer = (
+                            DEFAULT_STYLE_NAME
+                            if chosen_name == DEFAULT_SPEAKER_NAME
+                            else "ノーマル"
+                        )
+                        if prefer in style_labels:
+                            style_index = style_labels.index(prefer)
+                        elif (
+                            chosen_name == default_name
+                            and default_style in style_labels
+                        ):
+                            style_index = style_labels.index(default_style)
+                        else:
+                            style_index = 0
+                    else:
+                        style_index = style_labels.index(cur_style)
+
+                    with col_b:
+                        chosen_style = st.selectbox(
+                            "声調（ノーマル・ツンツンなど）",
+                            options=style_labels,
+                            index=style_index,
+                            key="vvox_style_select",
+                            help="同じ声優でも声の雰囲気が変わります",
+                        )
+                    selected_style_id = style_ids[style_labels.index(chosen_style)]
+                    selected_speaker_name = chosen_name
+                    selected_style_name = chosen_style
+                    st.session_state.vvox_speaker_name = chosen_name
+                    st.session_state.vvox_style_name = chosen_style
+                    st.session_state.vvox_style_id = selected_style_id
+                    st.success(
+                        f"選択中: {chosen_name} / {chosen_style}"
+                        f"（内部ID: {selected_style_id}）"
+                    )
+                    st.caption(
+                        "エンディング音声表記: "
+                        + format_voicevox_credit(chosen_name)
+                        + f"（読み上げ声調: {chosen_style}）"
+                    )
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"声優一覧の取得に失敗しました: {e}")
+            st.caption(
+                f"代わりに初期設定（{DEFAULT_SPEAKER_NAME} / {DEFAULT_STYLE_NAME}）"
+                f"で生成を試みます。"
+            )
+            selected_style_id = DEFAULT_SPEAKER_ID
+            selected_speaker_name = DEFAULT_SPEAKER_NAME
+            selected_style_name = DEFAULT_STYLE_NAME
 
         if st.button("3. 動画を生成する", type="primary"):
             progress = st.progress(0, text="準備中…")
@@ -1287,8 +2515,24 @@ def main() -> None:
                         f"（詳細: {ver}）"
                     )
 
+                style_id = int(
+                    st.session_state.get("vvox_style_id", selected_style_id)
+                )
+                speaker_name = str(
+                    st.session_state.get("vvox_speaker_name", selected_speaker_name)
+                )
+                style_name = str(
+                    st.session_state.get("vvox_style_name", selected_style_name)
+                )
+                voice_credit = format_voicevox_credit(speaker_name)
+                ending_body = build_ending_credits_text(
+                    st.session_state.get("reference_text", ""),
+                    speaker_name,
+                )
+                # プレビュー用にも残す
+                st.session_state.ending_credits_text = ending_body
+
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                # 台本を残す（次回「最後の台本を見せて」に備える）
                 script_path = OUTPUT_DIR / "last_script.txt"
                 script_path.write_text(
                     st.session_state.final_script, encoding="utf-8"
@@ -1298,63 +2542,124 @@ def main() -> None:
                 with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
                     tmp_path = Path(tmp)
 
-                    status.info("① 音声を生成しています（長い台本は時間がかかります）…")
+                    status.info(
+                        f"① 音声を生成しています（{speaker_name} / {style_name}）…"
+                    )
                     wav_path = tmp_path / "narration.wav"
                     n_chunks = len(
                         split_text_for_voicevox(st.session_state.final_script)
                     )
 
                     def _voice_prog(done: int, total: int) -> None:
-                        pct = 5 + int(50 * (done / max(total, 1)))
+                        pct = 5 + int(45 * (done / max(total, 1)))
                         progress.progress(
-                            min(pct, 55),
+                            min(pct, 50),
                             text=f"VOICEVOX 音声生成中… {done}/{total} 区間",
                         )
                         status.info(
-                            f"① VOICEVOXで読み上げ中（{done}/{total}）…"
-                            f" 予定区間数 {n_chunks}"
+                            f"① {speaker_name}（{style_name}）で読み上げ中"
+                            f"（{done}/{total}）… 予定区間数 {n_chunks}"
                         )
 
-                    generate_narration_wav_to_file(
+                    wav_path, subtitle_cues = generate_narration_wav_to_file(
                         st.session_state.final_script,
                         wav_path,
                         progress_callback=_voice_prog,
+                        speaker=style_id,
+                    )
+                    status.info(
+                        f"①′ 字幕キュー {len(subtitle_cues)} 件を作成"
+                        "（ルビなし・人間が読める表記）"
                     )
 
-                    status.info("② 静止画フレーム（背景・タイトル・出典・クレジット）を作っています…")
-                    progress.progress(60, text="静止画を合成中…")
-                    bg_path = tmp_path / "background.png"
-                    bg_img = load_image_from_upload(bg_upload)
-                    title_img = load_image_from_upload(title_upload)
-                    create_background_image(
-                        bg_path,
-                        title=st.session_state.get("video_title", ""),
-                        subtitle=st.session_state.get("video_subtitle", ""),
-                        background_img=bg_img,
-                        title_img=title_img,
-                        footnote_text=st.session_state.get("footnote_text", ""),
+                    # 音声の長さを知り、1分ごとの風景シーンを計画
+                    import wave as _wave
+
+                    with _wave.open(str(wav_path), "rb") as wf:
+                        audio_sec = wf.getnframes() / float(wf.getframerate())
+
+                    schedule = plan_scene_schedule(
+                        st.session_state.final_script, audio_sec
                     )
-                    # プレビュー用にも保存
+                    status.info(
+                        f"② 風景写真を用意（{len(schedule)} 枚・"
+                        f"約{SCENE_INTERVAL_SEC/60:.0f}分ごと切替）…"
+                    )
+                    progress.progress(52, text="風景写真をダウンロード中…")
+                    landscapes = ensure_landscape_images(len(schedule))
+                    progress.progress(55, text="シーン画像を合成中…")
+                    title_img = load_image_from_upload(title_upload)
+                    scene_dir = tmp_path / "scenes"
+                    scene_dir.mkdir(parents=True, exist_ok=True)
+                    scene_clips: list[tuple[Path, float]] = []
+                    for item in schedule:
+                        i = int(item["index"])
+                        li = int(item.get("landscape_index", i))
+                        dur = float(item["duration"])
+                        frame_path = scene_dir / f"scene_{i:03d}.png"
+                        land = landscapes[li % len(landscapes)]
+                        create_scene_frame(
+                            frame_path,
+                            landscape_path=land,
+                            title=st.session_state.get("video_title", ""),
+                            title_img=title_img,
+                            show_title=(i == 0),
+                            landscape_index=li,
+                        )
+                        scene_clips.append((frame_path, dur))
+                        pct = 55 + int(12 * ((i + 1) / max(len(schedule), 1)))
+                        progress.progress(
+                            min(pct, 67),
+                            text=f"シーン {i+1}/{len(schedule)}",
+                        )
+
+                    # エンディング（著作権・出典）
+                    status.info(
+                        f"②′ エンディング（約{int(ENDING_DURATION_SEC)}秒）を作っています…"
+                    )
+                    progress.progress(70, text="エンディング画像を生成中…")
+                    ending_path = tmp_path / "ending_credits.png"
+                    create_ending_credits_frame(
+                        ending_path,
+                        ending_text=ending_body,
+                        voicevox_credit=voice_credit,
+                    )
+                    # プレビューはエンディングも保存
+                    (OUTPUT_DIR / "last_ending.png").write_bytes(
+                        ending_path.read_bytes()
+                    )
+                    # 本編プレビューは最初のシーン
                     preview_path = OUTPUT_DIR / "last_frame.png"
-                    preview_path.write_bytes(bg_path.read_bytes())
+                    preview_path.write_bytes(scene_clips[0][0].read_bytes())
 
                     status.info("③ BGMを用意しています…")
-                    progress.progress(70, text="BGMを取得中…")
+                    progress.progress(75, text="BGMを取得中…")
                     bgm_path = ensure_bgm(WORK_DIR)
 
-                    status.info("④ 静止画＋音声をMP4にしています（30分級は数分かかることがあります）…")
-                    progress.progress(80, text="MP4へエンコード中…")
+                    status.info("④ 本編＋字幕＋エンディングをMP4にしています…")
+                    progress.progress(85, text="MP4へエンコード中…")
                     out_path = OUTPUT_DIR / "medical_drama.mp4"
-                    build_mp4(wav_path, bg_path, bgm_path, out_path)
+                    build_mp4(
+                        wav_path,
+                        scene_clips,
+                        bgm_path,
+                        out_path,
+                        ending_png=ending_path,
+                        ending_duration=ENDING_DURATION_SEC,
+                        subtitle_cues=subtitle_cues,
+                        subtitle_dir=tmp_path / "_subs",
+                    )
 
                     st.session_state.mp4_path = str(out_path)
                     st.session_state.mp4_name = "medical_drama.mp4"
-                    # 巨大ファイルはメモリに載せない（ダウンロードはファイルから）
                     st.session_state.mp4_bytes = None
                     progress.progress(100, text="完了")
+                    themes_used = f"{len(schedule)} 枚の風景（約{int(SCENE_INTERVAL_SEC/60)}分ごと）"
                     status.success(
                         "動画の生成が完了しました。"
-                        f"保存先: {out_path}"
+                        f"保存先: {out_path}\n"
+                        f"音声: {speaker_name}（{style_name}）\n"
+                        f"背景: {themes_used}"
                     )
 
             except Exception as e:  # noqa: BLE001
@@ -1390,7 +2695,14 @@ def main() -> None:
             if frame.exists():
                 st.image(
                     str(frame),
-                    caption="動画に使う静止画フレーム",
+                    caption="本編の静止画フレーム（先頭シーン）",
+                    use_container_width=True,
+                )
+            ending_prev = OUTPUT_DIR / "last_ending.png"
+            if ending_prev.exists():
+                st.image(
+                    str(ending_prev),
+                    caption=f"エンディング（約{int(ENDING_DURATION_SEC)}秒・著作権／出典）",
                     use_container_width=True,
                 )
             script_saved = st.session_state.get("last_script_path") or ""
@@ -1410,6 +2722,13 @@ def main() -> None:
                 type="primary",
             )
             st.video(st.session_state.mp4_bytes)
+
+    # ----- 画面一番下の注意書き -----
+    st.divider()
+    st.markdown(
+        f"<p style='font-size:0.85rem;color:#666;line-height:1.5;'>{DISCLAIMER_TEXT}</p>",
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
