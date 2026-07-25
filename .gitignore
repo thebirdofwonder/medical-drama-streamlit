@@ -1,0 +1,11 @@
+# 秘密情報・作業ファイル（GitHub に上げない）
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.venv/
+venv/
+bgm.mp3
+bgm_fallback.wav
+*.mp4
+.DS_Store
