@@ -9,9 +9,11 @@ import io
 import json
 import os
 import re
+import shutil
 import struct
 import tempfile
 import wave
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +63,26 @@ BGM_CANDIDATE_URLS = [
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
 LANDSCAPE_DIR = OUTPUT_DIR / "landscapes"
+
+
+def get_desktop_dir() -> Path:
+    """macOS のデスクトップフォルダ（英語名 / 日本語名の両方を探す）。"""
+    for name in ("Desktop", "デスクトップ"):
+        p = Path.home() / name
+        if p.is_dir():
+            return p
+    p = Path.home() / "Desktop"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def make_desktop_mp4_filename(title: str = "") -> str:
+    """デスクトップ保存用のファイル名（上書きしにくいよう日時つき）。"""
+    raw = (title or "").strip() or "medical_drama"
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", raw)
+    safe = re.sub(r"_+", "_", safe).strip("._")[:40] or "medical_drama"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{safe}_{stamp}.mp4"
 # Unsplash のフリー利用可能な風景写真（表示用。出典はエンディングに記載推奨）
 LANDSCAPE_IMAGE_URLS = [
     "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?auto=format&fit=crop&w=1920&h=1080&q=80",
@@ -2366,7 +2388,6 @@ def init_state() -> None:
         "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
         "vvox_style_name": DEFAULT_STYLE_NAME,
         "vvox_style_id": DEFAULT_SPEAKER_ID,
-        "vvox_ruby_enabled": True,
         "vvox_speed_scale": VOICEVOX_SPEED_SCALE,
     }
     for k, v in defaults.items():
@@ -2823,19 +2844,10 @@ def main() -> None:
             selected_speaker_name = DEFAULT_SPEAKER_NAME
             selected_style_name = DEFAULT_STYLE_NAME
 
-        st.markdown("**VOICEVOXルビ（読み方指定）**")
-        st.checkbox(
-            "ルビをONにする（推奨）",
-            key="vvox_ruby_enabled",
-            help=(
-                "ON: 台本の {漢字|よみ} と医学用語辞書のルビを使って読み上げます。"
-                "字幕にはルビを出さず、読みやすい漢字のまま表示します。"
-            ),
+        st.caption(
+            "VOICEVOXルビ（読み方指定）は常にONです。"
+            "音声は {漢字|よみ} で正しく読み、字幕にはルビを出さず漢字のまま表示します。"
         )
-        if st.session_state.get("vvox_ruby_enabled", True):
-            st.success("ルビ: ON（読み間違い防止のため、音声生成時にルビを適用します）")
-        else:
-            st.warning("ルビ: OFF（ルビを外して読み上げます。誤読が増えることがあります）")
 
         st.markdown("**読み上げ速度**")
         st.slider(
@@ -2880,7 +2892,6 @@ def main() -> None:
                 st.session_state.ending_credits_text = ending_body
 
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                ruby_on = bool(st.session_state.get("vvox_ruby_enabled", True))
                 speed_scale = clamp_voicevox_speed(
                     st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
                 )
@@ -2889,13 +2900,14 @@ def main() -> None:
                     extra_ruby = (
                         st.session_state.review.get("ruby_annotations") or []
                     )
+                # ルビは常にON
                 voice_script, ruby_count = prepare_script_for_voicevox(
                     st.session_state.final_script,
                     extra_annotations=extra_ruby,
-                    enabled=ruby_on,
+                    enabled=True,
                 )
                 # 音声用台本だけ更新（final_script_editor は画面ウィジェット済みなので触らない）
-                if ruby_on and voice_script:
+                if voice_script:
                     st.session_state.final_script = voice_script
 
                 script_path = OUTPUT_DIR / "last_script.txt"
@@ -2905,11 +2917,7 @@ def main() -> None:
                 with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
                     tmp_path = Path(tmp)
 
-                    ruby_msg = (
-                        f"ルビON・{ruby_count}件"
-                        if ruby_on
-                        else "ルビOFF"
-                    )
+                    ruby_msg = f"ルビ{ruby_count}件"
                     status.info(
                         f"① 音声を生成しています"
                         f"（{speaker_name} / {style_name}・{ruby_msg}・{speed_scale:.1f}倍速）…"
@@ -3021,14 +3029,23 @@ def main() -> None:
                         subtitle_dir=tmp_path / "_subs",
                     )
 
-                    st.session_state.mp4_path = str(out_path)
-                    st.session_state.mp4_name = "medical_drama.mp4"
+                    # 完成MP4をデスクトップへコピー（Finderですぐ見つかる）
+                    desktop_dir = get_desktop_dir()
+                    desktop_name = make_desktop_mp4_filename(
+                        st.session_state.get("video_title", "")
+                    )
+                    desktop_path = desktop_dir / desktop_name
+                    shutil.copy2(out_path, desktop_path)
+
+                    st.session_state.mp4_path = str(desktop_path)
+                    st.session_state.mp4_name = desktop_name
                     st.session_state.mp4_bytes = None
                     progress.progress(100, text="完了")
                     themes_used = f"{len(schedule)} 枚の風景（約{int(SCENE_INTERVAL_SEC/60)}分ごと）"
                     status.success(
-                        "動画の生成が完了しました。"
-                        f"保存先: {out_path}\n"
+                        "動画の生成が完了しました。\n"
+                        f"デスクトップに保存: {desktop_path}\n"
+                        f"（作業用コピー: {out_path}）\n"
                         f"音声: {speaker_name}（{style_name}）\n"
                         f"背景: {themes_used}"
                     )
