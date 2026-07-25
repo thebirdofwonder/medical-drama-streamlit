@@ -28,8 +28,11 @@ VOICEVOX_URL = "http://127.0.0.1:50021"
 DEFAULT_SPEAKER_ID = 29
 DEFAULT_SPEAKER_NAME = "No.7"
 DEFAULT_STYLE_NAME = "ノーマル"
-# 読み上げ速度（1.0＝通常、1.2＝1.2倍速）
+# 読み上げ速度の初期値（1.0＝通常）。画面で 0.5〜3.0 を選べる
 VOICEVOX_SPEED_SCALE = 1.2
+VOICEVOX_SPEED_MIN = 0.5
+VOICEVOX_SPEED_MAX = 3.0
+VOICEVOX_SPEED_STEP = 0.1
 VIDEO_SIZE = (1920, 1080)
 CREDIT_TEXT = f"音声\nVOICEVOX：{DEFAULT_SPEAKER_NAME}"
 # 後方互換（古いコード参照用）
@@ -123,13 +126,89 @@ def extract_text_from_upload(uploaded_file) -> str:
 # ---------------------------------------------------------------------------
 # AI レビュー（Anthropic Claude API / フォールバック簡易レビュー）
 # ---------------------------------------------------------------------------
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+
+def load_dotenv_file(path: Path | None = None) -> None:
+    """
+    .env から KEY=VALUE を読み、未設定の環境変数だけ入れる。
+    （GitHub には上げないローカル専用ファイル）
+    """
+    env_path = path or ENV_FILE
+    if not env_path.is_file():
+        return
+    try:
+        raw = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if not key:
+            continue
+        # すでにターミナル等で設定済みなら上書きしない
+        if os.environ.get(key, "").strip():
+            continue
+        os.environ[key] = val
+
+
+def save_api_key_to_env_file(api_key: str, path: Path | None = None) -> Path:
+    """
+    APIキーを .env に保存（または更新）。他の行はそのまま残す。
+    """
+    env_path = path or ENV_FILE
+    key_name = "ANTHROPIC_API_KEY"
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise ValueError("保存する APIキーが空です。")
+
+    lines: list[str] = []
+    found = False
+    if env_path.is_file():
+        try:
+            old = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            old = []
+        for line in old:
+            stripped = line.strip()
+            if stripped.startswith("#") or "=" not in stripped:
+                lines.append(line)
+                continue
+            k, _, _ = stripped.partition("=")
+            if k.strip() == key_name:
+                lines.append(f"{key_name}={api_key}")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(f"# Anthropic Claude API（このファイルは GitHub に上げません）")
+        lines.append(f"{key_name}={api_key}")
+
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # すぐに使えるように環境変数にも入れる
+    os.environ[key_name] = api_key
+    return env_path
+
+
 def get_api_key() -> str:
-    """環境変数または Streamlit secrets から API キーを取得（コードに直書きしない）。"""
+    """
+    APIキー取得の優先順位:
+    1. 環境変数 ANTHROPIC_API_KEY（.env 読込後含む）
+    2. Streamlit secrets（.streamlit/secrets.toml）
+    コードには直書きしない。
+    """
+    load_dotenv_file()
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if key:
         return key
     try:
-        return st.secrets.get("ANTHROPIC_API_KEY", "").strip()
+        return str(st.secrets.get("ANTHROPIC_API_KEY", "") or "").strip()
     except Exception:
         return ""
 
@@ -1052,7 +1131,22 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
     return chunks
 
 
-def synthesize_wav_bytes(text: str, speaker: int = DEFAULT_SPEAKER_ID) -> bytes:
+def clamp_voicevox_speed(speed: float) -> float:
+    """読み上げ速度を 0.5〜3.0 の範囲に収める（0.1 刻み）。"""
+    try:
+        s = float(speed)
+    except (TypeError, ValueError):
+        s = float(VOICEVOX_SPEED_SCALE)
+    s = max(VOICEVOX_SPEED_MIN, min(VOICEVOX_SPEED_MAX, s))
+    # 0.1 刻みに丸める（浮動小数の誤差対策）
+    return round(round(s / VOICEVOX_SPEED_STEP) * VOICEVOX_SPEED_STEP, 1)
+
+
+def synthesize_wav_bytes(
+    text: str,
+    speaker: int = DEFAULT_SPEAKER_ID,
+    speed_scale: float = VOICEVOX_SPEED_SCALE,
+) -> bytes:
     q = requests.post(
         f"{VOICEVOX_URL}/audio_query",
         params={"text": text, "speaker": speaker},
@@ -1061,8 +1155,8 @@ def synthesize_wav_bytes(text: str, speaker: int = DEFAULT_SPEAKER_ID) -> bytes:
     if q.status_code != 200:
         raise RuntimeError(f"audio_query 失敗: HTTP {q.status_code} / {q.text[:300]}")
     query = q.json()
-    # 通常の 1.2 倍速
-    query["speedScale"] = float(query.get("speedScale", 1.0)) * VOICEVOX_SPEED_SCALE
+    speed = clamp_voicevox_speed(speed_scale)
+    query["speedScale"] = float(query.get("speedScale", 1.0)) * speed
     query["intonationScale"] = float(query.get("intonationScale", 1.0))
 
     s = requests.post(
@@ -1182,6 +1276,7 @@ def generate_narration_wav_to_file(
     progress_callback=None,
     pause_ms: int = 280,
     speaker: int = DEFAULT_SPEAKER_ID,
+    speed_scale: float = VOICEVOX_SPEED_SCALE,
 ) -> tuple[Path, list[dict[str, Any]]]:
     """
     長い台本向け: VOICEVOXで音声生成し、字幕用タイミングも返す。
@@ -1189,6 +1284,7 @@ def generate_narration_wav_to_file(
     戻り値: (wavパス, 字幕キュー[{start,end,text}, ...])
     text はルビを外した人間向け表記。
     speaker: VOICEVOXの style_id（APIでは speaker という名前）
+    speed_scale: 読み上げ倍率（0.5〜3.0）
     """
     chunks = split_text_for_voicevox(script)
     if not chunks:
@@ -1201,13 +1297,16 @@ def generate_narration_wav_to_file(
     subtitle_cues: list[dict[str, Any]] = []
     t = 0.0
     pause_sec = max(0.0, pause_ms / 1000.0)
+    speed = clamp_voicevox_speed(speed_scale)
 
     try:
         for i, chunk in enumerate(chunks):
             if progress_callback:
                 progress_callback(i, len(chunks))
             part = part_dir / f"part_{i:05d}.wav"
-            part.write_bytes(synthesize_wav_bytes(chunk, speaker=speaker))
+            part.write_bytes(
+                synthesize_wav_bytes(chunk, speaker=speaker, speed_scale=speed)
+            )
             part_paths.append(part)
             with wave.open(str(part), "rb") as w:
                 dur = w.getnframes() / float(w.getframerate())
@@ -2268,6 +2367,7 @@ def init_state() -> None:
         "vvox_style_name": DEFAULT_STYLE_NAME,
         "vvox_style_id": DEFAULT_SPEAKER_ID,
         "vvox_ruby_enabled": True,
+        "vvox_speed_scale": VOICEVOX_SPEED_SCALE,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2314,18 +2414,45 @@ def main() -> None:
         st.divider()
         st.markdown("**AIレビュー用 APIキー**")
         st.caption(
-            "Anthropic（クロード）の APIキーを使う場合は、"
-            "ターミナルで環境変数 `ANTHROPIC_API_KEY` を設定するか、"
-            "下の欄に一時入力してください（コードには保存しません）。"
+            "Anthropic（クロード）の APIキーです。"
+            "下に入力して「ローカルに保存」すると、次回から自動で読み込みます。"
+            "保存先は `.env`（GitHub には上がりません）。"
         )
-        typed = st.text_input("ANTHROPIC_API_KEY（任意）", type="password")
+        # 起動時に .env を読む
+        load_dotenv_file()
+        has_saved = bool(get_api_key())
+        if has_saved:
+            st.success("保存済みの APIキーを検出 → 本格レビューモード")
+            st.caption(f"読込元の例: プロジェクト内の `{ENV_FILE.name}`（非公開）")
+        else:
+            st.warning("APIキーなし → 簡易レビューモード（動作確認用）")
+
+        typed = st.text_input(
+            "ANTHROPIC_API_KEY（新規入力・上書き用）",
+            type="password",
+            help="ここに貼り付けて「ローカルに保存」を押すと、次回から入力不要です",
+        )
         if typed.strip():
             os.environ["ANTHROPIC_API_KEY"] = typed.strip()
 
+        if st.button("このキーをローカル（.env）に保存する"):
+            to_save = typed.strip() or get_api_key()
+            if not to_save:
+                st.error("先に上の欄へ APIキーを入力してください。")
+            else:
+                try:
+                    saved_path = save_api_key_to_env_file(to_save)
+                    st.success(
+                        f"保存しました: `{saved_path.name}`"
+                        "（このファイルは GitHub に上がりません）"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"保存に失敗しました: {e}")
+
         if get_api_key():
-            st.success("Claude API キーを検出 → 本格レビューモード")
+            st.caption("いま Claude API キーが使えます。")
         else:
-            st.warning("APIキーなし → 簡易レビューモード（動作確認用）")
+            st.caption("キーが無いときは簡易レビューで動きます。")
 
     # ----- Step 1: アップロード -----
     st.header("ステップ1: 台本をアップロード")
@@ -2710,6 +2837,20 @@ def main() -> None:
         else:
             st.warning("ルビ: OFF（ルビを外して読み上げます。誤読が増えることがあります）")
 
+        st.markdown("**読み上げ速度**")
+        st.slider(
+            "VOICEVOXの速さ（0.5＝ゆっくり〜3.0＝とても速い）",
+            min_value=float(VOICEVOX_SPEED_MIN),
+            max_value=float(VOICEVOX_SPEED_MAX),
+            step=float(VOICEVOX_SPEED_STEP),
+            key="vvox_speed_scale",
+            help="1.0 が通常の速さです。初期値は 1.2 倍です。",
+            format="%.1f倍",
+        )
+        st.caption(
+            f"いまの設定: {clamp_voicevox_speed(st.session_state.get('vvox_speed_scale', VOICEVOX_SPEED_SCALE)):.1f} 倍速"
+        )
+
         if st.button("3. 動画を生成する", type="primary"):
             progress = st.progress(0, text="準備中…")
             status = st.empty()
@@ -2740,6 +2881,9 @@ def main() -> None:
 
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                 ruby_on = bool(st.session_state.get("vvox_ruby_enabled", True))
+                speed_scale = clamp_voicevox_speed(
+                    st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
+                )
                 extra_ruby = []
                 if st.session_state.get("review"):
                     extra_ruby = (
@@ -2750,10 +2894,9 @@ def main() -> None:
                     extra_annotations=extra_ruby,
                     enabled=ruby_on,
                 )
-                # 確定台本もルビ適用後で揃える（次回編集用）
+                # 音声用台本だけ更新（final_script_editor は画面ウィジェット済みなので触らない）
                 if ruby_on and voice_script:
                     st.session_state.final_script = voice_script
-                    st.session_state.final_script_editor = voice_script
 
                 script_path = OUTPUT_DIR / "last_script.txt"
                 script_path.write_text(voice_script, encoding="utf-8")
@@ -2768,7 +2911,8 @@ def main() -> None:
                         else "ルビOFF"
                     )
                     status.info(
-                        f"① 音声を生成しています（{speaker_name} / {style_name}・{ruby_msg}）…"
+                        f"① 音声を生成しています"
+                        f"（{speaker_name} / {style_name}・{ruby_msg}・{speed_scale:.1f}倍速）…"
                     )
                     wav_path = tmp_path / "narration.wav"
                     n_chunks = len(split_text_for_voicevox(voice_script))
@@ -2780,7 +2924,8 @@ def main() -> None:
                             text=f"VOICEVOX 音声生成中… {done}/{total} 区間",
                         )
                         status.info(
-                            f"① {speaker_name}（{style_name}・{ruby_msg}）で読み上げ中"
+                            f"① {speaker_name}（{style_name}・{ruby_msg}・"
+                            f"{speed_scale:.1f}倍速）で読み上げ中"
                             f"（{done}/{total}）… 予定区間数 {n_chunks}"
                         )
 
@@ -2789,6 +2934,7 @@ def main() -> None:
                         wav_path,
                         progress_callback=_voice_prog,
                         speaker=style_id,
+                        speed_scale=speed_scale,
                     )
                     status.info(
                         f"①′ 字幕キュー {len(subtitle_cues)} 件を作成"
