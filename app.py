@@ -63,6 +63,8 @@ BGM_CANDIDATE_URLS = [
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
 LANDSCAPE_DIR = OUTPUT_DIR / "landscapes"
+# 参考文献の前回入力（outputs/ は GitHub に上がらない）
+REFERENCE_SAVE_PATH = OUTPUT_DIR / "last_reference.txt"
 
 
 def get_desktop_dir() -> Path:
@@ -83,6 +85,31 @@ def make_desktop_mp4_filename(title: str = "") -> str:
     safe = re.sub(r"_+", "_", safe).strip("._")[:40] or "medical_drama"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{safe}_{stamp}.mp4"
+
+
+def load_saved_reference_text() -> str:
+    """前回保存した参考文献を読み込む。"""
+    try:
+        if REFERENCE_SAVE_PATH.is_file():
+            return REFERENCE_SAVE_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def save_reference_text(text: str) -> None:
+    """参考文献をローカルに保存（次回起動時も残す・上書き可）。"""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    body = (text or "").rstrip()
+    REFERENCE_SAVE_PATH.write_text(
+        (body + "\n") if body else "",
+        encoding="utf-8",
+    )
+
+
+def persist_reference_from_widget() -> None:
+    """参考文献テキスト欄の変更をファイルへ保存する（Streamlit on_change用）。"""
+    save_reference_text(str(st.session_state.get("reference_text") or ""))
 # Unsplash のフリー利用可能な風景写真（表示用。出典はエンディングに記載推奨）
 LANDSCAPE_IMAGE_URLS = [
     "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?auto=format&fit=crop&w=1920&h=1080&q=80",
@@ -1223,12 +1250,26 @@ def concat_wav_files(wav_paths: list[Path], out_path: Path, pause_ms: int = 350)
 def strip_voicevox_ruby(text: str) -> str:
     """
     VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ を外し、
-    人間が自然に読める表記だけ残す。
+    字幕・表示用に「表記」（漢字・アルファベットなど）だけ残す。
     """
     if not text:
         return ""
     return re.sub(
         r"[{｛]([^|｜\n]+)[|｜][^}｝\n]+[}｝]",
+        r"\1",
+        text,
+    )
+
+
+def expand_voicevox_ruby_to_reading(text: str) -> str:
+    """
+    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ を外し、
+    読み上げ用に「よみ」だけ残す（VOICEVOXへ送る文）。
+    """
+    if not text:
+        return ""
+    return re.sub(
+        r"[{｛][^|｜\n]+[|｜]([^}｝\n]+)[}｝]",
         r"\1",
         text,
     )
@@ -1302,11 +1343,9 @@ def generate_narration_wav_to_file(
 ) -> tuple[Path, list[dict[str, Any]]]:
     """
     長い台本向け: VOICEVOXで音声生成し、字幕用タイミングも返す。
-    1音声区間＝1字幕（開始・終了はWAVの実時間）なので音声とズレにくい。
+    1音声区間＝1字幕。開始・終了は各WAVの実時間（よみ上げと完全同期）。
     戻り値: (wavパス, 字幕キュー[{start,end,text}, ...])
-    text はルビを外した人間向け表記。
-    speaker: VOICEVOXの style_id（APIでは speaker という名前）
-    speed_scale: 読み上げ倍率（0.5〜3.0）
+    text は表記のみ（ルビ記号なし）。
     """
     chunks = split_text_for_voicevox(script)
     if not chunks:
@@ -1326,33 +1365,51 @@ def generate_narration_wav_to_file(
             if progress_callback:
                 progress_callback(i, len(chunks))
             part = part_dir / f"part_{i:05d}.wav"
+            # VOICEVOXへはよみがなのみ、字幕には表記のみ（同じ区間の実時間を共有）
+            tts_text = expand_voicevox_ruby_to_reading(chunk).strip()
+            display = strip_voicevox_ruby(chunk).strip()
+            if not tts_text:
+                tts_text = display
+            if not tts_text:
+                # 空区間はスキップ（無音も字幕も入れない）
+                continue
+            # 連結時と同じく、前の音声のあとにだけ無音を入れる
+            if part_paths:
+                t += pause_sec
             part.write_bytes(
-                synthesize_wav_bytes(chunk, speaker=speaker, speed_scale=speed)
+                synthesize_wav_bytes(tts_text, speaker=speaker, speed_scale=speed)
             )
             part_paths.append(part)
             with wave.open(str(part), "rb") as w:
                 dur = w.getnframes() / float(w.getframerate())
-            display = strip_voicevox_ruby(chunk).strip()
+            seg_start = t
+            seg_end = t + dur
             if display and dur > 0:
-                # 区間の実時間そのまま（文字数按分はしない＝ズレ防止）
                 subtitle_cues.append(
-                    {"start": t, "end": t + dur, "text": display}
+                    {
+                        "start": seg_start,
+                        "end": seg_end,
+                        "text": display,
+                        # 検証用: この字幕が対応する読み上げ文
+                        "tts": tts_text,
+                    }
                 )
-            t += dur
-            if i < len(chunks) - 1:
-                t += pause_sec
+            t = seg_end
         if progress_callback:
             progress_callback(len(chunks), len(chunks))
+        if not part_paths:
+            raise ValueError("読み上げる文章が空です。")
         concat_wav_files(part_paths, out_wav, pause_ms=pause_ms)
 
-        # 連結後の実時間に合わせて、ごく小さい誤差を補正
+        # 連結WAVの実時間とタイムライン t を一致させる（字幕も同じ倍率）
         with wave.open(str(out_wav), "rb") as w:
             actual_dur = w.getnframes() / float(w.getframerate())
-        if subtitle_cues and t > 0 and abs(actual_dur - t) > 0.01:
+        if subtitle_cues and t > 0 and abs(actual_dur - t) > 0.001:
             scale = actual_dur / t
             for cue in subtitle_cues:
                 cue["start"] = float(cue["start"]) * scale
                 cue["end"] = float(cue["end"]) * scale
+            t = actual_dur
     finally:
         for p in part_paths:
             try:
@@ -1364,6 +1421,66 @@ def generate_narration_wav_to_file(
         except OSError:
             pass
     return out_wav, subtitle_cues
+
+
+def validate_audio_subtitle_sync(
+    wav_path: Path,
+    subtitle_cues: list[dict[str, Any]],
+    tol_sec: float = 0.08,
+) -> list[str]:
+    """
+    音声WAVと字幕キューが同期しているか検査する。
+    問題があればメッセージ一覧を返す（空ならOK）。
+    """
+    issues: list[str] = []
+    if not wav_path.is_file():
+        return ["音声ファイルがありません"]
+    with wave.open(str(wav_path), "rb") as w:
+        wav_dur = w.getnframes() / float(w.getframerate())
+    if wav_dur <= 0:
+        return ["音声の長さが 0 です"]
+    if not subtitle_cues:
+        issues.append("字幕キューが空です")
+        return issues
+
+    first_start = float(subtitle_cues[0].get("start", 0))
+    if first_start > tol_sec:
+        issues.append(
+            f"最初の字幕開始が遅すぎます ({first_start:.3f}s)"
+        )
+
+    prev_end = 0.0
+    for i, cue in enumerate(subtitle_cues):
+        start = float(cue.get("start", 0))
+        end = float(cue.get("end", 0))
+        text = str(cue.get("text") or "").strip()
+        if not text:
+            issues.append(f"字幕#{i+1}: テキストが空です")
+        if end <= start:
+            issues.append(f"字幕#{i+1}: 終了が開始以下です ({start:.3f}→{end:.3f})")
+        if start < -tol_sec:
+            issues.append(f"字幕#{i+1}: 開始が負です ({start:.3f})")
+        if end > wav_dur + tol_sec:
+            issues.append(
+                f"字幕#{i+1}: 音声長を超えています"
+                f" (終了 {end:.3f}s / 音声 {wav_dur:.3f}s)"
+            )
+        if i > 0 and start < prev_end - tol_sec:
+            issues.append(
+                f"字幕#{i+1}: 前の字幕と重なっています"
+                f" (前終了 {prev_end:.3f} / 開始 {start:.3f})"
+            )
+        prev_end = max(prev_end, end)
+
+    last_end = float(subtitle_cues[-1].get("end", 0))
+    # 末尾に字幕なしの読み上げが無いとき、最後の字幕終了は音声長に近い
+    if abs(last_end - wav_dur) > tol_sec and last_end < wav_dur - 1.0:
+        # 1秒以上余る場合のみ注意（末尾の表示なし区間が長い）
+        issues.append(
+            f"注意: 最後の字幕終了 ({last_end:.3f}s) のあと音声が"
+            f" {wav_dur - last_end:.3f}s 続きます"
+        )
+    return issues
 
 
 def generate_narration_wav(script: str) -> bytes:
@@ -1972,11 +2089,13 @@ def build_mp4(
         voice.close()
         raise RuntimeError("シーン画像がありません。")
 
-    # 字幕キューが wave 計測ベースのとき、moviepy の音声長と微小差が出ることがあるので合わせる
+    # moviepy の音声長と、wave 計測の差を字幕全体に同じ倍率で吸収する
+    # （最後の字幕終了時刻ではなく、WAV全体の長さを基準にする＝同期を崩さない）
     if subtitle_cues:
-        last_end = max(float(c.get("end", 0) or 0) for c in subtitle_cues)
-        if last_end > 0.5 and abs(last_end - duration) > 0.05:
-            scale = duration / last_end
+        with wave.open(str(narration_wav), "rb") as wf:
+            wave_dur = wf.getnframes() / float(wf.getframerate())
+        if wave_dur > 0.5 and abs(wave_dur - duration) > 0.01:
+            scale = duration / wave_dur
             for c in subtitle_cues:
                 c["start"] = float(c.get("start", 0)) * scale
                 c["end"] = float(c.get("end", 0)) * scale
@@ -1989,7 +2108,7 @@ def build_mp4(
     bgm_main = bgm_main.volumex(0.18)
     mixed = CompositeAudioClip([voice, bgm_main])
 
-    # 字幕切替のため本編は高めのfps（低すぎると字幕が最大で約1/fps秒ずれる）
+    # 字幕は音声の実時間どおりに出す（フレーム丸めはしない＝ずれ防止）
     still_fps = SUBTITLE_VIDEO_FPS
     clips = []
     for img_path, dur in scene_clips:
@@ -2001,32 +2120,29 @@ def build_mp4(
     if abs(float(main_video.duration) - duration) > 0.05:
         main_video = main_video.set_duration(duration)
 
-    # 字幕オーバーレイ（ルビなしの自然文）
-    # 開始時刻をフレーム境界に揃えて、見た目のズレを抑える
-    def _snap_to_frame(sec: float) -> float:
-        return round(float(sec) * still_fps) / float(still_fps)
-
     sub_clips = []
     if subtitle_cues:
         sub_dir = subtitle_dir or (output_mp4.parent / "_subs")
         sub_dir.mkdir(parents=True, exist_ok=True)
         for i, cue in enumerate(subtitle_cues):
-            start = _snap_to_frame(cue.get("start", 0))
+            start = float(cue.get("start", 0))
             end = float(cue.get("end", 0))
             text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
             if not text or end <= start:
                 continue
-            # 本編長さを超えない
             if start >= duration:
                 continue
             end = min(end, duration)
-            end = max(end, start + (1.0 / still_fps))
+            # 最低でも1フレーム分は出す（ただし開始は音声どおり）
+            min_dur = 1.0 / float(still_fps)
+            if end - start < min_dur:
+                end = min(duration, start + min_dur)
             png = sub_dir / f"sub_{i:05d}.png"
             create_subtitle_png(text, png)
             sub_clips.append(
                 ImageClip(str(png), ismask=False)
                 .set_start(start)
-                .set_duration(max(1.0 / still_fps, end - start))
+                .set_duration(max(min_dur, end - start))
                 .set_fps(still_fps)
                 .set_position((0, 0))
             )
@@ -2394,6 +2510,20 @@ def init_state() -> None:
         if k not in st.session_state:
             st.session_state[k] = v
 
+    # 参考文献: 空なら前回保存分を復元（上書きも可）
+    if not (st.session_state.get("reference_text") or "").strip():
+        saved_ref = load_saved_reference_text()
+        if saved_ref:
+            st.session_state.reference_text = saved_ref
+
+    # 読み上げ速度の既定は 1.2（未設定・異常値のときだけ）
+    try:
+        cur_speed = float(st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE))
+    except (TypeError, ValueError):
+        cur_speed = VOICEVOX_SPEED_SCALE
+    if cur_speed < VOICEVOX_SPEED_MIN or cur_speed > VOICEVOX_SPEED_MAX:
+        st.session_state.vvox_speed_scale = VOICEVOX_SPEED_SCALE
+
     # 声優初期値の移行（旧・青山龍星 → No.7 ノーマル）を一度だけ
     if st.session_state.get("_vvox_default_v2") is not True:
         old_name = st.session_state.get("vvox_speaker_name")
@@ -2687,10 +2817,10 @@ def main() -> None:
         if ref_upload is not None:
             file_id = f"{ref_upload.name}-{ref_upload.size}"
             if st.session_state.get("_reference_file_id") != file_id:
-                st.session_state.reference_text = load_text_from_upload(
-                    ref_upload
-                ).strip()
+                loaded = load_text_from_upload(ref_upload).strip()
+                st.session_state.reference_text = loaded
                 st.session_state["_reference_file_id"] = file_id
+                save_reference_text(loaded)
 
         # 旧・脚注／自由文からの移行（一度だけ。生成済みエンディング全文は取り込まない）
         if st.session_state.get("_reference_migrated") is not True:
@@ -2701,21 +2831,22 @@ def main() -> None:
                     if old and not old.startswith("本動画は医学教育用フィクション"):
                         legacy = old
                 if legacy:
-                    st.session_state.reference_text = legacy.replace(
-                        "医学的参考文献", "参考文献"
-                    )
+                    migrated = legacy.replace("医学的参考文献", "参考文献")
+                    st.session_state.reference_text = migrated
+                    save_reference_text(migrated)
             st.session_state["_reference_migrated"] = True
 
         st.text_area(
-            "参考文献の内容",
+            "参考文献の内容（前回の入力を保持・必要なら上書き）",
             key="reference_text",
             height=120,
             placeholder=DEFAULT_REFERENCE_EXAMPLE,
-            help="論文名・雑誌名・DOI・ライセンスなどを書いてください",
+            help="論文名・雑誌名・DOI・ライセンスなどを書いてください。変更は自動保存されます。",
+            on_change=persist_reference_from_widget,
         )
         st.caption(
-            "エンディングでは見出しが「参考文献」になります"
-            "（「医学的参考文献」にはしません）。"
+            "前回入力した内容を残しています。書き換えるとその内容で上書き保存されます。"
+            "エンディング見出しは「参考文献」です。"
         )
         st.caption(
             "音声行は次の③で選んだ声優名が自動で入ります"
@@ -2845,8 +2976,9 @@ def main() -> None:
             selected_style_name = DEFAULT_STYLE_NAME
 
         st.caption(
-            "VOICEVOXルビ（読み方指定）は常にONです。"
-            "音声は {漢字|よみ} で正しく読み、字幕にはルビを出さず漢字のまま表示します。"
+            "VOICEVOXルビは常にONです。"
+            "読み上げ時は {表記|よみ} → よみだけをVOICEVOXへ送り、"
+            "字幕には表記（漢字・アルファベットなど）だけを出します。"
         )
 
         st.markdown("**読み上げ速度**")
@@ -2856,11 +2988,12 @@ def main() -> None:
             max_value=float(VOICEVOX_SPEED_MAX),
             step=float(VOICEVOX_SPEED_STEP),
             key="vvox_speed_scale",
-            help="1.0 が通常の速さです。初期値は 1.2 倍です。",
+            help="1.0 が通常の速さです。既定値（初期値）は 1.2 倍です。",
             format="%.1f倍",
         )
         st.caption(
             f"いまの設定: {clamp_voicevox_speed(st.session_state.get('vvox_speed_scale', VOICEVOX_SPEED_SCALE)):.1f} 倍速"
+            f"（既定値 {VOICEVOX_SPEED_SCALE:.1f} 倍）"
         )
 
         if st.button("3. 動画を生成する", type="primary"):
@@ -2900,7 +3033,7 @@ def main() -> None:
                     extra_ruby = (
                         st.session_state.review.get("ruby_annotations") or []
                     )
-                # ルビは常にON
+                # ルビは常にON（台本には {表記|よみ} を付与）
                 voice_script, ruby_count = prepare_script_for_voicevox(
                     st.session_state.final_script,
                     extra_annotations=extra_ruby,
@@ -2910,8 +3043,20 @@ def main() -> None:
                 if voice_script:
                     st.session_state.final_script = voice_script
 
+                # 参考文献を保存（次回も残す）
+                save_reference_text(st.session_state.get("reference_text", ""))
+
                 script_path = OUTPUT_DIR / "last_script.txt"
                 script_path.write_text(voice_script, encoding="utf-8")
+                # VOICEVOX送信用（よみのみ）と字幕用（表記のみ）も保存
+                tts_script = expand_voicevox_ruby_to_reading(voice_script)
+                sub_script = strip_voicevox_ruby(voice_script)
+                (OUTPUT_DIR / "last_script_tts.txt").write_text(
+                    tts_script, encoding="utf-8"
+                )
+                (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
+                    sub_script, encoding="utf-8"
+                )
                 st.session_state.last_script_path = str(script_path)
 
                 with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
@@ -2944,9 +3089,17 @@ def main() -> None:
                         speaker=style_id,
                         speed_scale=speed_scale,
                     )
+                    sync_issues = validate_audio_subtitle_sync(
+                        wav_path, subtitle_cues
+                    )
+                    if sync_issues:
+                        raise RuntimeError(
+                            "音声と字幕の同期チェックに失敗しました:\n"
+                            + "\n".join(f"- {m}" for m in sync_issues)
+                        )
                     status.info(
                         f"①′ 字幕キュー {len(subtitle_cues)} 件を作成"
-                        "（ルビなし・人間が読める表記）"
+                        "（表記のみ）／音声との同期チェック OK"
                     )
 
                     # 音声の長さを知り、1分ごとの風景シーンを計画
