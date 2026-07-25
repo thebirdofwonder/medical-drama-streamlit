@@ -2589,63 +2589,84 @@ def init_state() -> None:
 # Streamlit メイン
 # ---------------------------------------------------------------------------
 def inject_app_theme() -> None:
-    """大きな活字を抑え、グレー基調の落ち着いた画面にする。"""
+    """アプリ画面は白黒基調。大きな活字は使わず、コントラストを確保する。"""
     st.markdown(
         """
 <style>
-  /* 全体：グレー基調・標準サイズ寄り */
-  html, body, [data-testid="stAppViewContainer"],
-  [data-testid="stMarkdownContainer"], .stMarkdown, p, label, span {
-    color: #444 !important;
-  }
+  /* 全体：白背景・黒文字 */
   [data-testid="stAppViewContainer"] {
-    background: #f3f3f3 !important;
+    background: #ffffff !important;
+    color: #000000 !important;
   }
   [data-testid="stHeader"] {
-    background: #f3f3f3 !important;
+    background: #ffffff !important;
   }
   [data-testid="stSidebar"] {
-    background: #eaeaea !important;
+    background: #f7f7f7 !important;
+    border-right: 1px solid #000000 !important;
+  }
+  [data-testid="stMarkdownContainer"] p,
+  [data-testid="stMarkdownContainer"] li,
+  label {
+    color: #000000 !important;
   }
   /* 見出しを大きくしない */
-  h1 {
-    font-size: 1.2rem !important;
-    font-weight: 600 !important;
-    color: #333 !important;
-    letter-spacing: 0 !important;
-  }
-  h2 {
+  h1, h2, h3, h4 {
     font-size: 1.05rem !important;
     font-weight: 600 !important;
-    color: #3a3a3a !important;
+    color: #000000 !important;
   }
-  h3 {
-    font-size: 0.98rem !important;
-    font-weight: 600 !important;
-    color: #3a3a3a !important;
-  }
-  /* ボタン：赤系をやめてグレー */
+  /* 主ボタン：黒背景＋白文字 */
+  .stButton > button,
   .stButton > button[kind="primary"],
-  .stButton > button[data-testid="baseButton-primary"] {
-    background-color: #5a5a5a !important;
-    border-color: #5a5a5a !important;
-    color: #fff !important;
+  .stButton > button[data-testid="baseButton-primary"],
+  button[kind="primary"],
+  button[data-testid="baseButton-primary"] {
+    background-color: #000000 !important;
+    border: 1px solid #000000 !important;
+    color: #ffffff !important;
   }
+  .stButton > button p,
+  .stButton > button span,
+  .stButton > button div,
+  button[kind="primary"] p,
+  button[kind="primary"] span,
+  button[data-testid="baseButton-primary"] p,
+  button[data-testid="baseButton-primary"] span {
+    color: #ffffff !important;
+  }
+  /* 副ボタン：白背景＋黒文字＋黒枠 */
   .stButton > button[kind="secondary"],
-  .stButton > button[data-testid="baseButton-secondary"] {
-    background-color: #dedede !important;
-    border-color: #bdbdbd !important;
-    color: #333 !important;
+  .stButton > button[data-testid="baseButton-secondary"],
+  button[kind="secondary"],
+  button[data-testid="baseButton-secondary"] {
+    background-color: #ffffff !important;
+    border: 1px solid #000000 !important;
+    color: #000000 !important;
   }
-  /* 情報枠もグレー寄り */
+  .stButton > button[kind="secondary"] p,
+  .stButton > button[kind="secondary"] span,
+  .stButton > button[data-testid="baseButton-secondary"] p,
+  .stButton > button[data-testid="baseButton-secondary"] span,
+  button[kind="secondary"] p,
+  button[kind="secondary"] span {
+    color: #000000 !important;
+  }
+  /* 情報枠も白黒 */
   div[data-testid="stAlert"] {
-    background-color: #ececec !important;
-    color: #444 !important;
-    border: 1px solid #cfcfcf !important;
+    background-color: #ffffff !important;
+    color: #000000 !important;
+    border: 1px solid #000000 !important;
   }
   .stCaption, [data-testid="stCaptionContainer"] {
-    color: #666 !important;
+    color: #222222 !important;
     font-size: 0.85rem !important;
+  }
+  /* 入力欄も黒枠 */
+  .stTextInput input, .stTextArea textarea, [data-baseweb="select"] {
+    border-color: #000000 !important;
+    color: #000000 !important;
+    background: #ffffff !important;
   }
 </style>
         """,
