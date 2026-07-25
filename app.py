@@ -1,5 +1,5 @@
 """
-医学ドラマ台本 → AIレビュー → VOICEVOX音声 → 背景＋BGM → MP4 生成
+医学ドラマ台本 → AIレビュー → VOICEVOX音声 → 静止画背景 → MP4 生成
 Streamlit アプリ（macOS / Apple Silicon 向け）
 """
 
@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import tempfile
 import wave
 from datetime import datetime
@@ -30,11 +31,8 @@ VOICEVOX_URL = "http://127.0.0.1:50021"
 DEFAULT_SPEAKER_ID = 29
 DEFAULT_SPEAKER_NAME = "No.7"
 DEFAULT_STYLE_NAME = "ノーマル"
-# 読み上げ速度の初期値（1.0＝通常）。画面で 0.5〜3.0 を選べる
+# 読み上げ速度は 1.2 倍速で固定（画面にスライダーは出さない）
 VOICEVOX_SPEED_SCALE = 1.2
-VOICEVOX_SPEED_MIN = 0.5
-VOICEVOX_SPEED_MAX = 3.0
-VOICEVOX_SPEED_STEP = 0.1
 VIDEO_SIZE = (1920, 1080)
 CREDIT_TEXT = f"音声\nVOICEVOX：{DEFAULT_SPEAKER_NAME}"
 # 後方互換（古いコード参照用）
@@ -186,35 +184,37 @@ def extract_text_from_path(path: str | Path) -> str:
 
 
 def pick_local_script_path() -> str:
-    """macOS のファイル選択画面を開いて、台本ファイルのパスを返す。"""
+    """macOS のファイル選択画面を開き、台本ファイルのパスを返す。"""
+    # tkinter は Streamlit と併用するとアプリ全体が落ちることがあるため使わない
+    script = (
+        'try\n'
+        'set f to choose file with prompt "台本ファイルを選んでください（.txt / .docx）" '
+        'of type {"txt", "docx", "public.plain-text"}\n'
+        "return POSIX path of f\n"
+        "on error\n"
+        'return ""\n'
+        "end try"
+    )
     try:
-        import tkinter as tk
-        from tkinter import filedialog
+        completed = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(
             "ファイル選択画面を開けませんでした。"
             "下の「パス」欄か、文章の貼り付けを使ってください。"
         ) from e
-
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        path = filedialog.askopenfilename(
-            title="台本ファイルを選んでください（.txt / .docx）",
-            filetypes=[
-                ("台本（txt / docx）", "*.txt *.docx"),
-                ("テキスト", "*.txt"),
-                ("Word", "*.docx"),
-                ("すべてのファイル", "*.*"),
-            ],
+    path = (completed.stdout or "").strip()
+    if not path and (completed.stderr or "").strip():
+        raise RuntimeError(
+            "ファイル選択に失敗しました。"
+            "下の「パス」欄か、文章の貼り付けを使ってください。"
         )
-    finally:
-        root.destroy()
-    return str(path or "")
+    return path
 
 
 def commit_loaded_script(text: str, source_id: str) -> None:
@@ -397,12 +397,36 @@ def normalize_voicevox_reading(reading: str) -> str:
     return reading.strip()
 
 
+# ルビ区切り: 半角 { } | と全角 ｛ ｝ ｜ は同じものとして扱う
+_RUBY_OPEN = r"[{｛]"
+_RUBY_PIPE = r"[|｜]"
+_RUBY_CLOSE = r"[}｝]"
+_RUBY_TAG_RE = re.compile(
+    _RUBY_OPEN + r"([^|｜\n]+)" + _RUBY_PIPE + r"([^}｝\n]+)" + _RUBY_CLOSE
+)
+
+
+def canonicalize_voicevox_ruby_delimiters(text: str) -> str:
+    """
+    ルビの {｝| と ｛｝｜ を区別せず、すべて半角 {表記|よみ} にそろえる。
+    """
+    if not text:
+        return ""
+
+    def _repl(match: re.Match) -> str:
+        surface = match.group(1)
+        reading = normalize_voicevox_reading(match.group(2))
+        return "{" + surface + "|" + reading + "}"
+
+    return _RUBY_TAG_RE.sub(_repl, text)
+
+
 def apply_voicevox_ruby(script: str, annotations: list[dict[str, str]]) -> str:
     """
     VOICEVOXルビ {表記|よみ} を台本へ付与する。
-    既にあるルビは壊さない。長い表記から順に置換する。
+    半角/全角の区切り記号は区別しない。既にあるルビは壊さない。
     """
-    text = script or ""
+    text = canonicalize_voicevox_ruby_delimiters(script or "")
     if not annotations:
         return text
 
@@ -414,7 +438,7 @@ def apply_voicevox_ruby(script: str, annotations: list[dict[str, str]]) -> str:
         return key
 
     def protect_existing(src: str) -> str:
-        return re.sub(r"[{｛][^|｜\n]+[|｜][^}｝\n]+[}｝]", _protect, src)
+        return _RUBY_TAG_RE.sub(_protect, src)
 
     pairs: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -444,7 +468,7 @@ def apply_voicevox_ruby(script: str, annotations: list[dict[str, str]]) -> str:
 
     for key, val in protected.items():
         text = text.replace(key, val)
-    return text
+    return canonicalize_voicevox_ruby_delimiters(text)
 
 
 # 簡易モード用: よく誤読されやすい医学用語のルビ辞書（必要に応じて増やす）
@@ -522,7 +546,7 @@ def merge_ruby_annotations(
 
 
 def count_voicevox_ruby(text: str) -> int:
-    return len(re.findall(r"[{｛][^|｜\n]+[|｜][^}｝\n]+[}｝]", text or ""))
+    return len(_RUBY_TAG_RE.findall(canonicalize_voicevox_ruby_delimiters(text or "")))
 
 
 def prepare_script_for_voicevox(
@@ -537,7 +561,7 @@ def prepare_script_for_voicevox(
     enabled=False: ルビを外した文を返す
     戻り値: (台本, ルビ件数)
     """
-    text = script or ""
+    text = canonicalize_voicevox_ruby_delimiters(script or "")
     if not enabled:
         plain = strip_voicevox_ruby(text)
         return plain, 0
@@ -548,8 +572,7 @@ def prepare_script_for_voicevox(
 
 
 def _ruby_incomplete(fragment: str) -> bool:
-    """断片の末尾で {表記|よみ} が途中切れなら True。"""
-    # 最後の { より後に対応する } が無ければ途中切れ
+    """断片の末尾で {表記|よみ} が途中切れなら True（半角/全角どちらも）。"""
     last_open = max(fragment.rfind("{"), fragment.rfind("｛"))
     if last_open < 0:
         return False
@@ -1242,14 +1265,8 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
 
 
 def clamp_voicevox_speed(speed: float) -> float:
-    """読み上げ速度を 0.5〜3.0 の範囲に収める（0.1 刻み）。"""
-    try:
-        s = float(speed)
-    except (TypeError, ValueError):
-        s = float(VOICEVOX_SPEED_SCALE)
-    s = max(VOICEVOX_SPEED_MIN, min(VOICEVOX_SPEED_MAX, s))
-    # 0.1 刻みに丸める（浮動小数の誤差対策）
-    return round(round(s / VOICEVOX_SPEED_STEP) * VOICEVOX_SPEED_STEP, 1)
+    """読み上げ速度は常に 1.2 倍速固定。"""
+    return float(VOICEVOX_SPEED_SCALE)
 
 
 def synthesize_wav_bytes(
@@ -1310,13 +1327,14 @@ def concat_wav_files(wav_paths: list[Path], out_path: Path, pause_ms: int = 350)
 
 def strip_voicevox_ruby(text: str) -> str:
     """
-    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ を外し、
-    字幕・表示用に「表記」（漢字・アルファベットなど）だけ残す。
+    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ などを外し、
+    字幕・表示用に「表記」だけ残す（半角/全角の区切りは区別しない）。
     """
+    text = canonicalize_voicevox_ruby_delimiters(text or "")
     if not text:
         return ""
     return re.sub(
-        r"[{｛]([^|｜\n]+)[|｜][^}｝\n]+[}｝]",
+        r"\{([^|\n]+)\|[^}\n]+\}",
         r"\1",
         text,
     )
@@ -1324,13 +1342,14 @@ def strip_voicevox_ruby(text: str) -> str:
 
 def expand_voicevox_ruby_to_reading(text: str) -> str:
     """
-    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ を外し、
-    読み上げ用に「よみ」だけ残す（VOICEVOXへ送る文）。
+    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ などを外し、
+    読み上げ用に「よみ」だけ残す（半角/全角の区切りは区別しない）。
     """
+    text = canonicalize_voicevox_ruby_delimiters(text or "")
     if not text:
         return ""
     return re.sub(
-        r"[{｛][^|｜\n]+[|｜]([^}｝\n]+)[}｝]",
+        r"\{[^|\n]+\|([^}\n]+)\}",
         r"\1",
         text,
     )
@@ -2065,7 +2084,7 @@ def create_background_image(
 
 
 # ---------------------------------------------------------------------------
-# BGM
+# BGM（現在は未使用：動画にはナレーションのみ。必要になったら再利用可）
 # ---------------------------------------------------------------------------
 def make_fallback_bgm_wav(path: Path, seconds: float = 60.0, rate: int = 44100) -> Path:
     """ダウンロード失敗時: 低いドローン音のWAVを自作（追加ライブラリ不要）。"""
@@ -2120,7 +2139,6 @@ def ensure_bgm(work_dir: Path = WORK_DIR) -> Path:
 def build_mp4(
     narration_wav: Path,
     scene_clips: list[tuple[Path, float]],
-    bgm_path: Path,
     output_mp4: Path,
     ending_png: Path | None = None,
     ending_duration: float = ENDING_DURATION_SEC,
@@ -2129,16 +2147,15 @@ def build_mp4(
 ) -> Path:
     """
     風景静止画シーン + 長尺音声 + 同期字幕 + エンディング著作権表示。
+    BGM・効果音は入れない（ナレーション音声のみ）。
     scene_clips: [(画像パス, 秒数), ...]
     subtitle_cues: [{start, end, text}, ...]  textはルビなし
     """
     from moviepy.editor import (
         AudioFileClip,
-        CompositeAudioClip,
         CompositeVideoClip,
         ImageClip,
         concatenate_videoclips,
-        afx,
     )
 
     voice = AudioFileClip(str(narration_wav))
@@ -2160,14 +2177,6 @@ def build_mp4(
             for c in subtitle_cues:
                 c["start"] = float(c.get("start", 0)) * scale
                 c["end"] = float(c.get("end", 0)) * scale
-
-    bgm_src = AudioFileClip(str(bgm_path))
-    if bgm_src.duration < duration:
-        bgm_main = afx.audio_loop(bgm_src, duration=duration)
-    else:
-        bgm_main = bgm_src.subclip(0, duration)
-    bgm_main = bgm_main.volumex(0.18)
-    mixed = CompositeAudioClip([voice, bgm_main])
 
     # 字幕は音声の実時間どおりに出す（フレーム丸めはしない＝ずれ防止）
     still_fps = SUBTITLE_VIDEO_FPS
@@ -2213,22 +2222,17 @@ def build_mp4(
             [main_video] + sub_clips, size=VIDEO_SIZE
         ).set_duration(duration)
 
-    main_video = main_video.set_audio(mixed)
+    # ナレーションのみ（BGM・効果音なし）
+    main_video = main_video.set_audio(voice)
 
     parts = [main_video]
     ending_clip = None
-    ending_audio = None
     if ending_png is not None and ending_duration > 0:
         end_dur = float(ending_duration)
-        if bgm_src.duration < end_dur:
-            ending_audio = afx.audio_loop(bgm_src, duration=end_dur).volumex(0.12)
-        else:
-            ending_audio = bgm_src.subclip(0, end_dur).volumex(0.12)
         ending_clip = (
             ImageClip(str(ending_png))
             .set_duration(end_dur)
             .set_fps(still_fps)
-            .set_audio(ending_audio)
         )
         parts.append(ending_clip)
 
@@ -2277,12 +2281,6 @@ def build_mp4(
                     pass
 
     voice.close()
-    bgm_src.close()
-    try:
-        bgm_main.close()
-    except Exception:
-        pass
-    mixed.close()
     video.close()
     try:
         main_video.close()
@@ -2566,7 +2564,6 @@ def init_state() -> None:
         "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
         "vvox_style_name": DEFAULT_STYLE_NAME,
         "vvox_style_id": DEFAULT_SPEAKER_ID,
-        "vvox_speed_scale": VOICEVOX_SPEED_SCALE,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2577,22 +2574,6 @@ def init_state() -> None:
         saved_ref = load_saved_reference_text()
         if saved_ref:
             st.session_state.reference_text = saved_ref
-
-    # 読み上げ速度の既定は 1.2
-    # ・範囲外 → 1.2
-    # ・旧既定のままの 1.0 → 一度だけ 1.2 に更新（手動で変えた 1.5 などは残す）
-    try:
-        cur_speed = float(st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE))
-    except (TypeError, ValueError):
-        cur_speed = VOICEVOX_SPEED_SCALE
-    if cur_speed < VOICEVOX_SPEED_MIN or cur_speed > VOICEVOX_SPEED_MAX:
-        st.session_state.vvox_speed_scale = float(VOICEVOX_SPEED_SCALE)
-    elif (
-        st.session_state.get("_vvox_speed_default_v12") is not True
-        and abs(cur_speed - 1.0) < 1e-9
-    ):
-        st.session_state.vvox_speed_scale = float(VOICEVOX_SPEED_SCALE)
-    st.session_state["_vvox_speed_default_v12"] = True
 
     # 声優初期値の移行（旧・青山龍星 → No.7 ノーマル）を一度だけ
     if st.session_state.get("_vvox_default_v2") is not True:
@@ -2618,7 +2599,7 @@ def main() -> None:
     st.title("医学ドラマ動画メーカー")
     st.write(
         "台本（テキストまたはWord）を上げると、"
-        "（任意で）AIレビュー → VOICEVOX音声 → 静止画背景・BGM合成 → MP4ダウンロード、まで進めます。"
+        "（任意で）AIレビュー → VOICEVOX音声 → 静止画背景合成 → MP4ダウンロード、まで進めます。"
         "台本は30分前後の長さにも対応しています。"
     )
 
@@ -2974,7 +2955,8 @@ def main() -> None:
     if st.session_state.script_confirmed:
         st.header("ステップ3: 素材を用意してMP4を作る")
         st.caption(
-            "VOICEVOX 音声 ＋ 同期字幕 ＋ 風景写真（約1分ごと）＋ BGM → MP4"
+            "VOICEVOX 音声 ＋ 同期字幕 ＋ 風景写真（約1分ごと）→ MP4"
+            "（BGM・効果音は入れません）"
         )
         st.info(
             "背景はフリー風景写真を約1分ごとに切り替えます。"
@@ -3173,24 +3155,10 @@ def main() -> None:
 
         st.caption(
             "VOICEVOXルビは常にONです。"
-            "読み上げ時は {表記|よみ} → よみだけをVOICEVOXへ送り、"
-            "字幕には表記（漢字・アルファベットなど）だけを出します。"
+            "半角 {表記|よみ} と全角 ｛表記｜よみ｝ は同じものとして扱います。"
+            "読み上げ時はよみだけをVOICEVOXへ送り、字幕には表記だけを出します。"
         )
-
-        st.markdown("**読み上げ速度**")
-        st.slider(
-            "VOICEVOXの速さ（0.5＝ゆっくり〜3.0＝とても速い）",
-            min_value=float(VOICEVOX_SPEED_MIN),
-            max_value=float(VOICEVOX_SPEED_MAX),
-            step=float(VOICEVOX_SPEED_STEP),
-            key="vvox_speed_scale",
-            help="1.0 が通常の速さです。既定値（初期値）は 1.2 倍です。",
-            format="%.1f倍",
-        )
-        st.caption(
-            f"いまの設定: {clamp_voicevox_speed(st.session_state.get('vvox_speed_scale', VOICEVOX_SPEED_SCALE)):.1f} 倍速"
-            f"（既定値 {VOICEVOX_SPEED_SCALE:.1f} 倍）"
-        )
+        st.caption(f"読み上げ速度は {VOICEVOX_SPEED_SCALE:.1f} 倍速で固定です。")
 
         if st.button("3. 動画を生成する", type="primary"):
             progress = st.progress(0, text="準備中…")
@@ -3221,9 +3189,7 @@ def main() -> None:
                 st.session_state.ending_credits_text = ending_body
 
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                speed_scale = clamp_voicevox_speed(
-                    st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
-                )
+                speed_scale = float(VOICEVOX_SPEED_SCALE)
                 extra_ruby = []
                 if st.session_state.get("review"):
                     extra_ruby = (
@@ -3360,17 +3326,12 @@ def main() -> None:
                     preview_path = OUTPUT_DIR / "last_frame.png"
                     preview_path.write_bytes(scene_clips[0][0].read_bytes())
 
-                    status.info("③ BGMを用意しています…")
-                    progress.progress(75, text="BGMを取得中…")
-                    bgm_path = ensure_bgm(WORK_DIR)
-
-                    status.info("④ 本編＋字幕＋エンディングをMP4にしています…")
+                    status.info("③ 本編＋字幕＋エンディングをMP4にしています…")
                     progress.progress(85, text="MP4へエンコード中…")
                     out_path = OUTPUT_DIR / "medical_drama.mp4"
                     build_mp4(
                         wav_path,
                         scene_clips,
-                        bgm_path,
                         out_path,
                         ending_png=ending_path,
                         ending_duration=ENDING_DURATION_SEC,
