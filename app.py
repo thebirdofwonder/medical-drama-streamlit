@@ -2588,79 +2588,124 @@ def init_state() -> None:
 # ---------------------------------------------------------------------------
 # Streamlit メイン
 # ---------------------------------------------------------------------------
+def inject_app_theme() -> None:
+    """大きな活字を抑え、グレー基調の落ち着いた画面にする。"""
+    st.markdown(
+        """
+<style>
+  /* 全体：グレー基調・標準サイズ寄り */
+  html, body, [data-testid="stAppViewContainer"],
+  [data-testid="stMarkdownContainer"], .stMarkdown, p, label, span {
+    color: #444 !important;
+  }
+  [data-testid="stAppViewContainer"] {
+    background: #f3f3f3 !important;
+  }
+  [data-testid="stHeader"] {
+    background: #f3f3f3 !important;
+  }
+  [data-testid="stSidebar"] {
+    background: #eaeaea !important;
+  }
+  /* 見出しを大きくしない */
+  h1 {
+    font-size: 1.2rem !important;
+    font-weight: 600 !important;
+    color: #333 !important;
+    letter-spacing: 0 !important;
+  }
+  h2 {
+    font-size: 1.05rem !important;
+    font-weight: 600 !important;
+    color: #3a3a3a !important;
+  }
+  h3 {
+    font-size: 0.98rem !important;
+    font-weight: 600 !important;
+    color: #3a3a3a !important;
+  }
+  /* ボタン：赤系をやめてグレー */
+  .stButton > button[kind="primary"],
+  .stButton > button[data-testid="baseButton-primary"] {
+    background-color: #5a5a5a !important;
+    border-color: #5a5a5a !important;
+    color: #fff !important;
+  }
+  .stButton > button[kind="secondary"],
+  .stButton > button[data-testid="baseButton-secondary"] {
+    background-color: #dedede !important;
+    border-color: #bdbdbd !important;
+    color: #333 !important;
+  }
+  /* 情報枠もグレー寄り */
+  div[data-testid="stAlert"] {
+    background-color: #ececec !important;
+    color: #444 !important;
+    border: 1px solid #cfcfcf !important;
+  }
+  .stCaption, [data-testid="stCaptionContainer"] {
+    color: #666 !important;
+    font-size: 0.85rem !important;
+  }
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="医学ドラマ動画メーカー",
-        page_icon="🎬",
+        page_icon=None,
         layout="wide",
     )
+    inject_app_theme()
     init_state()
 
-    st.title("医学ドラマ動画メーカー")
-    st.write(
-        "台本（テキストまたはWord）を上げると、"
-        "（任意で）AIレビュー → VOICEVOX音声 → 静止画背景合成 → MP4ダウンロード、まで進めます。"
-        "台本は30分前後の長さにも対応しています。"
-    )
+    st.markdown("### 医学ドラマ動画メーカー")
+    st.caption("台本 →（任意）レビュー → 音声・字幕・背景 → MP4")
 
     with st.sidebar:
-        st.header("設定")
-        st.caption("VOICEVOX はあらかじめ起動しておいてください。")
+        st.markdown("#### 設定")
+        st.caption("先に VOICEVOX を起動してください。")
         ok, ver = check_voicevox()
         if ok:
-            st.success(f"VOICEVOX 接続OK（version: {ver}）")
+            st.success(f"VOICEVOX OK（{ver}）")
         else:
-            st.error(f"VOICEVOX に接続できません: {ver}")
-            st.info("VOICEVOXアプリを起動し、エンジンが 50021 番で待っているか確認してください。")
+            st.error(f"VOICEVOX 未接続: {ver}")
 
         st.divider()
-        st.markdown("**AIレビュー用 APIキー**")
-        st.caption(
-            "Anthropic（クロード）の APIキーです。"
-            "下に入力して「ローカルに保存」すると、次回から自動で読み込みます。"
-            "保存先は `.env`（GitHub には上がりません）。"
-        )
-        # 起動時に .env を読む
+        st.markdown("**APIキー**")
+        st.caption("Claude レビュー用。`.env` に保存可（GitHub非公開）。")
         load_dotenv_file()
         has_saved = bool(get_api_key())
         if has_saved:
-            st.success("保存済みの APIキーを検出 → 本格レビューモード")
-            st.caption(f"読込元の例: プロジェクト内の `{ENV_FILE.name}`（非公開）")
+            st.caption("キー検出済み（本格レビュー）")
         else:
-            st.warning("APIキーなし → 簡易レビューモード（動作確認用）")
+            st.caption("キーなし（簡易レビュー）")
 
         typed = st.text_input(
-            "ANTHROPIC_API_KEY（新規入力・上書き用）",
+            "ANTHROPIC_API_KEY",
             type="password",
-            help="ここに貼り付けて「ローカルに保存」を押すと、次回から入力不要です",
+            help="入力後「保存」で次回から自動読込",
         )
         if typed.strip():
             os.environ["ANTHROPIC_API_KEY"] = typed.strip()
 
-        if st.button("このキーをローカル（.env）に保存する"):
+        if st.button("キーをローカルに保存"):
             to_save = typed.strip() or get_api_key()
             if not to_save:
-                st.error("先に上の欄へ APIキーを入力してください。")
+                st.error("先にキーを入力してください。")
             else:
                 try:
                     saved_path = save_api_key_to_env_file(to_save)
-                    st.success(
-                        f"保存しました: `{saved_path.name}`"
-                        "（このファイルは GitHub に上がりません）"
-                    )
+                    st.success(f"保存しました: `{saved_path.name}`")
                 except Exception as e:  # noqa: BLE001
-                    st.error(f"保存に失敗しました: {e}")
+                    st.error(f"保存失敗: {e}")
 
-        if get_api_key():
-            st.caption("いま Claude API キーが使えます。")
-        else:
-            st.caption("キーが無いときは簡易レビューで動きます。")
-
-    # ----- Step 1: 台本を読み込む（ドラッグ＆ドロップは使わない） -----
-    st.header("ステップ1: 台本を読み込む")
-    st.caption(
-        "次のいずれかで台本を入れてください。.txt または .docx に対応しています。"
-    )
+    # ----- Step 1: 台本を読み込む -----
+    st.markdown("#### ステップ1: 台本を読み込む")
+    st.caption(".txt / .docx")
 
     if st.button(
         "台本ファイルを選ぶ",
@@ -2671,21 +2716,20 @@ def main() -> None:
         try:
             picked = pick_local_script_path()
             if not picked:
-                st.warning("ファイルが選ばれませんでした。")
+                st.warning("キャンセルしました。")
             else:
                 text = extract_text_from_path(picked)
                 if not text.strip():
-                    st.error("ファイルの中身が空でした。")
+                    st.error("ファイルが空です。")
                 else:
                     commit_loaded_script(text, f"path-{picked}-{len(text)}")
                     st.success(
-                        f"台本を読み込みました: {Path(picked).name}"
-                        f"（約 {len(text):,} 字）"
+                        f"読込完了: {Path(picked).name}（約 {len(text):,} 字）"
                     )
         except Exception as e:  # noqa: BLE001
-            st.error(f"ファイルの読み込みに失敗しました: {e}")
+            st.error(f"読込失敗: {e}")
 
-    st.markdown("**または：ファイルの場所（パス）を貼る**")
+    st.caption("または：ファイルパス")
     path_col, path_btn_col = st.columns([3, 1])
     with path_col:
         local_path = st.text_input(
@@ -2693,7 +2737,6 @@ def main() -> None:
             key="script_local_path",
             placeholder="/Users/あなた/Desktop/台本.txt",
             label_visibility="collapsed",
-            help="Finderでファイルを選んで Optionキーを押しながら右クリック →「パス名をコピー」",
         )
     with path_btn_col:
         load_path_clicked = st.button(
@@ -2705,46 +2748,39 @@ def main() -> None:
         try:
             text = extract_text_from_path(local_path or "")
             if not text.strip():
-                st.error("ファイルの中身が空でした。")
+                st.error("ファイルが空です。")
             else:
                 commit_loaded_script(
                     text, f"path-{local_path}-{len(text)}"
                 )
-                st.success(f"台本を読み込みました（約 {len(text):,} 字）")
+                st.success(f"読込完了（約 {len(text):,} 字）")
         except Exception as e:  # noqa: BLE001
-            st.error(f"パスからの読み込みに失敗しました: {e}")
+            st.error(f"読込失敗: {e}")
 
-    st.markdown("**または：文章をそのまま貼り付け**")
+    st.caption("または：貼り付け")
     pasted = st.text_area(
         "台本テキストを貼り付け",
-        height=180,
+        height=140,
         key="script_paste_area",
-        placeholder="ここに台本をコピー＆ペーストして、「貼り付けた台本を使う」を押してください。",
+        placeholder="台本を貼り付けてから下のボタンを押す",
+        label_visibility="collapsed",
     )
     if st.button("貼り付けた台本を使う", key="btn_use_pasted_script"):
         text = (pasted or "").strip()
         if not text:
-            st.error("文章が空です。貼り付けてから押してください。")
+            st.error("文章が空です。")
         else:
             commit_loaded_script(text, f"paste-{len(text)}")
-            st.success(f"貼り付けた台本を使います（約 {len(text):,} 字）")
+            st.success(f"貼り付け完了（約 {len(text):,} 字）")
 
     if st.session_state.raw_script:
         n_chars = len(st.session_state.raw_script)
-        # 目安: 日本語読み上げおおよそ 300〜350字/分 → ここでは 320字/分
         est_min = max(1, round(n_chars / 320))
-        st.info(
-            f"読み込んだ文字数: 約 {n_chars:,} 字　／　読み上げ目安: 約 {est_min} 分"
-            "（実際の長さはVOICEVOXの速さで変わります）"
-        )
-        with st.expander("読み込んだ台本（原文）", expanded=False):
+        st.caption(f"約 {n_chars:,} 字 ／ 読み上げ目安 約 {est_min} 分")
+        with st.expander("台本（原文）", expanded=False):
             st.text(st.session_state.raw_script)
 
-        st.markdown("**次の進め方を選んでください**")
-        st.caption(
-            "レビューする: AIが医学表現などをチェックします。"
-            "レビューしない: チェックを飛ばして動画制作へ進みます。"
-        )
+        st.caption("次の進め方")
         col_rev, col_skip = st.columns(2)
         with col_rev:
             review_clicked = st.button(
@@ -2807,18 +2843,15 @@ def main() -> None:
         st.session_state.final_script = plain_script
         st.session_state.final_script_editor = plain_script
         st.success(
-            "レビューをスキップしました。下で台本を確認してください。"
+            "レビューをスキップしました。"
         )
 
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
     if st.session_state.review_done:
         if st.session_state.get("skip_review"):
-            st.header("ステップ2: 最終台本を確認して確定")
-            st.info(
-                "AIレビューは行っていません。"
-                "必要なら下の台本を直してから、動画制作へ進んでください。"
-            )
-            st.subheader("最終台本（ここで直してから確定）")
+            st.markdown("#### ステップ2: 台本を確定")
+            st.caption("必要なら直してから進む")
+            st.markdown("**最終台本**")
             if "final_script_editor" not in st.session_state:
                 st.session_state.final_script_editor = (
                     st.session_state.final_script or st.session_state.raw_script
@@ -2835,44 +2868,27 @@ def main() -> None:
                 else:
                     st.session_state.final_script = edited
                     st.session_state.script_confirmed = True
-                    st.success("台本を確定しました。次のステップで動画を生成できます。")
+                    st.success("台本を確定しました。")
 
         elif st.session_state.review:
-            st.header("ステップ2: レビュー結果を確認し、最終台本を確定")
+            st.markdown("#### ステップ2: レビュー結果")
             review = st.session_state.review
             mode = review.get("mode", "claude")
             if mode == "heuristic":
-                st.info(
-                    "いまは簡易レビューです。"
-                    "より本格的な医学チェックには Anthropic API キーを設定してください。"
-                )
+                st.caption("簡易レビュー（APIキーがあると本格レビュー）")
             else:
-                st.success(
-                    "Claude によるレビュー結果です。"
-                    "各指摘で ①承諾／②却下／③別案 を選んでください。"
-                )
-            st.caption(
-                "※医学用語・専門用語のカタカナ表記は、読み上げ誤読防止のため意図的なものとして"
-                "指摘対象外にしています。"
-            )
+                st.caption("各指摘で ①承諾／②却下／③別案")
+            st.caption("カタカナ医学用語の表記は指摘対象外")
             ruby_list = review.get("ruby_annotations") or []
             if ruby_list:
-                st.info(
-                    f"VOICEVOX用ルビを {len(ruby_list)} 件、最終台本へ自動付与しました"
-                    "（形式: {{表記|よみ}}）。下の最終台本で確認・手直しできます。"
-                )
-                with st.expander("付与したルビ一覧", expanded=False):
+                st.caption(f"ルビ {len(ruby_list)} 件を付与")
+                with st.expander("ルビ一覧", expanded=False):
                     for item in ruby_list:
                         st.write(
                             f"- {{{item.get('surface')}|{item.get('reading')}}}"
                         )
-            else:
-                st.caption("今回、追加ルビの候補はありませんでした。")
             if review.get("review_truncated"):
-                st.warning(
-                    "台本がとても長いため、レビューは先頭部分のみです。"
-                    "最終台本は全文を確認・編集してください。"
-                )
+                st.warning("長い台本のため、レビューは先頭部分のみです。")
 
             for section_key, section_title in REVIEW_SECTION_DEFS:
                 render_review_section_interactive(
@@ -2881,12 +2897,8 @@ def main() -> None:
                     review.get(section_key, []),
                 )
 
-            st.subheader("採択した内容を台本へ反映")
-            st.caption(
-                "①承諾 → 修正案をそのまま反映　／　"
-                "②却下 → 何もしない　／　"
-                "③別案 → 入力した文章で置き換え"
-            )
+            st.markdown("**採択を台本へ反映**")
+            st.caption("①承諾／②却下／③別案")
             if st.button("採択・別案を台本に反映する", type="secondary"):
                 base = (
                     st.session_state.get("final_script_editor")
@@ -2925,7 +2937,7 @@ def main() -> None:
                     for line in st.session_state.review_manual_log:
                         st.write(f"- {line}")
 
-            st.subheader("最終台本（ここで直してから確定）")
+            st.markdown("**最終台本**")
             if "final_script_editor" not in st.session_state:
                 st.session_state.final_script_editor = (
                     st.session_state.final_script or st.session_state.raw_script
@@ -2948,49 +2960,37 @@ def main() -> None:
                     st.session_state.final_script = edited
                     st.session_state.script_confirmed = True
                     st.success(
-                        "台本を確定しました。次のステップで動画を生成できます。"
+                    st.success("台本を確定しました。")
                     )
 
     # ----- Step 3: 動画生成 -----
     if st.session_state.script_confirmed:
-        st.header("ステップ3: 素材を用意してMP4を作る")
-        st.caption(
-            "VOICEVOX 音声 ＋ 同期字幕 ＋ 風景写真（約1分ごと）→ MP4"
-            "（BGM・効果音は入れません）"
-        )
-        st.info(
-            "背景はフリー風景写真を約1分ごとに切り替えます。"
-            "字幕は音声に合わせて表示し、VOICEVOXルビは外した読みやすい文章にします。"
-        )
+        st.markdown("#### ステップ3: 動画を作る")
+        st.caption("音声・字幕・風景写真（約1分ごと）→ MP4（BGMなし）")
 
-        st.subheader("① タイトル（画像 or 文字）")
+        st.markdown("**① タイトル**")
         title_upload = st.file_uploader(
-            "タイトル画像をアップロード（.png 推奨・透明OK）",
+            "タイトル画像（任意）",
             type=["png", "jpg", "jpeg", "webp"],
             key="title_image_upload",
-            help="画像があれば文字タイトルより優先されます（最初のシーンに表示）",
         )
         if title_upload is not None:
-            st.image(title_upload, caption="タイトル画像プレビュー", use_container_width=True)
+            st.image(title_upload, caption="プレビュー", use_container_width=True)
 
         st.text_input(
-            "タイトル文字（画像が無いとき用）",
+            "タイトル文字（画像が無いとき）",
             key="video_title",
         )
 
-        st.subheader("② エンディング（フィクション表示・参考文献・音声）")
-        st.caption(
-            f"本編には出さず、動画の最後に約 {int(ENDING_DURATION_SEC)} 秒だけ表示します。"
-        )
-        st.markdown("**固定で入る文（フィクション表示）**")
-        st.info(ENDING_FICTION_NOTICE)
+        st.markdown("**② エンディング**")
+        st.caption(f"動画末尾に約 {int(ENDING_DURATION_SEC)} 秒表示")
+        st.caption("固定文＋参考文献＋VOICEVOXクレジット")
 
-        st.markdown("**参考文献**（ここに入力した内容がエンディングに入ります）")
+        st.markdown("**参考文献**")
         ref_upload = st.file_uploader(
-            "参考文献をファイルから入れる（.txt）",
+            "参考文献ファイル（.txt・任意）",
             type=["txt"],
             key="reference_upload",
-            help="例: 論文名・DOI・ライセンスなど",
         )
         if ref_upload is not None:
             file_id = f"{ref_upload.name}-{ref_upload.size}"
@@ -3015,27 +3015,16 @@ def main() -> None:
             st.session_state["_reference_migrated"] = True
 
         st.text_area(
-            "参考文献の内容（前回の入力を保持・必要なら上書き）",
+            "参考文献",
             key="reference_text",
-            height=120,
+            height=100,
             placeholder=DEFAULT_REFERENCE_EXAMPLE,
-            help="論文名・雑誌名・DOI・ライセンスなどを書いてください。変更は自動保存されます。",
             on_change=persist_reference_from_widget,
         )
-        st.caption(
-            "前回入力した内容を残しています。書き換えるとその内容で上書き保存されます。"
-            "エンディング見出しは「参考文献」です。"
-        )
-        st.caption(
-            "音声行は次の③で選んだ声優名が自動で入ります"
-            f"（例: {format_voicevox_credit(DEFAULT_SPEAKER_NAME)}）。"
-        )
+        st.caption("変更は自動保存。音声クレジットは③の声優名から自動入力。")
 
-        st.subheader("③ 読み上げ音声（VOICEVOX）")
-        st.caption(
-            "VOICEVOXアプリに入っている（ダウンロード済みの）声優と声調から選びます。"
-            "一覧はVOICEVOXから自動取得します。"
-        )
+        st.markdown("**③ 読み上げ（VOICEVOX）**")
+        st.caption("声優と声調を選ぶ")
         selected_style_id = int(
             st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID)
         )
@@ -3154,11 +3143,9 @@ def main() -> None:
             selected_style_name = DEFAULT_STYLE_NAME
 
         st.caption(
-            "VOICEVOXルビは常にONです。"
-            "半角 {表記|よみ} と全角 ｛表記｜よみ｝ は同じものとして扱います。"
-            "読み上げ時はよみだけをVOICEVOXへ送り、字幕には表記だけを出します。"
+            "ルビON。半角/全角の {｝| は同じ扱い。"
+            f"速度は {VOICEVOX_SPEED_SCALE:.1f} 倍速固定。"
         )
-        st.caption(f"読み上げ速度は {VOICEVOX_SPEED_SCALE:.1f} 倍速で固定です。")
 
         if st.button("3. 動画を生成する", type="primary"):
             progress = st.progress(0, text="準備中…")
@@ -3420,13 +3407,6 @@ def main() -> None:
                 type="primary",
             )
             st.video(st.session_state.mp4_bytes)
-
-    # ----- 画面一番下の注意書き -----
-    st.divider()
-    st.markdown(
-        f"<p style='font-size:0.85rem;color:#666;line-height:1.5;'>{DISCLAIMER_TEXT}</p>",
-        unsafe_allow_html=True,
-    )
 
 
 if __name__ == "__main__":
