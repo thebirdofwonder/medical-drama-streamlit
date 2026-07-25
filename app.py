@@ -28,6 +28,8 @@ VOICEVOX_URL = "http://127.0.0.1:50021"
 DEFAULT_SPEAKER_ID = 29
 DEFAULT_SPEAKER_NAME = "No.7"
 DEFAULT_STYLE_NAME = "ノーマル"
+# 読み上げ速度（1.0＝通常、1.2＝1.2倍速）
+VOICEVOX_SPEED_SCALE = 1.2
 VIDEO_SIZE = (1920, 1080)
 CREDIT_TEXT = f"音声\nVOICEVOX：{DEFAULT_SPEAKER_NAME}"
 # 後方互換（古いコード参照用）
@@ -1059,8 +1061,8 @@ def synthesize_wav_bytes(text: str, speaker: int = DEFAULT_SPEAKER_ID) -> bytes:
     if q.status_code != 200:
         raise RuntimeError(f"audio_query 失敗: HTTP {q.status_code} / {q.text[:300]}")
     query = q.json()
-    # 少しゆっくり・はっきり（医学ドラマ向け）
-    query["speedScale"] = float(query.get("speedScale", 1.0)) * 0.95
+    # 通常の 1.2 倍速
+    query["speedScale"] = float(query.get("speedScale", 1.0)) * VOICEVOX_SPEED_SCALE
     query["intonationScale"] = float(query.get("intonationScale", 1.0))
 
     s = requests.post(
