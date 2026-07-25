@@ -311,6 +311,80 @@ def collect_default_ruby_annotations(script: str) -> list[dict[str, str]]:
     return found
 
 
+def merge_ruby_annotations(
+    *groups: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """複数のルビ一覧をまとめ、同じ表記は先勝ち。"""
+    merged: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group or []:
+            surface = str(item.get("surface") or "").strip()
+            reading = normalize_voicevox_reading(str(item.get("reading") or ""))
+            if not surface or not reading or surface in seen or surface == reading:
+                continue
+            seen.add(surface)
+            merged.append({"surface": surface, "reading": reading})
+    return merged
+
+
+def count_voicevox_ruby(text: str) -> int:
+    return len(re.findall(r"[{｛][^|｜\n]+[|｜][^}｝\n]+[}｝]", text or ""))
+
+
+def prepare_script_for_voicevox(
+    script: str,
+    extra_annotations: list[dict[str, str]] | None = None,
+    enabled: bool = True,
+) -> tuple[str, int]:
+    """
+    音声生成直前にルビを整える。
+    enabled=True（既定）: 辞書＋追加注釈のルビを付与して返す
+    enabled=False: ルビを外した文を返す
+    戻り値: (台本, ルビ件数)
+    """
+    text = script or ""
+    if not enabled:
+        plain = strip_voicevox_ruby(text)
+        return plain, 0
+    annotations = merge_ruby_annotations(
+        list(extra_annotations or []),
+        collect_default_ruby_annotations(text),
+    )
+    out = apply_voicevox_ruby(text, annotations)
+    return out, count_voicevox_ruby(out)
+
+
+def _ruby_incomplete(fragment: str) -> bool:
+    """断片の末尾で {表記|よみ} が途中切れなら True。"""
+    # 最後の { より後に対応する } が無ければ途中切れ
+    last_open = max(fragment.rfind("{"), fragment.rfind("｛"))
+    if last_open < 0:
+        return False
+    tail = fragment[last_open:]
+    return ("}" not in tail) and ("｝" not in tail)
+
+
+def _safe_force_chunks(text: str, max_chars: int) -> list[str]:
+    """文字数で切るが、ルビ {表記|よみ} の途中では切らない。"""
+    if len(text) <= max_chars:
+        return [text]
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        end = min(i + max_chars, n)
+        # ルビ途中なら閉じるまで延ばす
+        while end < n and _ruby_incomplete(text[i:end]):
+            end += 1
+        # 次チャンク先頭がルビの途中にならないよう調整は上記で足りる
+        if end <= i:
+            end = min(i + 1, n)
+        out.append(text[i:end])
+        i = end
+    return out
+
+
 def is_katakana_notation_complaint(item: dict[str, str]) -> bool:
     """カタカナ表記そのものを問題にしている指摘なら True（除外用）。"""
     blob = " ".join(
@@ -760,9 +834,8 @@ def format_voicevox_credit(speaker_name: str, style_name: str = "") -> str:
 
 def build_ending_credits_text(reference_text: str, speaker_name: str) -> str:
     """
-    エンディング全文を組み立てる。
-    参考文献ラベルは「参考文献」（医学的参考文献 ではない）。
-    音声行は選択した声優名。
+    エンディング全文を組み立てる（プレビュー／保存用）。
+    参考文献・音声の直前は空行。区切りは文字の「----」ではなく描画時に線を引く。
     """
     ref = (reference_text or "").strip()
     if not ref:
@@ -771,16 +844,140 @@ def build_ending_credits_text(reference_text: str, speaker_name: str) -> str:
     return "\n".join(
         [
             ENDING_FICTION_NOTICE,
-            "----------",
+            "",
             "参考文献",
+            "",
             ref,
-            "----------",
+            "",
             "音声",
+            "",
             voice_line,
             "",
             ENDING_FOOTER,
         ]
     )
+
+
+def create_ending_credits_frame(
+    path: Path,
+    ending_text: str = "",
+    voicevox_credit: str = CREDIT_TEXT,
+    reference_text: str | None = None,
+    speaker_name: str | None = None,
+) -> Path:
+    """
+    エンディング約10秒用。中央寄せ。
+    参考文献・音声の前に余白を取り、区切りは横線で描いて文字と重ねない。
+    """
+    _ = voicevox_credit
+    w, h = VIDEO_SIZE
+    img = _dark_gradient_base((20, 25, 40))
+    draw = ImageDraw.Draw(img)
+
+    # 構造化データがあればそれを優先（重なり防止のため専用レイアウト）
+    if reference_text is not None or speaker_name is not None:
+        ref = (reference_text or "").strip() or "（参考文献未入力）"
+        name = (speaker_name or "").strip() or DEFAULT_SPEAKER_NAME
+        fiction_lines = [
+            ln for ln in ENDING_FICTION_NOTICE.split("\n") if ln.strip()
+        ]
+        blocks: list[tuple[str, str]] = [
+            ("text", fiction_lines[0] if fiction_lines else ""),
+        ]
+        for ln in fiction_lines[1:]:
+            blocks.append(("text", ln))
+        blocks.extend(
+            [
+                ("gap", ""),
+                ("rule", ""),
+                ("gap", ""),
+                ("heading", "参考文献"),
+                ("gap_sm", ""),
+                ("text", ref),
+                ("gap", ""),
+                ("rule", ""),
+                ("gap", ""),
+                ("heading", "音声"),
+                ("gap_sm", ""),
+                ("text", format_voicevox_credit(name)),
+                ("gap", ""),
+                ("text", ENDING_FOOTER),
+            ]
+        )
+    else:
+        # 互換: 旧・全文テキスト（---- は無視して余白扱いにする）
+        body = (ending_text or "").strip() or "（エンディング文未設定）"
+        blocks = []
+        for paragraph in body.replace("\r\n", "\n").split("\n"):
+            p = paragraph.strip()
+            if not p:
+                blocks.append(("gap_sm", ""))
+            elif set(p) <= set("-─━—–_") and len(p) >= 3:
+                blocks.append(("gap", ""))
+                blocks.append(("rule", ""))
+                blocks.append(("gap", ""))
+            elif p in ("参考文献", "音声"):
+                blocks.append(("gap", ""))
+                blocks.append(("heading", p))
+                blocks.append(("gap_sm", ""))
+            else:
+                blocks.append(("text", p))
+
+    body_font = load_jp_font(34, bold=False)
+    heading_font = load_jp_font(42, bold=True)
+    max_w = int(w * 0.86)
+    y = int(h * 0.08)
+    fill = (220, 225, 230)
+    heading_fill = (245, 245, 248)
+
+    def _draw_centered(line: str, font: ImageFont.ImageFont, color: tuple[int, int, int]) -> int:
+        nonlocal y
+        bbox = draw.textbbox((0, 0), line, font=font)
+        tw = bbox[2] - bbox[0]
+        th = max(bbox[3] - bbox[1], 1)
+        x = (w - tw) // 2
+        draw.text((x + 2, y + 2), line, font=font, fill=(0, 0, 0))
+        draw.text((x, y), line, font=font, fill=color)
+        y += th + 14
+        return th
+
+    for kind, content in blocks:
+        if y > h - 48:
+            break
+        if kind == "gap":
+            y += 48
+            continue
+        if kind == "gap_sm":
+            y += 22
+            continue
+        if kind == "rule":
+            # 横線の上下に余白を確保（見出し・本文と絶対に重ねない）
+            y += 16
+            rule_w = int(w * 0.22)
+            x0 = (w - rule_w) // 2
+            draw.line([(x0, y), (x0 + rule_w, y)], fill=(140, 150, 165), width=2)
+            y += 44
+            continue
+        if kind == "heading":
+            _draw_centered(content, heading_font, heading_fill)
+            y += 10
+            continue
+        # text: 長い行は折り返し、各行を中央寄せ
+        wrapped = wrap_text_to_width(content, body_font, max_w, draw) or [""]
+        # 英語の極端な1文字折り返しを減らす（スペース優先の再折り返し）
+        if content.isascii() and " " in content:
+            wrapped = _wrap_latin_prefer_spaces(content, body_font, max_w, draw)
+        for line in wrapped:
+            if y > h - 48:
+                break
+            if not line:
+                y += 12
+                continue
+            _draw_centered(line, body_font, fill)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.convert("RGB").save(path, format="PNG")
+    return path
 
 
 def resolve_default_voice_selection(
@@ -814,7 +1011,7 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
     """
     句点単位で分割する（文章同士はくっつけない）。
     理由: 1音声区間＝1字幕にすると、読み上げと表示がズレにくい。
-    1文が長すぎるときだけ max_chars でさらに切る。
+    1文が長すぎるときだけ max_chars でさらに切る（ルビの途中では切らない）。
     """
     text = text.replace("\r\n", "\n").strip()
     if not text:
@@ -847,8 +1044,7 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
                         if len(piece) <= max_chars:
                             buf = piece
                         else:
-                            for i in range(0, len(piece), max_chars):
-                                chunks.append(piece[i : i + max_chars])
+                            chunks.extend(_safe_force_chunks(piece, max_chars))
                             buf = ""
                 if buf:
                     chunks.append(buf)
@@ -1133,6 +1329,34 @@ def wrap_text_to_width(
                 buf = ch
         if buf:
             lines.append(buf)
+    return lines
+
+
+def _wrap_latin_prefer_spaces(
+    text: str, font: ImageFont.ImageFont, max_width: int, draw: ImageDraw.ImageDraw
+) -> list[str]:
+    """英語など、できれば単語の途中ではなくスペースで折り返す。"""
+    words = (text or "").split()
+    if not words:
+        return []
+    lines: list[str] = []
+    buf = ""
+    for word in words:
+        trial = word if not buf else f"{buf} {word}"
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            buf = trial
+            continue
+        if buf:
+            lines.append(buf)
+        # 単語自体が幅を超える場合は1文字折り返し
+        if draw.textbbox((0, 0), word, font=font)[2] > max_width:
+            lines.extend(wrap_text_to_width(word, font, max_width, draw))
+            buf = ""
+        else:
+            buf = word
+    if buf:
+        lines.append(buf)
     return lines
 
 
@@ -1513,40 +1737,6 @@ def create_scene_frame(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     base.convert("RGB").save(path, format="PNG")
-    return path
-
-
-def create_ending_credits_frame(
-    path: Path,
-    ending_text: str,
-    voicevox_credit: str = CREDIT_TEXT,
-) -> Path:
-    """エンディング約10秒用。フィクション表示・参考文献・音声クレジットを表示。"""
-    _ = voicevox_credit  # 本文に含める想定のため、二重描画しない
-    w, h = VIDEO_SIZE
-    img = _dark_gradient_base((20, 25, 40))
-    draw = ImageDraw.Draw(img)
-
-    body = (ending_text or "").strip()
-    if not body:
-        body = "（エンディング文未設定）"
-
-    body_font = load_jp_font(34, bold=False)
-    y = int(h * 0.10)
-    max_w = int(w * 0.88)
-    for line in wrap_text_to_width(body, body_font, max_w, draw)[:22]:
-        bbox = draw.textbbox((0, 0), line, font=body_font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        x = (w - tw) // 2
-        draw.text((x + 2, y + 2), line, font=body_font, fill=(0, 0, 0))
-        draw.text((x, y), line, font=body_font, fill=(210, 215, 220))
-        y += th + 8
-        if y > h - 40:
-            break
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    img.convert("RGB").save(path, format="PNG")
     return path
 
 
@@ -2076,6 +2266,7 @@ def init_state() -> None:
         "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
         "vvox_style_name": DEFAULT_STYLE_NAME,
         "vvox_style_id": DEFAULT_SPEAKER_ID,
+        "vvox_ruby_enabled": True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2504,6 +2695,20 @@ def main() -> None:
             selected_speaker_name = DEFAULT_SPEAKER_NAME
             selected_style_name = DEFAULT_STYLE_NAME
 
+        st.markdown("**VOICEVOXルビ（読み方指定）**")
+        st.checkbox(
+            "ルビをONにする（推奨）",
+            key="vvox_ruby_enabled",
+            help=(
+                "ON: 台本の {漢字|よみ} と医学用語辞書のルビを使って読み上げます。"
+                "字幕にはルビを出さず、読みやすい漢字のまま表示します。"
+            ),
+        )
+        if st.session_state.get("vvox_ruby_enabled", True):
+            st.success("ルビ: ON（読み間違い防止のため、音声生成時にルビを適用します）")
+        else:
+            st.warning("ルビ: OFF（ルビを外して読み上げます。誤読が増えることがあります）")
+
         if st.button("3. 動画を生成する", type="primary"):
             progress = st.progress(0, text="準備中…")
             status = st.empty()
@@ -2533,22 +2738,39 @@ def main() -> None:
                 st.session_state.ending_credits_text = ending_body
 
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                script_path = OUTPUT_DIR / "last_script.txt"
-                script_path.write_text(
-                    st.session_state.final_script, encoding="utf-8"
+                ruby_on = bool(st.session_state.get("vvox_ruby_enabled", True))
+                extra_ruby = []
+                if st.session_state.get("review"):
+                    extra_ruby = (
+                        st.session_state.review.get("ruby_annotations") or []
+                    )
+                voice_script, ruby_count = prepare_script_for_voicevox(
+                    st.session_state.final_script,
+                    extra_annotations=extra_ruby,
+                    enabled=ruby_on,
                 )
+                # 確定台本もルビ適用後で揃える（次回編集用）
+                if ruby_on and voice_script:
+                    st.session_state.final_script = voice_script
+                    st.session_state.final_script_editor = voice_script
+
+                script_path = OUTPUT_DIR / "last_script.txt"
+                script_path.write_text(voice_script, encoding="utf-8")
                 st.session_state.last_script_path = str(script_path)
 
                 with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
                     tmp_path = Path(tmp)
 
+                    ruby_msg = (
+                        f"ルビON・{ruby_count}件"
+                        if ruby_on
+                        else "ルビOFF"
+                    )
                     status.info(
-                        f"① 音声を生成しています（{speaker_name} / {style_name}）…"
+                        f"① 音声を生成しています（{speaker_name} / {style_name}・{ruby_msg}）…"
                     )
                     wav_path = tmp_path / "narration.wav"
-                    n_chunks = len(
-                        split_text_for_voicevox(st.session_state.final_script)
-                    )
+                    n_chunks = len(split_text_for_voicevox(voice_script))
 
                     def _voice_prog(done: int, total: int) -> None:
                         pct = 5 + int(45 * (done / max(total, 1)))
@@ -2557,12 +2779,12 @@ def main() -> None:
                             text=f"VOICEVOX 音声生成中… {done}/{total} 区間",
                         )
                         status.info(
-                            f"① {speaker_name}（{style_name}）で読み上げ中"
+                            f"① {speaker_name}（{style_name}・{ruby_msg}）で読み上げ中"
                             f"（{done}/{total}）… 予定区間数 {n_chunks}"
                         )
 
                     wav_path, subtitle_cues = generate_narration_wav_to_file(
-                        st.session_state.final_script,
+                        voice_script,
                         wav_path,
                         progress_callback=_voice_prog,
                         speaker=style_id,
@@ -2623,6 +2845,8 @@ def main() -> None:
                         ending_path,
                         ending_text=ending_body,
                         voicevox_credit=voice_credit,
+                        reference_text=st.session_state.get("reference_text", ""),
+                        speaker_name=speaker_name,
                     )
                     # プレビューはエンディングも保存
                     (OUTPUT_DIR / "last_ending.png").write_bytes(
