@@ -3068,14 +3068,7 @@ def main() -> None:
             key="video_title",
         )
 
-        st.markdown("**② エンディング**")
-        st.caption(
-            f"音声終了後 {int(ENDING_FADE_SEC)} 秒でフェード移行し、"
-            f"その後約 {int(ENDING_DURATION_SEC)} 秒表示"
-        )
-        st.caption("固定文＋参考文献＋VOICEVOXクレジット")
-
-        st.markdown("**参考文献**")
+        st.markdown("**② 参考文献**")
         st.caption(".txt または .docx でやりとり")
         ref_upload = st.file_uploader(
             "参考文献ファイル（.txt / .docx）",
@@ -3134,7 +3127,7 @@ def main() -> None:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key="dl_reference_docx",
                 )
-        st.caption("変更は自動保存。音声クレジットは③の声優名から自動入力。")
+        st.caption("変更は自動保存。エンディング文面は④で確認します。")
 
         st.markdown("**③ 読み上げ（VOICEVOX）**")
         st.caption("声優と声調を選ぶ")
@@ -3273,6 +3266,47 @@ def main() -> None:
             f"（初期 {VOICEVOX_SPEED_SCALE:.1f}）"
         )
 
+        # ----- ④ エンディング画面の確認・修正 -----
+        st.markdown("**④ エンディング画面の確認・修正**")
+        st.caption(
+            f"音声終了後 {int(ENDING_FADE_SEC)} 秒でフェードし、"
+            f"約 {int(ENDING_DURATION_SEC)} 秒表示。下の文面が画面に出ます。"
+        )
+        ending_speaker = str(
+            st.session_state.get("vvox_speaker_name", selected_speaker_name)
+            or DEFAULT_SPEAKER_NAME
+        )
+        ending_ref = str(st.session_state.get("reference_text") or "")
+        latest_ending = build_ending_credits_text(ending_ref, ending_speaker)
+        ending_sig = f"{ending_ref.strip()}\0{ending_speaker.strip()}"
+        prev_auto = str(st.session_state.get("_ending_auto_text") or "")
+        current_ending = str(st.session_state.get("ending_credits_text") or "")
+        # 初回／空／自動文面のまま → 現在レイアウト＋最新の参考文献・声優で pre-fill
+        never_inited = st.session_state.get("_ending_prefill_sig") is None
+        still_auto = current_ending.strip() == prev_auto.strip()
+        if never_inited or (not current_ending.strip()) or still_auto:
+            st.session_state.ending_credits_text = latest_ending
+            st.session_state._ending_auto_text = latest_ending
+            st.session_state._ending_prefill_sig = ending_sig
+        elif st.session_state.get("_ending_prefill_sig") != ending_sig:
+            st.caption(
+                "参考文献または声優が変わっています。"
+                "必要なら「最新で入れ直す」を押してください。"
+            )
+
+        if st.button("最新の参考文献・声優で入れ直す", key="btn_refresh_ending"):
+            st.session_state.ending_credits_text = latest_ending
+            st.session_state._ending_auto_text = latest_ending
+            st.session_state._ending_prefill_sig = ending_sig
+            st.rerun()
+
+        st.text_area(
+            "エンディング文面（編集可）",
+            key="ending_credits_text",
+            height=280,
+            help="フィクション表示・参考文献・音声クレジットなど。ここを直した内容が動画に使われます。",
+        )
+
         if st.button("3. 動画を生成する", type="primary"):
             progress = st.progress(0, text="準備中…")
             status = st.empty()
@@ -3293,13 +3327,15 @@ def main() -> None:
                 style_name = str(
                     st.session_state.get("vvox_style_name", selected_style_name)
                 )
-                voice_credit = format_voicevox_credit(speaker_name)
-                ending_body = build_ending_credits_text(
-                    st.session_state.get("reference_text", ""),
-                    speaker_name,
-                )
-                # プレビュー用にも残す
-                st.session_state.ending_credits_text = ending_body
+                # ④で確認・修正した文面を使う（空なら最新で組み立て）
+                ending_body = (st.session_state.get("ending_credits_text") or "").strip()
+                if not ending_body:
+                    ending_body = build_ending_credits_text(
+                        st.session_state.get("reference_text", ""),
+                        speaker_name,
+                    )
+                    st.session_state.ending_credits_text = ending_body
+                    st.session_state._ending_auto_text = ending_body
 
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                 speed_scale = clamp_voicevox_speed(
@@ -3432,9 +3468,6 @@ def main() -> None:
                     create_ending_credits_frame(
                         ending_path,
                         ending_text=ending_body,
-                        voicevox_credit=voice_credit,
-                        reference_text=st.session_state.get("reference_text", ""),
-                        speaker_name=speaker_name,
                     )
                     # プレビューはエンディングも保存
                     (OUTPUT_DIR / "last_ending.png").write_bytes(
