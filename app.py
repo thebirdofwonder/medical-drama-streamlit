@@ -1708,17 +1708,41 @@ def load_image_from_upload(uploaded_file) -> Image.Image | None:
 
 
 def load_text_from_upload(uploaded_file) -> str:
+    """アップロードファイルからテキストを読む（.txt / .docx 両対応）。"""
     if uploaded_file is None:
         return ""
-    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    name = uploaded_file.name or "upload.txt"
+    raw = (
+        uploaded_file.getvalue()
+        if hasattr(uploaded_file, "getvalue")
+        else uploaded_file.read()
+    )
     if isinstance(raw, str):
-        return raw
-    for enc in ("utf-8", "utf-8-sig", "cp932", "shift_jis"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+        raw = raw.encode("utf-8")
+    lower = name.lower()
+    if not (
+        lower.endswith(".txt")
+        or lower.endswith(".text")
+        or lower.endswith(".md")
+        or lower.endswith(".docx")
+    ):
+        # 拡張子が無い／不明なときは中身で判断
+        name = "upload.docx" if raw[:2] == b"PK" else "upload.txt"
+    return extract_text_from_bytes(name, raw)
+
+
+def text_to_docx_bytes(text: str) -> bytes:
+    """プレーンテキストを Word（.docx）のバイト列にする。"""
+    doc = Document()
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    if not lines:
+        doc.add_paragraph("")
+    else:
+        for line in lines:
+            doc.add_paragraph(line)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 def paste_centered(
@@ -3031,9 +3055,7 @@ def main() -> None:
                 else:
                     st.session_state.final_script = edited
                     st.session_state.script_confirmed = True
-                    st.success(
                     st.success("台本を確定しました。")
-                    )
 
     # ----- Step 3: 動画生成 -----
     if st.session_state.script_confirmed:
@@ -3041,16 +3063,8 @@ def main() -> None:
         st.caption("音声・字幕・風景写真（約1分ごと）→ MP4（BGMなし）")
 
         st.markdown("**① タイトル**")
-        title_upload = st.file_uploader(
-            "タイトル画像（任意）",
-            type=["png", "jpg", "jpeg", "webp"],
-            key="title_image_upload",
-        )
-        if title_upload is not None:
-            st.image(title_upload, caption="プレビュー", use_container_width=True)
-
         st.text_input(
-            "タイトル文字（画像が無いとき）",
+            "タイトル文字",
             key="video_title",
         )
 
@@ -3062,18 +3076,23 @@ def main() -> None:
         st.caption("固定文＋参考文献＋VOICEVOXクレジット")
 
         st.markdown("**参考文献**")
+        st.caption(".txt または .docx でやりとり")
         ref_upload = st.file_uploader(
-            "参考文献ファイル（.txt・任意）",
-            type=["txt"],
+            "参考文献ファイル（.txt / .docx）",
+            type=["txt", "docx"],
             key="reference_upload",
         )
         if ref_upload is not None:
             file_id = f"{ref_upload.name}-{ref_upload.size}"
             if st.session_state.get("_reference_file_id") != file_id:
-                loaded = load_text_from_upload(ref_upload).strip()
-                st.session_state.reference_text = loaded
-                st.session_state["_reference_file_id"] = file_id
-                save_reference_text(loaded)
+                try:
+                    loaded = load_text_from_upload(ref_upload).strip()
+                    st.session_state.reference_text = loaded
+                    st.session_state["_reference_file_id"] = file_id
+                    save_reference_text(loaded)
+                    st.success(f"参考文献を読み込みました: {ref_upload.name}")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"参考文献の読込失敗: {e}")
 
         # 旧・脚注／自由文からの移行（一度だけ。生成済みエンディング全文は取り込まない）
         if st.session_state.get("_reference_migrated") is not True:
@@ -3096,6 +3115,25 @@ def main() -> None:
             placeholder=DEFAULT_REFERENCE_EXAMPLE,
             on_change=persist_reference_from_widget,
         )
+        ref_now = (st.session_state.get("reference_text") or "").strip()
+        if ref_now:
+            c_ref_txt, c_ref_docx = st.columns(2)
+            with c_ref_txt:
+                st.download_button(
+                    "参考文献を .txt で保存",
+                    data=ref_now.encode("utf-8"),
+                    file_name="reference.txt",
+                    mime="text/plain",
+                    key="dl_reference_txt",
+                )
+            with c_ref_docx:
+                st.download_button(
+                    "参考文献を .docx で保存",
+                    data=text_to_docx_bytes(ref_now),
+                    file_name="reference.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_reference_docx",
+                )
         st.caption("変更は自動保存。音声クレジットは③の声優名から自動入力。")
 
         st.markdown("**③ 読み上げ（VOICEVOX）**")
@@ -3287,6 +3325,8 @@ def main() -> None:
 
                 script_path = OUTPUT_DIR / "last_script.txt"
                 script_path.write_text(voice_script, encoding="utf-8")
+                script_docx_path = OUTPUT_DIR / "last_script.docx"
+                script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
                 # VOICEVOX送信用（よみのみ）と字幕用（表記のみ）も保存
                 tts_script = expand_voicevox_ruby_to_reading(voice_script)
                 sub_script = strip_voicevox_ruby(voice_script)
@@ -3296,7 +3336,7 @@ def main() -> None:
                 (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
                     sub_script, encoding="utf-8"
                 )
-                st.session_state.last_script_path = str(script_path)
+                st.session_state.last_script_path = str(script_docx_path)
 
                 with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
                     tmp_path = Path(tmp)
@@ -3357,7 +3397,6 @@ def main() -> None:
                     progress.progress(52, text="風景写真をダウンロード中…")
                     landscapes = ensure_landscape_images(len(schedule))
                     progress.progress(55, text="シーン画像を合成中…")
-                    title_img = load_image_from_upload(title_upload)
                     scene_dir = tmp_path / "scenes"
                     scene_dir.mkdir(parents=True, exist_ok=True)
                     scene_clips: list[tuple[Path, float]] = []
@@ -3371,7 +3410,7 @@ def main() -> None:
                             frame_path,
                             landscape_path=land,
                             title=st.session_state.get("video_title", ""),
-                            title_img=title_img,
+                            title_img=None,
                             show_title=(i == 0),
                             landscape_index=li,
                         )
@@ -3485,10 +3524,10 @@ def main() -> None:
             script_saved = st.session_state.get("last_script_path") or ""
             if script_saved and Path(script_saved).exists():
                 st.download_button(
-                    label="今回の台本テキストをダウンロード",
-                    data=Path(script_saved).read_text(encoding="utf-8"),
-                    file_name="last_script.txt",
-                    mime="text/plain",
+                    label="今回の台本を Word（.docx）でダウンロード",
+                    data=Path(script_saved).read_bytes(),
+                    file_name="last_script.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
         elif st.session_state.mp4_bytes:
             st.download_button(
