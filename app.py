@@ -64,7 +64,9 @@ BGM_CANDIDATE_URLS = [
 ]
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
-LANDSCAPE_DIR = OUTPUT_DIR / "landscapes"
+# 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
+MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
+LANDSCAPE_DIR = MEDICAL_BG_DIR  # 互換エイリアス
 # 参考文献の前回入力（outputs/ は GitHub に上がらない）
 REFERENCE_SAVE_PATH = OUTPUT_DIR / "last_reference.txt"
 
@@ -112,21 +114,46 @@ def save_reference_text(text: str) -> None:
 def persist_reference_from_widget() -> None:
     """参考文献テキスト欄の変更をファイルへ保存する（Streamlit on_change用）。"""
     save_reference_text(str(st.session_state.get("reference_text") or ""))
-# Unsplash のフリー利用可能な風景写真（表示用。出典はエンディングに記載推奨）
-LANDSCAPE_IMAGE_URLS = [
-    "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1469474968028-56623f02e42e?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1433086966358-54859d0ed716?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1519681393784-d120267933ba?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1475924156734-496f6cac6ec1?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1418065460487-3e41a6c84dc5?auto=format&fit=crop&w=1920&h=1080&q=80",
-    "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1920&h=1080&q=80",
+# Unsplash（著作権フリー）の医療関連写真。病院・手術室・病室・検査機器など。
+# 出典は動画説明欄への記載を推奨（Unsplash License）。
+MEDICAL_BACKGROUND_URLS = [
+    # 病院廊下
+    "https://images.unsplash.com/photo-1519494026892-80bbd2d6fd0d?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 手術室・執刀
+    "https://images.unsplash.com/photo-1551076805-e1869033e561?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # モニター・検査機器
+    "https://images.unsplash.com/photo-1579684385127-1ef15d508118?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 病室・ベッド
+    "https://images.unsplash.com/photo-1516549655169-df83a0774514?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 聴診器など診療用具
+    "https://images.unsplash.com/photo-1584982751601-97dcc096659c?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 手術灯・オペ室
+    "https://images.unsplash.com/photo-1551601651-2a8555f1a136?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 手術用具
+    "https://images.unsplash.com/photo-1581594693702-fbdc51b2763b?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # レントゲン・画像検査
+    "https://images.unsplash.com/photo-1530497610245-94d3c16cda28?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 医療スタッフ・診療
+    "https://images.unsplash.com/photo-1576091160399-112ba8d25d1d?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 病院内の医療機器
+    "https://images.unsplash.com/photo-1666214280557-f1b5022eb634?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 救急・医療現場
+    "https://images.unsplash.com/photo-1505751172876-fa1923c5c528?auto=format&fit=crop&w=1920&h=1080&q=80",
+    # 検査・ラボ
+    "https://images.unsplash.com/photo-1582719471384-894fbb16e074?auto=format&fit=crop&w=1920&h=1080&q=80",
 ]
+# 台本の場面に近い写真を優先するための対応（URLリストの番号）
+THEME_TO_BG_INDEX = {
+    "er": 10,
+    "icu": 2,
+    "surgery": 1,
+    "lab": 11,
+    "ward": 3,
+    "consult": 8,
+    "pharma": 4,
+    "ambulance": 10,
+}
+LANDSCAPE_IMAGE_URLS = MEDICAL_BACKGROUND_URLS  # 互換エイリアス
 # 1区間＝1字幕にするため短め（句点で区切り、長文のみここで切る）
 MAX_VOICEVOX_CHARS = 90
 # 字幕切替の時間精度（低いと最大で約 1/fps 秒ずれる）
@@ -1940,31 +1967,33 @@ def split_script_for_scenes(script: str, n_scenes: int) -> list[str]:
 
 
 def make_fallback_landscape(index: int) -> Image.Image:
-    """ダウンロード失敗時の控えめな風景風グラデーション。"""
-    accents = [
-        (30, 60, 100),
-        (40, 70, 50),
-        (70, 50, 40),
-        (50, 50, 80),
-        (35, 55, 70),
-    ]
-    return _dark_gradient_base(accents[index % len(accents)]).convert("RGB")
+    """ダウンロード失敗時は自作の医療イメージ（写真不使用）を使う。"""
+    theme = THEME_CYCLE[index % len(THEME_CYCLE)]
+    return draw_medical_scene(theme).convert("RGB")
 
 
-def ensure_landscape_images(needed: int) -> list[Path]:
+def ensure_landscape_images(needed: int | list[int]) -> list[Path]:
     """
-    著作権フリーの風景画像を取得してキャッシュする。
-    足りない分はネットから取得。失敗時は自作グラデーション。
+    著作権フリーの医療背景写真を取得してキャッシュする。
+    needed が整数なら 0..(needed-1)、リストならその番号の写真を用意。
+    失敗時は自作の医療イメージ。
     """
-    LANDSCAPE_DIR.mkdir(parents=True, exist_ok=True)
-    paths: list[Path] = []
-    n = max(1, int(needed))
-    for i in range(n):
-        out = LANDSCAPE_DIR / f"landscape_{i:03d}.jpg"
+    MEDICAL_BG_DIR.mkdir(parents=True, exist_ok=True)
+    urls = MEDICAL_BACKGROUND_URLS
+    n_urls = max(1, len(urls))
+    if isinstance(needed, int):
+        indices = list(range(max(1, int(needed))))
+    else:
+        indices = [int(x) for x in needed] or [0]
+
+    unique = sorted({i % n_urls for i in indices})
+    path_by_idx: dict[int, Path] = {}
+    for i in unique:
+        out = MEDICAL_BG_DIR / f"med_bg_{i:03d}.jpg"
         if out.exists() and out.stat().st_size > 8000:
-            paths.append(out)
+            path_by_idx[i] = out
             continue
-        url = LANDSCAPE_IMAGE_URLS[i % len(LANDSCAPE_IMAGE_URLS)]
+        url = urls[i % n_urls]
         ok = False
         try:
             r = http_session_direct().get(url, timeout=60, allow_redirects=True)
@@ -1980,26 +2009,36 @@ def ensure_landscape_images(needed: int) -> list[Path]:
         if not ok:
             img = make_fallback_landscape(i)
             img.save(out, format="JPEG", quality=90)
-        paths.append(out)
-    return paths
+        path_by_idx[i] = out
+
+    return [path_by_idx[i % n_urls] for i in indices]
 
 
 def plan_scene_schedule(script: str, total_duration: float) -> list[dict[str, Any]]:
-    """約1分ごとに風景背景を切り替えるスケジュール。"""
+    """約1分ごとに医療背景を切り替えるスケジュール。"""
     total_duration = max(float(total_duration), 1.0)
     n = max(1, int((total_duration + SCENE_INTERVAL_SEC - 0.01) // SCENE_INTERVAL_SEC))
     segments = split_script_for_scenes(script, n)
+    n_urls = max(1, len(MEDICAL_BACKGROUND_URLS))
     schedule = []
+    prev_bg: int | None = None
     for i in range(n):
         start = i * SCENE_INTERVAL_SEC
         end = min((i + 1) * SCENE_INTERVAL_SEC, total_duration)
         dur = max(0.5, end - start)
+        seg = segments[i] if i < len(segments) else ""
+        theme = infer_theme_from_text(seg, i)
+        bg = int(THEME_TO_BG_INDEX.get(theme, i % n_urls)) % n_urls
+        if prev_bg is not None and bg == prev_bg:
+            bg = (bg + 1) % n_urls
+        prev_bg = bg
         schedule.append(
             {
                 "index": i,
-                "landscape_index": i,
+                "theme": theme,
+                "landscape_index": bg,
                 "duration": dur,
-                "segment": segments[i] if i < len(segments) else "",
+                "segment": seg,
             }
         )
     spent = sum(s["duration"] for s in schedule[:-1]) if len(schedule) > 1 else 0
@@ -2019,7 +2058,7 @@ def create_scene_frame(
     landscape_index: int = 0,
 ) -> Path:
     """
-    風景写真背景＋タイトル＋注意書き。
+    医療写真背景＋タイトル＋注意書き。
     本編には VOICEVOX クレジット・サブタイトル・場面ラベルを出さない。
     """
     w, h = VIDEO_SIZE
@@ -2179,7 +2218,7 @@ def build_mp4(
     subtitle_dir: Path | None = None,
 ) -> Path:
     """
-    風景静止画シーン + 長尺音声 + 同期字幕 + エンディング著作権表示。
+    医療静止画シーン + 長尺音声 + 同期字幕 + エンディング著作権表示。
     BGM・効果音は入れない（ナレーション音声のみ）。
     scene_clips: [(画像パス, 秒数), ...]
     subtitle_cues: [{start, end, text}, ...]  textはルビなし
@@ -3060,7 +3099,7 @@ def main() -> None:
     # ----- Step 3: 動画生成 -----
     if st.session_state.script_confirmed:
         st.markdown("#### ステップ3: 動画を作る")
-        st.caption("音声・字幕・風景写真（約1分ごと）→ MP4（BGMなし）")
+        st.caption("音声・字幕・医療背景（約1分ごと）→ MP4（BGMなし）")
 
         st.markdown("**① タイトル**")
         st.text_input(
@@ -3417,7 +3456,7 @@ def main() -> None:
                         "（表記のみ）／音声との同期チェック OK"
                     )
 
-                    # 音声の長さを知り、1分ごとの風景シーンを計画
+                    # 音声の長さを知り、1分ごとの医療背景シーンを計画
                     import wave as _wave
 
                     with _wave.open(str(wav_path), "rb") as wf:
@@ -3427,11 +3466,15 @@ def main() -> None:
                         st.session_state.final_script, audio_sec
                     )
                     status.info(
-                        f"② 風景写真を用意（{len(schedule)} 枚・"
+                        f"② 医療背景を用意（{len(schedule)} 枚・"
                         f"約{SCENE_INTERVAL_SEC/60:.0f}分ごと切替）…"
                     )
-                    progress.progress(52, text="風景写真をダウンロード中…")
-                    landscapes = ensure_landscape_images(len(schedule))
+                    progress.progress(52, text="医療背景をダウンロード中…")
+                    bg_indices = [
+                        int(item.get("landscape_index", item["index"]))
+                        for item in schedule
+                    ]
+                    landscapes = ensure_landscape_images(bg_indices)
                     progress.progress(55, text="シーン画像を合成中…")
                     scene_dir = tmp_path / "scenes"
                     scene_dir.mkdir(parents=True, exist_ok=True)
@@ -3441,13 +3484,14 @@ def main() -> None:
                         li = int(item.get("landscape_index", i))
                         dur = float(item["duration"])
                         frame_path = scene_dir / f"scene_{i:03d}.png"
-                        land = landscapes[li % len(landscapes)]
+                        land = landscapes[i % len(landscapes)]
                         create_scene_frame(
                             frame_path,
                             landscape_path=land,
                             title=st.session_state.get("video_title", ""),
                             title_img=None,
                             show_title=(i == 0),
+                            disclaimer=DISCLAIMER_TEXT,
                             landscape_index=li,
                         )
                         scene_clips.append((frame_path, dur))
@@ -3502,7 +3546,10 @@ def main() -> None:
                     st.session_state.mp4_name = desktop_name
                     st.session_state.mp4_bytes = None
                     progress.progress(100, text="完了")
-                    themes_used = f"{len(schedule)} 枚の風景（約{int(SCENE_INTERVAL_SEC/60)}分ごと）"
+                    themes_used = (
+                        f"{len(schedule)} 枚の医療背景"
+                        f"（約{int(SCENE_INTERVAL_SEC/60)}分ごと）"
+                    )
                     status.success(
                         "動画の生成が完了しました。\n"
                         f"デスクトップに保存: {desktop_path}\n"
