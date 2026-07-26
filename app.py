@@ -1258,11 +1258,52 @@ def resolve_default_voice_selection(
     return speaker_name, str(style.get("name") or "ノーマル"), int(style["id"])
 
 
+def _split_after_punct_outside_quotes(text: str, punct: str) -> list[str]:
+    """
+    punct の直後で分割する。ただし「」『』のセリフ内では分割しない。
+    （括弧内の「。」で切ると、閉じの 」 の前で字幕が改ページしてしまうため）
+    """
+    if not text:
+        return []
+    parts: list[str] = []
+    buf: list[str] = []
+    # いま開いているかぎ括弧の閉じ文字（入れ子対応）
+    closers: list[str] = []
+    for ch in text:
+        buf.append(ch)
+        if ch == "「":
+            closers.append("」")
+        elif ch == "『":
+            closers.append("』")
+        elif closers and ch == closers[-1]:
+            closers.pop()
+        elif (not closers) and (ch in punct):
+            parts.append("".join(buf))
+            buf = []
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def _merge_chunks_broken_before_close(chunks: list[str]) -> list[str]:
+    """閉じ括弧で始まる断片を直前の字幕に戻す（保険）。"""
+    if not chunks:
+        return []
+    out: list[str] = [chunks[0]]
+    for c in chunks[1:]:
+        if c and c[0] in "」』" and out:
+            out[-1] += c
+        else:
+            out.append(c)
+    return out
+
+
 def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> list[str]:
     """
     句点単位で分割する（文章同士はくっつけない）。
     理由: 1音声区間＝1字幕にすると、読み上げと表示がズレにくい。
-    1文が長すぎるときだけ max_chars でさらに切る（ルビの途中では切らない）。
+    「」『』のセリフ内では句点・読点で切らない（閉じ括弧の前で改ページしない）。
+    1文が長すぎるときだけ max_chars でさらに切る（ルビの途中・」直前では切らない）。
     """
     text = text.replace("\r\n", "\n").strip()
     if not text:
@@ -1273,7 +1314,8 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
         block = block.strip()
         if not block:
             continue
-        parts = re.split(r"(?<=[。！？!?])", block)
+        # 「」内の 。！？ では切らない
+        parts = _split_after_punct_outside_quotes(block, "。！？!?")
         for part in parts:
             part = part.strip()
             if not part:
@@ -1281,9 +1323,9 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
             if len(part) <= max_chars:
                 chunks.append(part)
             else:
-                # 読点などでも切れなければ、文字数で強制分割
+                # 読点でも切れなければ文字数で強制分割（「」内の読点では切らない）
                 buf = ""
-                for piece in re.split(r"(?<=[、,，])", part):
+                for piece in _split_after_punct_outside_quotes(part, "、,，"):
                     piece = piece.strip()
                     if not piece:
                         continue
@@ -1299,7 +1341,7 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
                             buf = ""
                 if buf:
                     chunks.append(buf)
-    return chunks
+    return _merge_chunks_broken_before_close(chunks)
 
 
 def clamp_voicevox_speed(speed: float) -> float:
