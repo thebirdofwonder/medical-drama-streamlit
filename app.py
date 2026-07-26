@@ -31,8 +31,11 @@ VOICEVOX_URL = "http://127.0.0.1:50021"
 DEFAULT_SPEAKER_ID = 29
 DEFAULT_SPEAKER_NAME = "No.7"
 DEFAULT_STYLE_NAME = "ノーマル"
-# 読み上げ速度は 1.2 倍速で固定（画面にスライダーは出さない）
-VOICEVOX_SPEED_SCALE = 1.2
+# 読み上げ速度（画面のスライダーで変更可）
+VOICEVOX_SPEED_SCALE = 1.1  # 初期値
+VOICEVOX_SPEED_MIN = 0.8
+VOICEVOX_SPEED_MAX = 1.5
+VOICEVOX_SPEED_STEP = 0.1
 VIDEO_SIZE = (1920, 1080)
 CREDIT_TEXT = f"音声\nVOICEVOX：{DEFAULT_SPEAKER_NAME}"
 # 後方互換（古いコード参照用）
@@ -51,7 +54,8 @@ DEFAULT_REFERENCE_EXAMPLE = (
     "Hashimoto E, Nagasaki K. Cureus. 2024;16(4):e58441. / CC BY 4.0"
 )
 SCENE_INTERVAL_SEC = 60.0  # 1分ごとに背景切替
-ENDING_DURATION_SEC = 10.0  # 著作権・出典表示のエンディング秒数
+ENDING_DURATION_SEC = 10.0  # エンディング画面を出し続ける秒数（フェード完了後）
+ENDING_FADE_SEC = 5.0  # 本編音声終了後、エンディングへ完全移行するフェード秒数
 BGM_FILENAME = "bgm.mp3"
 # Pixabay のフリー音源（暗め・シリアス寄り）。取得失敗時は簡易BGMを自動生成します。
 BGM_CANDIDATE_URLS = [
@@ -1265,8 +1269,13 @@ def split_text_for_voicevox(text: str, max_chars: int = MAX_VOICEVOX_CHARS) -> l
 
 
 def clamp_voicevox_speed(speed: float) -> float:
-    """読み上げ速度は常に 1.2 倍速固定。"""
-    return float(VOICEVOX_SPEED_SCALE)
+    """読み上げ速度を 0.8〜1.5 の範囲に収める（0.1 刻み）。"""
+    try:
+        s = float(speed)
+    except (TypeError, ValueError):
+        s = float(VOICEVOX_SPEED_SCALE)
+    s = max(VOICEVOX_SPEED_MIN, min(VOICEVOX_SPEED_MAX, s))
+    return round(round(s / VOICEVOX_SPEED_STEP) * VOICEVOX_SPEED_STEP, 1)
 
 
 def synthesize_wav_bytes(
@@ -2227,14 +2236,35 @@ def build_mp4(
 
     parts = [main_video]
     ending_clip = None
+    transition_clip = None
+    ending_hold_clip = None
     if ending_png is not None and ending_duration > 0:
+        fade_sec = float(ENDING_FADE_SEC)
         end_dur = float(ending_duration)
-        ending_clip = (
+        ending_base = (
             ImageClip(str(ending_png))
-            .set_duration(end_dur)
             .set_fps(still_fps)
         )
-        parts.append(ending_clip)
+        # 本編音声終了後: 最終フレーム → エンディングへ 5秒でフェード移行
+        last_t = max(0.0, duration - (1.0 / float(still_fps)))
+        last_frame = (
+            main_video.to_ImageClip(t=last_t)
+            .set_duration(fade_sec)
+            .set_fps(still_fps)
+            .fadeout(fade_sec)
+        )
+        ending_fade_in = (
+            ending_base.set_duration(fade_sec)
+            .fadein(fade_sec)
+        )
+        transition_clip = CompositeVideoClip(
+            [last_frame, ending_fade_in],
+            size=VIDEO_SIZE,
+        ).set_duration(fade_sec).set_fps(still_fps)
+        # フェード完了後、エンディングをそのまま表示
+        ending_hold_clip = ending_base.set_duration(end_dur).set_fps(still_fps)
+        ending_clip = transition_clip  # close用の代表
+        parts.extend([transition_clip, ending_hold_clip])
 
     video = concatenate_videoclips(parts, method="compose")
 
@@ -2289,6 +2319,16 @@ def build_mp4(
     if ending_clip is not None:
         try:
             ending_clip.close()
+        except Exception:
+            pass
+    if transition_clip is not None and transition_clip is not ending_clip:
+        try:
+            transition_clip.close()
+        except Exception:
+            pass
+    if ending_hold_clip is not None:
+        try:
+            ending_hold_clip.close()
         except Exception:
             pass
     for c in clips:
@@ -2564,6 +2604,7 @@ def init_state() -> None:
         "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
         "vvox_style_name": DEFAULT_STYLE_NAME,
         "vvox_style_id": DEFAULT_SPEAKER_ID,
+        "vvox_speed_scale": VOICEVOX_SPEED_SCALE,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2574,6 +2615,16 @@ def init_state() -> None:
         saved_ref = load_saved_reference_text()
         if saved_ref:
             st.session_state.reference_text = saved_ref
+
+    # 読み上げ速度を 0.8〜1.5（初期 1.1）にそろえる
+    st.session_state.vvox_speed_scale = clamp_voicevox_speed(
+        st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
+    )
+    # 旧・固定1.2 のまま残っている場合は、新しい初期値 1.1 に一度だけ更新
+    if st.session_state.get("_vvox_speed_default_v11") is not True:
+        if abs(float(st.session_state.vvox_speed_scale) - 1.2) < 1e-9:
+            st.session_state.vvox_speed_scale = float(VOICEVOX_SPEED_SCALE)
+        st.session_state["_vvox_speed_default_v11"] = True
 
     # 声優初期値の移行（旧・青山龍星 → No.7 ノーマル）を一度だけ
     if st.session_state.get("_vvox_default_v2") is not True:
@@ -3004,7 +3055,10 @@ def main() -> None:
         )
 
         st.markdown("**② エンディング**")
-        st.caption(f"動画末尾に約 {int(ENDING_DURATION_SEC)} 秒表示")
+        st.caption(
+            f"音声終了後 {int(ENDING_FADE_SEC)} 秒でフェード移行し、"
+            f"その後約 {int(ENDING_DURATION_SEC)} 秒表示"
+        )
         st.caption("固定文＋参考文献＋VOICEVOXクレジット")
 
         st.markdown("**参考文献**")
@@ -3165,7 +3219,20 @@ def main() -> None:
 
         st.caption(
             "ルビON。半角/全角の {｝| は同じ扱い。"
-            f"速度は {VOICEVOX_SPEED_SCALE:.1f} 倍速固定。"
+        )
+        st.markdown("**読み上げ速度**")
+        st.slider(
+            "VOICEVOXの速さ",
+            min_value=float(VOICEVOX_SPEED_MIN),
+            max_value=float(VOICEVOX_SPEED_MAX),
+            step=float(VOICEVOX_SPEED_STEP),
+            key="vvox_speed_scale",
+            help=f"初期値は {VOICEVOX_SPEED_SCALE:.1f} 倍。0.8〜1.5 を 0.1 刻みで選べます。",
+            format="%.1f倍",
+        )
+        st.caption(
+            f"いま {clamp_voicevox_speed(st.session_state.get('vvox_speed_scale', VOICEVOX_SPEED_SCALE)):.1f} 倍"
+            f"（初期 {VOICEVOX_SPEED_SCALE:.1f}）"
         )
 
         if st.button("3. 動画を生成する", type="primary"):
@@ -3197,7 +3264,9 @@ def main() -> None:
                 st.session_state.ending_credits_text = ending_body
 
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                speed_scale = float(VOICEVOX_SPEED_SCALE)
+                speed_scale = clamp_voicevox_speed(
+                    st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
+                )
                 extra_ruby = []
                 if st.session_state.get("review"):
                     extra_ruby = (
@@ -3315,7 +3384,9 @@ def main() -> None:
 
                     # エンディング（著作権・出典）
                     status.info(
-                        f"②′ エンディング（約{int(ENDING_DURATION_SEC)}秒）を作っています…"
+                        f"②′ エンディングへフェード"
+                        f"（{int(ENDING_FADE_SEC)}秒）＋表示"
+                        f"（約{int(ENDING_DURATION_SEC)}秒）…"
                     )
                     progress.progress(70, text="エンディング画像を生成中…")
                     ending_path = tmp_path / "ending_credits.png"
