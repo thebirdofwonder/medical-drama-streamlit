@@ -602,6 +602,10 @@ def prepare_script_for_voicevox(
     return out, count_voicevox_ruby(out)
 
 
+# 字幕折り返し／分割：行頭に置かない文字（閉じの 」 など）
+SUBTITLE_NO_LINE_START = frozenset("」』）)]］】》〉、。，．！？!?ー…‥")
+
+
 def _ruby_incomplete(fragment: str) -> bool:
     """断片の末尾で {表記|よみ} が途中切れなら True（半角/全角どちらも）。"""
     last_open = max(fragment.rfind("{"), fragment.rfind("｛"))
@@ -612,7 +616,7 @@ def _ruby_incomplete(fragment: str) -> bool:
 
 
 def _safe_force_chunks(text: str, max_chars: int) -> list[str]:
-    """文字数で切るが、ルビ {表記|よみ} の途中では切らない。"""
+    """文字数で切るが、ルビ {表記|よみ} の途中や 」 の直前では切らない。"""
     if len(text) <= max_chars:
         return [text]
     out: list[str] = []
@@ -622,6 +626,9 @@ def _safe_force_chunks(text: str, max_chars: int) -> list[str]:
         end = min(i + max_chars, n)
         # ルビ途中なら閉じるまで延ばす
         while end < n and _ruby_incomplete(text[i:end]):
+            end += 1
+        # 閉じ括弧・句読点が次チャンク先頭に来ないよう、同じチャンクに含める
+        while end < n and text[end] in SUBTITLE_NO_LINE_START:
             end += 1
         # 次チャンク先頭がルビの途中にならないよう調整は上記で足りる
         if end <= i:
@@ -1660,10 +1667,16 @@ def draw_outlined_text(
     draw.text((x, y), text, font=font, fill=fill)
 
 
+# 字幕折り返し：行頭に置かない文字は SUBTITLE_NO_LINE_START を参照
+
+
 def wrap_text_to_width(
     text: str, font: ImageFont.ImageFont, max_width: int, draw: ImageDraw.ImageDraw
 ) -> list[str]:
-    """画面幅に収まるよう、日本語を1文字ずつ折り返す。"""
+    """
+    画面幅に収まるよう、日本語を1文字ずつ折り返す。
+    「」で囲んだセリフでは、閉じの 」 の直前では改行しない（行頭禁則）。
+    """
     text = (text or "").replace("\r\n", "\n").strip()
     if not text:
         return []
@@ -1678,10 +1691,15 @@ def wrap_text_to_width(
             bbox = draw.textbbox((0, 0), trial, font=font)
             if bbox[2] - bbox[0] <= max_width:
                 buf = trial
-            else:
-                if buf:
-                    lines.append(buf)
-                buf = ch
+                continue
+            # 次の文字が 」 など行頭禁則 → 直前では切らず、同じ行に付ける
+            if ch in SUBTITLE_NO_LINE_START and buf:
+                lines.append(buf + ch)
+                buf = ""
+                continue
+            if buf:
+                lines.append(buf)
+            buf = ch
         if buf:
             lines.append(buf)
     return lines
