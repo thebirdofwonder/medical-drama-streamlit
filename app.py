@@ -22,6 +22,7 @@ import requests
 import streamlit as st
 from docx import Document
 from PIL import Image, ImageDraw, ImageFont
+from pypdf import PdfReader
 
 # ---------------------------------------------------------------------------
 # 定数
@@ -44,14 +45,17 @@ DISCLAIMER_TEXT = (
     "本動画は、公開された症例報告を参考に制作した医学教育用フィクションです。"
     "人物、会話、状況設定は創作であり、ナレーションには合成音声を使用しています。"
 )
-# エンディング固定文
+# エンディング固定文（雛形どおり）
 ENDING_FICTION_NOTICE = (
-    "本動画は医学教育用フィクションです。\n"
-    "人物・会話・状況・一部の医学的経過を改変しています。"
+    "本動画は医学教育を目的としたフィクションです。"
+    "登場人物、氏名、年齢、職業、会話、診療場面、時系列、"
+    "および検査値・状況設定は実在のものではありません。"
 )
 ENDING_FOOTER = "詳細な出典・ライセンスは動画説明欄に記載しています。"
 DEFAULT_REFERENCE_EXAMPLE = (
-    "Hashimoto E, Nagasaki K. Cureus. 2024;16(4):e58441. / CC BY 4.0"
+    "Lim J, Wenham T. An Atypical Presentation of Mycoplasma pneumoniae "
+    "Infection Mimicking Acute Surgical Abdomen in an Adult. "
+    "Cureus. 2024;16(11):e73665. doi:10.7759/cureus.73665"
 )
 SCENE_INTERVAL_SEC = 60.0  # 1分ごとに背景切替
 ENDING_DURATION_SEC = 10.0  # エンディング画面を出し続ける秒数（フェード完了後）
@@ -168,6 +172,11 @@ CLAUDE_MODEL_CANDIDATES = [
 ]
 # レビュー用に送る台本の上限（長すぎると API が失敗しやすい）
 REVIEW_SCRIPT_MAX_CHARS = 12000
+# 論文PDF→台本化：論文本文の送付上限・15分ナレーション目安
+PAPER_TEXT_MAX_CHARS = 100000
+# 日本語ナレーション目安 約300〜350字/分 × 15分
+DRAMA_SCRIPT_TARGET_CHARS_MIN = 4500
+DRAMA_SCRIPT_TARGET_CHARS_MAX = 5500
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +210,39 @@ def extract_text_from_bytes(name: str, raw: bytes) -> str:
                         parts.append(t)
         return "\n".join(parts)
 
+    if fname.endswith(".pdf"):
+        return extract_text_from_pdf_bytes(raw)
+
     raise ValueError(
-        f"対応形式は .txt または .docx のみです（受け取ったファイル: {name or '不明'}）。"
+        f"対応形式は .txt / .docx / .pdf です（受け取ったファイル: {name or '不明'}）。"
     )
+
+
+def extract_text_from_pdf_bytes(raw: bytes) -> str:
+    """PDF（医学論文など）から文字を取り出す。"""
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw or b"")
+    if not raw:
+        raise ValueError("PDFが空です。")
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"PDFを開けませんでした: {e}") from e
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            t = (page.extract_text() or "").strip()
+        except Exception:
+            t = ""
+        if t:
+            pages.append(t)
+    text = "\n\n".join(pages).strip()
+    if not text:
+        raise ValueError(
+            "PDFから文字を取り出せませんでした。"
+            "スキャン画像のみのPDFの可能性があります。"
+        )
+    return text
 
 
 def extract_text_from_path(path: str | Path) -> str:
@@ -838,6 +877,454 @@ def review_with_claude(script: str, api_key: str) -> dict[str, Any]:
         f"試したモデル: {', '.join(CLAUDE_MODEL_CANDIDATES)}\n"
         f"最後のエラー: {last_error}"
     )
+
+
+def build_drama_script_prompt(paper_text: str) -> str:
+    """医学論文テキストから YouTube 医学ドラマ台本を作る指示文。"""
+    paper = (paper_text or "").strip()
+    if len(paper) > PAPER_TEXT_MAX_CHARS:
+        paper = (
+            paper[:PAPER_TEXT_MAX_CHARS]
+            + "\n\n…（以下、長さ制限のため省略）"
+        )
+    return f"""あなたは医学教育向け YouTube 動画の台本作家かつ臨床医です。
+次の医学論文（または症例報告）の内容をもとに、ナレーション台本だけを書いてください。
+
+【必須条件】
+① 約15分の YouTube 医学ドラマ台本にする（本文の文字数はおおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字を目安）。
+② すべてナレーターが話し、ドラマが展開する。場面転換もナレーションで示す。
+③ 読み上げる台本本文以外は一切書かない。タイトル見出し、サブタイトル、シーン番号、「注釈」「解説」「制作メモ」、私への説明、前置き、後書き、Markdown記法は禁止。
+④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
+⑤ 主な視聴者は医療従事者。専門用語はそのまま使ってよい。
+⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。
+⑦ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
+⑧ 登場人物のセリフには必ずカギ括弧「」を付ける。
+⑨ 必ずしも一文ごとに改行しない。1画面の字幕に収まる長さなら、複数文を改行せずにつなげてよい。
+⑩ 鑑別診断・臓器名などを列挙するときは、単語ごとに読点でつなぎ、途中で改行しない。最後は句点。例：胃、小腸、大腸、肝臓、胆嚢、骨盤内。
+⑪ 読みを誤りやすい医学用語・専門用語・AIが誤読しやすい語には、全角の ｛用語｜よみがな｝ の形でルビを付ける（半角の {{}} は使わない）。
+⑫ 出力する前に、医師として医学的に違和感のある表現・論理の破綻を自分で直し、その最終稿だけを出す。
+
+【出力形式】
+- 台本本文のみ（プレーンテキスト）
+- 最初の行からナレーションを始める
+- コードブロックやJSONで囲まない
+
+【論文テキスト】
+{paper}
+"""
+
+
+def _claude_messages_text(
+    api_key: str,
+    prompt: str,
+    *,
+    max_tokens: int = 16000,
+) -> tuple[str, str]:
+    """Claude Messages API を呼び、返答テキストと使用モデル名を返す。"""
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    last_error = ""
+    for model in CLAUDE_MODEL_CANDIDATES:
+        body = {
+            "model": model,
+            "max_tokens": int(max_tokens),
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = http_session_direct().post(
+                url, headers=headers, json=body, timeout=300
+            )
+        except requests.exceptions.ProxyError as e:
+            raise RuntimeError(
+                "プロキシのせいで Claude に接続できませんでした。\n"
+                "ターミナルで proxy を解除してからアプリを再起動してください。\n"
+                f"詳細: {e}"
+            ) from e
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(
+                "Claude API への通信に失敗しました。\n"
+                f"詳細: {e}"
+            ) from e
+
+        if resp.status_code == 404 and "model" in resp.text.lower():
+            last_error = f"{model}: {resp.text[:200]}"
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Claude API エラー (HTTP {resp.status_code}): {resp.text[:500]}"
+            )
+        data = resp.json()
+        parts = data.get("content", [])
+        text = "".join(
+            p.get("text", "") for p in parts if p.get("type") == "text"
+        ).strip()
+        if not text:
+            raise RuntimeError("Claude API から空の返答が返りました。")
+        return text, model
+
+    raise RuntimeError(
+        "利用できる Claude モデルが見つかりませんでした。\n"
+        f"試したモデル: {', '.join(CLAUDE_MODEL_CANDIDATES)}\n"
+        f"最後のエラー: {last_error}"
+    )
+
+
+def _strip_script_wrappers(text: str) -> str:
+    """台本以外の前置き・コード枠を取り除く。"""
+    text = strip_code_fence((text or "").strip())
+    # よくある前置き行を落とす
+    lines = text.replace("\r\n", "\n").split("\n")
+    drop_prefixes = (
+        "以下が",
+        "以下に",
+        "台本を作成",
+        "承知",
+        "了解",
+        "【台本】",
+        "■台本",
+        "# ",
+    )
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines:
+        first = lines[0].strip()
+        if any(first.startswith(p) for p in drop_prefixes) and len(first) < 80:
+            lines.pop(0)
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
+def polish_drama_script_medically(script: str, api_key: str) -> str:
+    """医師視点で違和感・論理破綻を直し、台本本文だけ返す。"""
+    prompt = f"""あなたは臨床医です。次の YouTube 医学ドラマ台本を読み、
+医学的に違和感のある表現・論理的におかしい箇所だけを直してください。
+
+【厳守】
+- 出力は修正後の台本本文のみ（説明・箇条書きの修正リストは禁止）
+- ナレーションのみの形式を維持する
+- ドラマ前半で正しい診断を明示しないルールは維持する
+- セリフの「」、ルビ ｛用語｜よみがな｝、列挙の読点ルールは崩さない
+- 不要な前置き・後書きを付けない
+
+【台本】
+{script}
+"""
+    text, _model = _claude_messages_text(api_key, prompt, max_tokens=16000)
+    return _strip_script_wrappers(text)
+
+
+def generate_drama_script_from_paper(paper_text: str, api_key: str) -> str:
+    """
+    医学論文テキストから約15分のナレーション台本を作る。
+    生成後に医学的な自己校正パスを1回行う。
+    """
+    paper = (paper_text or "").strip()
+    if not paper:
+        raise ValueError("論文テキストが空です。")
+    if not (api_key or "").strip():
+        raise RuntimeError(
+            "論文から台本を作るには ANTHROPIC_API_KEY（Claude用の鍵）が必要です。"
+            "画面上部でキーを入力・保存してください。"
+        )
+    draft, model_used = _claude_messages_text(
+        api_key,
+        build_drama_script_prompt(paper),
+        max_tokens=16000,
+    )
+    draft = _strip_script_wrappers(draft)
+    if not draft:
+        raise RuntimeError("台本が空でした。もう一度お試しください。")
+    try:
+        polished = polish_drama_script_medically(draft, api_key)
+        if polished.strip():
+            draft = polished
+    except Exception:
+        # 校正に失敗しても下書きは返す
+        pass
+    _ = model_used
+    return draft.strip()
+
+
+def _heuristic_vancouver_from_paper(paper_text: str) -> str:
+    """APIなし時の簡易抽出（DOIなどが見えるとき）。"""
+    text = (paper_text or "").replace("\r\n", "\n")
+    head = text[:8000]
+    doi = ""
+    m = re.search(
+        r"(?:doi[:\s]*|https?://doi\.org/)(10\.\d{4,9}/[-._;()/:A-Z0-9]+)",
+        head,
+        flags=re.I,
+    )
+    if m:
+        doi = m.group(1).rstrip(".")
+    # 先頭付近のそれらしいタイトル行
+    lines = [ln.strip() for ln in head.split("\n") if ln.strip()]
+    title = ""
+    for ln in lines[:40]:
+        if len(ln) < 20 or len(ln) > 300:
+            continue
+        if re.search(r"abstract|introduction|keywords|©|copyright", ln, re.I):
+            continue
+        if re.search(r"[A-Za-z]{4,}", ln):
+            title = ln
+            break
+    parts = []
+    if title:
+        parts.append(title.rstrip("."))
+    if doi:
+        parts.append(f"doi:{doi}")
+    if parts:
+        return ". ".join(parts) + ("." if not parts[-1].endswith(".") else "")
+    return ""
+
+
+def extract_vancouver_citation_from_paper(paper_text: str, api_key: str = "") -> str:
+    """
+    論文テキストから Vancouver 方式の参考文献1件を作る。
+    例: Author A, Author B. Title. Journal. Year;Vol(Issue):Pages. doi:...
+    """
+    paper = (paper_text or "").strip()
+    if not paper:
+        return ""
+    excerpt = paper[:PAPER_TEXT_MAX_CHARS]
+    if (api_key or "").strip():
+        prompt = f"""次の医学論文テキストから、エンディング画面用の参考文献を
+Vancouver（バンクーバー）引用様式で1件だけ書いてください。
+
+【形式の例】
+Lim J, Wenham T. An Atypical Presentation of Mycoplasma pneumoniae Infection Mimicking Acute Surgical Abdomen in an Adult. Cureus. 2024;16(11):e73665. doi:10.7759/cureus.73665
+
+【ルール】
+- 出力は引用文1行（または必要なら2行）だけ。説明・箇条書き・前後の文言は禁止
+- 著者は姓→名頭文字。3名超なら et al. を使ってよい
+- 雑誌名・年・巻号・ページ／論文番号・DOI が分かれば入れる
+- ライセンス（CC BY など）が本文にあれば末尾に「 / CC BY 4.0」のように付けてよい
+- 不明な項目は無理に作らず省略する
+- Markdownやコードブロックで囲まない
+
+【論文テキスト】
+{excerpt}
+"""
+        try:
+            text, _ = _claude_messages_text(api_key, prompt, max_tokens=800)
+            cite = _strip_script_wrappers(text)
+            # 1〜3行に収める
+            cite_lines = [ln.strip() for ln in cite.splitlines() if ln.strip()]
+            cite = " ".join(cite_lines[:3]).strip()
+            if cite:
+                return cite
+        except Exception:
+            pass
+    return _heuristic_vancouver_from_paper(paper)
+
+
+def apply_paper_reference_to_session(citation: str) -> None:
+    """参考文献をセッションとエンディング文面の初期値へ反映する。"""
+    cite = (citation or "").strip()
+    if not cite:
+        return
+    st.session_state.reference_text = cite
+    try:
+        save_reference_text(cite)
+    except Exception:
+        pass
+    # エンディング④を最新の参考文献で入れ直せるようリセット
+    st.session_state.ending_credits_text = ""
+    st.session_state._ending_auto_text = ""
+    st.session_state._ending_prefill_sig = None
+
+
+def normalize_title_mukougawa(raw: str) -> str:
+    """タイトルを『〜の向こう側』形に整える（すでに付いていればそのまま）。"""
+    t = (raw or "").strip()
+    t = t.strip("「」『』\"'").strip()
+    t = re.sub(r"^(タイトル案|タイトル)[:：\s]*", "", t).strip()
+    if "\n" in t:
+        t = t.split("\n")[0].strip()
+    t = re.sub(r"[。．!！?？]+$", "", t).strip()
+    if not t:
+        return "診断の向こう側"
+    if t.endswith("の向こう側"):
+        return t
+    return f"{t}の向こう側"
+
+
+def _heuristic_title_from_paper(paper_text: str) -> str:
+    """APIなし時の簡潔なタイトル案。"""
+    head = (paper_text or "")[:5000]
+    # よくある疾患・病態キーワード（短いもの優先で拾う）
+    keywords = [
+        "敗血症",
+        "心筋梗塞",
+        "肺塞栓",
+        "大動脈解離",
+        "髄膜炎",
+        "脳梗塞",
+        "消化管穿孔",
+        "急性腹症",
+        "糖尿病性ケトアシドーシス",
+        "アナフィラキシー",
+        "心タンポナーデ",
+        "気胸",
+        "肺炎",
+        "虫垂炎",
+        "胆石",
+        "膵炎",
+        "腎盂腎炎",
+        "腸閉塞",
+        "心筋炎",
+        "心不全",
+        "喘息",
+        "結核",
+        "HIV",
+        "SLE",
+        "白血病",
+        "リンパ腫",
+    ]
+    for kw in keywords:
+        if kw in head:
+            return normalize_title_mukougawa(kw)
+    # 英語病名の簡易対応
+    eng = [
+        (r"\bsepsis\b", "敗血症"),
+        (r"\bpneumonia\b", "肺炎"),
+        (r"mycoplasma", "マイコプラズマ"),
+        (r"appendicitis", "虫垂炎"),
+        (r"pulmonary embolism", "肺塞栓"),
+        (r"myocardial infarction", "心筋梗塞"),
+    ]
+    for pat, jp in eng:
+        if re.search(pat, head, re.I):
+            return normalize_title_mukougawa(jp)
+    return "診断の向こう側"
+
+
+def suggest_drama_title_from_paper(paper_text: str, api_key: str = "") -> str:
+    """
+    論文内容から簡潔なタイトル案を1つ作る。
+    必ず『〜の向こう側』の形にする。
+    """
+    paper = (paper_text or "").strip()
+    if not paper:
+        return "診断の向こう側"
+    excerpt = paper[: min(20000, len(paper))]
+    if (api_key or "").strip():
+        prompt = f"""次の医学論文（症例報告など）の内容から、
+YouTube医学ドラマ用の簡潔な日本語タイトルを1つだけ考えてください。
+
+【必須形式】
+「〇〇の向こう側」
+（例: 敗血症の向こう側 / 急性腹症の向こう側 / 肺塞栓の向こう側）
+
+【ルール】
+- 出力はタイトル1行だけ。説明・箇条書き・引用符・前置きは禁止
+- 〇〇は疾患・病態・臨床テーマを短い日本語で（長くしすぎない）
+- 論文タイトルの直訳にしない。視聴者が惹かれる簡潔な言葉にする
+- 正しい診断名をネタバレしすぎない範囲で、テーマが伝わる語を選ぶ
+- Markdownやコードブロックで囲まない
+
+【論文テキスト】
+{excerpt}
+"""
+        try:
+            text, _ = _claude_messages_text(api_key, prompt, max_tokens=200)
+            title = normalize_title_mukougawa(_strip_script_wrappers(text))
+            if title:
+                return title
+        except Exception:
+            pass
+    return _heuristic_title_from_paper(paper)
+
+
+def set_pending_title_suggestion(title: str) -> None:
+    """タイトル案を提示待ち状態にする（採用はユーザーが選ぶ）。"""
+    suggestion = normalize_title_mukougawa(title)
+    st.session_state.title_suggestion = suggestion
+    st.session_state.title_decision = "pending"
+    st.session_state.pop("title_manual_input", None)
+
+
+def render_title_suggestion_ui(location: str = "main") -> None:
+    """
+    タイトル案の提示・採用／却下（手入力）UI。
+    location は Streamlit の key 衝突防止用。
+    """
+    suggestion = str(st.session_state.get("title_suggestion") or "").strip()
+    if not suggestion:
+        return
+    decision = str(st.session_state.get("title_decision") or "pending")
+    st.markdown("**タイトル案**")
+    st.caption("論文内容から作成。形式は「〜の向こう側」です。")
+
+    if decision == "pending":
+        st.info(f"提案: 「{suggestion}」")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(
+                "このタイトルを使う",
+                type="primary",
+                key=f"btn_accept_title_{location}",
+                use_container_width=True,
+            ):
+                st.session_state.video_title = suggestion
+                st.session_state.title_decision = "accepted"
+                st.rerun()
+        with c2:
+            if st.button(
+                "却下して手入力する",
+                key=f"btn_reject_title_{location}",
+                use_container_width=True,
+            ):
+                st.session_state.title_decision = "manual"
+                st.rerun()
+        return
+
+    if decision == "accepted":
+        st.success(f"採用中のタイトル: 「{st.session_state.get('video_title', suggestion)}」")
+        if st.button("タイトル案をやり直す", key=f"btn_reset_title_{location}"):
+            st.session_state.title_decision = "pending"
+            st.rerun()
+        return
+
+    # manual
+    st.warning(f"却下した案: 「{suggestion}」")
+    st.text_input(
+        "別のタイトルを入力",
+        key="title_manual_input",
+        placeholder="例: 沈黙のモニターの向こう側",
+        help="「〜の向こう側」形式がおすすめです。付け忘れなら自動で補います。",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button(
+            "手入力タイトルを確定",
+            type="primary",
+            key=f"btn_confirm_manual_title_{location}",
+            use_container_width=True,
+        ):
+            custom = str(st.session_state.get("title_manual_input") or "").strip()
+            if not custom:
+                st.error("タイトルを入力してください。")
+            else:
+                st.session_state.video_title = normalize_title_mukougawa(custom)
+                st.session_state.title_decision = "accepted"
+                st.rerun()
+    with c2:
+        if st.button(
+            "提案に戻る",
+            key=f"btn_back_to_suggestion_{location}",
+            use_container_width=True,
+        ):
+            st.session_state.title_decision = "pending"
+            st.rerun()
+
 
 def heuristic_review(script: str) -> dict[str, Any]:
     """
@@ -2719,6 +3206,8 @@ def init_state() -> None:
         "mp4_name": "medical_drama.mp4",
         "last_error": "",
         "video_title": "命を賭けた決断",
+        "title_suggestion": "",
+        "title_decision": "",
         "ending_credits_text": "",
         "reference_text": "",
         "last_script_path": "",
@@ -2900,6 +3389,89 @@ def main() -> None:
 
     # ----- Step 1: 台本を読み込む -----
     st.markdown("#### ステップ1: 台本を読み込む")
+
+    st.markdown("**A. 医学論文PDFから台本を作る**")
+    st.caption(
+        "PDFを上げると、約15分のナレーション台本を作り、このアプリに取り込みます。"
+        "（Claude用のAPIキーが必要）"
+    )
+    paper_pdf = st.file_uploader(
+        "医学論文PDF",
+        type=["pdf"],
+        key="paper_pdf_upload",
+        help="症例報告・医学論文のPDF（文字がコピーできるもの）",
+    )
+    if st.button(
+        "PDFから台本を作成して取り込む",
+        type="primary",
+        key="btn_pdf_to_script",
+        use_container_width=True,
+    ):
+        api_key = get_api_key()
+        if not api_key:
+            st.error(
+                "先に画面上部で ANTHROPIC_API_KEY（Claude用の鍵）を入力・保存してください。"
+            )
+        elif paper_pdf is None:
+            st.error("先にPDFファイルを選んでください。")
+        else:
+            try:
+                with st.spinner("PDFの文字を読み取っています…"):
+                    raw = paper_pdf.getvalue()
+                    paper_text = extract_text_from_pdf_bytes(raw)
+                with st.spinner(
+                    "台本を作成中です（数分かかることがあります）…"
+                ):
+                    script = generate_drama_script_from_paper(paper_text, api_key)
+                if not script.strip():
+                    st.error("台本が空でした。別のPDFで試してください。")
+                else:
+                    # 既存プロセスへ取り込み（レビュー／動画生成の流れへ）
+                    commit_loaded_script(
+                        script,
+                        f"pdf-{paper_pdf.name}-{len(script)}",
+                    )
+                    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    (OUTPUT_DIR / "last_script.txt").write_text(
+                        script, encoding="utf-8"
+                    )
+                    # 論文から Vancouver 方式の参考文献を作り、エンディングへ反映
+                    with st.spinner("参考文献（Vancouver形式）を作成中…"):
+                        citation = extract_vancouver_citation_from_paper(
+                            paper_text, api_key
+                        )
+                    if citation:
+                        apply_paper_reference_to_session(citation)
+                        st.caption(f"参考文献: {citation}")
+                    else:
+                        apply_paper_reference_to_session(
+                            f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
+                        )
+                    with st.spinner("タイトル案を作成中…"):
+                        title_idea = suggest_drama_title_from_paper(
+                            paper_text, api_key
+                        )
+                    set_pending_title_suggestion(title_idea)
+                    st.success(
+                        f"台本を作成し、取り込みました: {paper_pdf.name}"
+                        f"（約 {len(script):,} 字）"
+                    )
+                    st.info(
+                        "下のタイトル案を確認し、採用するか手入力してください。"
+                        "そのあと『1. AIで台本をレビューする』または"
+                        "『1′. レビューせずに進む』へ進みます。"
+                        "エンディングの参考文献はステップ3でも確認できます。"
+                    )
+            except Exception as e:  # noqa: BLE001
+                st.error(f"台本作成に失敗しました: {e}")
+
+    # タイトル案の採用／却下（PDF作成後・ステップ3より前）
+    if st.session_state.get("title_suggestion") and not st.session_state.get(
+        "script_confirmed"
+    ):
+        render_title_suggestion_ui(location="step1")
+
+    st.markdown("**B. すでにある台本ファイルを読む**")
     st.caption(".txt / .docx")
 
     if st.button(
@@ -3162,13 +3734,26 @@ def main() -> None:
         st.caption("音声・字幕・医療背景（約1分ごと）→ MP4（BGMなし）")
 
         st.markdown("**① タイトル**")
-        st.text_input(
-            "タイトル文字",
-            key="video_title",
-        )
+        if st.session_state.get("title_suggestion"):
+            render_title_suggestion_ui(location="step3")
+            # 採用済みなら念のため表示だけの確認欄も出す
+            if st.session_state.get("title_decision") == "accepted":
+                st.text_input(
+                    "タイトル文字（必要なら微修正）",
+                    key="video_title",
+                )
+        else:
+            st.caption("動画の先頭に出すタイトル（手入力可）")
+            st.text_input(
+                "タイトル文字",
+                key="video_title",
+            )
 
         st.markdown("**② 参考文献**")
-        st.caption(".txt または .docx でやりとり")
+        st.caption(
+            "エンディングに出る出典。論文PDFから作った場合は Vancouver 形式です。"
+            "手入力・.txt / .docx でも上書きできます。"
+        )
         ref_upload = st.file_uploader(
             "参考文献ファイル（.txt / .docx）",
             type=["txt", "docx"],
