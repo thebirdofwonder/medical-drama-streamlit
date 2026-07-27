@@ -1,5 +1,5 @@
 """
-医学ドラマ台本 → AIレビュー → VOICEVOX音声 → 静止画背景 → MP4 生成
+医学論文PDF → 台本生成 → AIレビュー → VOICEVOX音声 → 静止画背景 → MP4 生成
 Streamlit アプリ（macOS / Apple Silicon 向け）
 """
 
@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import struct
-import subprocess
 import tempfile
 import wave
 from datetime import datetime
@@ -183,7 +182,7 @@ DRAMA_SCRIPT_TARGET_CHARS_MAX = 5500
 
 
 # ---------------------------------------------------------------------------
-# ユーティリティ: 台本読み込み
+# ユーティリティ: テキスト／PDF読み込み
 # ---------------------------------------------------------------------------
 def extract_text_from_bytes(name: str, raw: bytes) -> str:
     """ファイル名と中身（バイト列）から台本テキストを取り出す。"""
@@ -246,48 +245,6 @@ def extract_text_from_pdf_bytes(raw: bytes) -> str:
             "スキャン画像のみのPDFの可能性があります。"
         )
     return text
-
-
-def extract_text_from_path(path: str | Path) -> str:
-    """パソコン内のファイルパスから台本を読み込む。"""
-    p = Path(str(path).strip().strip('"').strip("'")).expanduser()
-    if not p.is_file():
-        raise FileNotFoundError(f"ファイルが見つかりません: {p}")
-    return extract_text_from_bytes(p.name, p.read_bytes())
-
-
-def pick_local_script_path() -> str:
-    """macOS のファイル選択画面を開き、台本ファイルのパスを返す。"""
-    # tkinter は Streamlit と併用するとアプリ全体が落ちることがあるため使わない
-    script = (
-        'try\n'
-        'set f to choose file with prompt "台本ファイルを選んでください（.txt / .docx）" '
-        'of type {"txt", "docx", "public.plain-text"}\n'
-        "return POSIX path of f\n"
-        "on error\n"
-        'return ""\n'
-        "end try"
-    )
-    try:
-        completed = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-        )
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(
-            "ファイル選択画面を開けませんでした。"
-            "下の「パス」欄か、文章の貼り付けを使ってください。"
-        ) from e
-    path = (completed.stdout or "").strip()
-    if not path and (completed.stderr or "").strip():
-        raise RuntimeError(
-            "ファイル選択に失敗しました。"
-            "下の「パス」欄か、文章の貼り付けを使ってください。"
-        )
-    return path
 
 
 def commit_loaded_script(text: str, source_id: str) -> None:
@@ -3479,7 +3436,7 @@ def main() -> None:
     init_state()
 
     st.markdown("### 医学ドラマ動画メーカー")
-    st.caption("台本 →（任意）レビュー → 音声・字幕・背景 → MP4")
+    st.caption("論文PDF → 台本 →（任意）レビュー → 音声・字幕・背景 → MP4")
 
     with st.sidebar:
         st.markdown("#### 設定")
@@ -3519,50 +3476,10 @@ def main() -> None:
                 except Exception as e:  # noqa: BLE001
                     st.error(f"保存失敗: {e}")
 
-    # ----- Step 1: 台本を読み込む -----
-    st.markdown("#### ステップ1: 台本を読み込む")
+    # ----- Step 1: 論文PDFから台本を作る -----
+    st.markdown("#### ステップ1: 論文PDFから台本を作る")
 
-    st.markdown("**ルビ辞書（用語とよみの対照表）**")
-    st.caption(
-        "読みにくい医学用語に ｛用語｜よみ｝ を付けるとき、この辞書を優先します。"
-        f" 標準ファイル: `data/{RUBY_DICT_PATH.name}`"
-    )
-    dict_file = st.file_uploader(
-        "ルビ辞書を読み込む（.tsv / .txt / .csv）",
-        type=["tsv", "txt", "csv"],
-        key="ruby_dict_upload",
-        help="1行に「用語」と「よみ」。TAB区切りがおすすめ",
-    )
-    if dict_file is not None:
-        try:
-            raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
-            pairs = parse_ruby_dict_text(raw_dict)
-            if not pairs:
-                st.warning("辞書から用語を読み取れませんでした。形式を確認してください。")
-            else:
-                file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
-                if st.session_state.get("_ruby_dict_file_id") != file_id:
-                    st.session_state.ruby_dict_custom = pairs
-                    st.session_state.ruby_dict_source_name = dict_file.name
-                    st.session_state._ruby_dict_file_id = file_id
-                    st.success(f"辞書を読み込みました: {dict_file.name}（{len(pairs)} 語）")
-        except Exception as e:  # noqa: BLE001
-            st.error(f"辞書の読込失敗: {e}")
-    active_n = len(get_active_ruby_dictionary())
-    src_name = st.session_state.get("ruby_dict_source_name") or (
-        RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
-    )
-    st.caption(f"いま使う辞書: {src_name} ／ 登録 {active_n} 語")
-    if st.session_state.get("ruby_dict_custom") and st.button(
-        "アップロード辞書をやめて標準に戻す",
-        key="btn_reset_ruby_dict",
-    ):
-        st.session_state.ruby_dict_custom = None
-        st.session_state.ruby_dict_source_name = ""
-        st.session_state._ruby_dict_file_id = ""
-        st.rerun()
-
-    st.markdown("**A. 医学論文PDFから台本を作る**")
+    st.markdown("**① 医学論文PDFから台本を作る**")
     st.caption(
         "PDFを上げると、約15分のナレーション台本を作り、このアプリに取り込みます。"
         "（Claude用のAPIキーが必要）"
@@ -3656,74 +3573,45 @@ def main() -> None:
     ):
         render_title_suggestion_ui(location="step1")
 
-    st.markdown("**B. すでにある台本ファイルを読む**")
-    st.caption(".txt / .docx")
-
-    if st.button(
-        "台本ファイルを選ぶ",
-        type="primary",
-        key="btn_pick_script_file",
-        use_container_width=True,
-    ):
-        try:
-            picked = pick_local_script_path()
-            if not picked:
-                st.warning("キャンセルしました。")
-            else:
-                text = extract_text_from_path(picked)
-                if not text.strip():
-                    st.error("ファイルが空です。")
-                else:
-                    commit_loaded_script(text, f"path-{picked}-{len(text)}")
-                    st.success(
-                        f"読込完了: {Path(picked).name}（約 {len(text):,} 字）"
-                    )
-        except Exception as e:  # noqa: BLE001
-            st.error(f"読込失敗: {e}")
-
-    st.caption("または：ファイルパス")
-    path_col, path_btn_col = st.columns([3, 1])
-    with path_col:
-        local_path = st.text_input(
-            "パソコン内のファイルパス",
-            key="script_local_path",
-            placeholder="/Users/あなた/Desktop/台本.txt",
-            label_visibility="collapsed",
-        )
-    with path_btn_col:
-        load_path_clicked = st.button(
-            "パスから読む",
-            key="btn_load_script_path",
-            use_container_width=True,
-        )
-    if load_path_clicked:
-        try:
-            text = extract_text_from_path(local_path or "")
-            if not text.strip():
-                st.error("ファイルが空です。")
-            else:
-                commit_loaded_script(
-                    text, f"path-{local_path}-{len(text)}"
-                )
-                st.success(f"読込完了（約 {len(text):,} 字）")
-        except Exception as e:  # noqa: BLE001
-            st.error(f"読込失敗: {e}")
-
-    st.caption("または：貼り付け")
-    pasted = st.text_area(
-        "台本テキストを貼り付け",
-        height=140,
-        key="script_paste_area",
-        placeholder="台本を貼り付けてから下のボタンを押す",
-        label_visibility="collapsed",
+    st.markdown("**② ルビ辞書（用語とよみの対照表）**")
+    st.caption(
+        "読みにくい医学用語に ｛用語｜よみ｝ を付けるとき、この辞書を優先します。"
+        f" 標準ファイル: `data/{RUBY_DICT_PATH.name}`"
     )
-    if st.button("貼り付けた台本を使う", key="btn_use_pasted_script"):
-        text = (pasted or "").strip()
-        if not text:
-            st.error("文章が空です。")
-        else:
-            commit_loaded_script(text, f"paste-{len(text)}")
-            st.success(f"貼り付け完了（約 {len(text):,} 字）")
+    dict_file = st.file_uploader(
+        "ルビ辞書を読み込む（.tsv / .txt / .csv）",
+        type=["tsv", "txt", "csv"],
+        key="ruby_dict_upload",
+        help="1行に「用語」と「よみ」。TAB区切りがおすすめ",
+    )
+    if dict_file is not None:
+        try:
+            raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
+            pairs = parse_ruby_dict_text(raw_dict)
+            if not pairs:
+                st.warning("辞書から用語を読み取れませんでした。形式を確認してください。")
+            else:
+                file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
+                if st.session_state.get("_ruby_dict_file_id") != file_id:
+                    st.session_state.ruby_dict_custom = pairs
+                    st.session_state.ruby_dict_source_name = dict_file.name
+                    st.session_state._ruby_dict_file_id = file_id
+                    st.success(f"辞書を読み込みました: {dict_file.name}（{len(pairs)} 語）")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"辞書の読込失敗: {e}")
+    active_n = len(get_active_ruby_dictionary())
+    src_name = st.session_state.get("ruby_dict_source_name") or (
+        RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
+    )
+    st.caption(f"いま使う辞書: {src_name} ／ 登録 {active_n} 語")
+    if st.session_state.get("ruby_dict_custom") and st.button(
+        "アップロード辞書をやめて標準に戻す",
+        key="btn_reset_ruby_dict",
+    ):
+        st.session_state.ruby_dict_custom = None
+        st.session_state.ruby_dict_source_name = ""
+        st.session_state._ruby_dict_file_id = ""
+        st.rerun()
 
     if st.session_state.raw_script:
         n_chars = len(st.session_state.raw_script)
