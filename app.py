@@ -1,5 +1,5 @@
 """
-医学論文PDF → 台本生成 → AIレビュー → VOICEVOX音声 → 静止画背景 → MP4 生成
+医学論文PDFまたは台本 → 台本用意 → AIレビュー → VOICEVOX音声 → 静止画背景 → MP4 生成
 Streamlit アプリ（macOS / Apple Silicon 向け）
 """
 
@@ -3449,7 +3449,7 @@ def main() -> None:
     init_state()
 
     st.markdown("### 医学ドラマ動画メーカー")
-    st.caption("論文PDF → 台本 →（任意）レビュー → 音声・字幕・背景 → MP4")
+    st.caption("論文PDFまたは台本 →（任意）レビュー → 音声・字幕・背景 → MP4")
 
     with st.sidebar:
         st.markdown("#### 設定")
@@ -3489,98 +3489,184 @@ def main() -> None:
                 except Exception as e:  # noqa: BLE001
                     st.error(f"保存失敗: {e}")
 
-    # ----- Step 1: 論文PDFから台本を作る -----
-    st.markdown("#### ステップ1: 論文PDFから台本を作る")
+    # ----- Step 1: 台本を用意する -----
+    st.markdown("#### ステップ1: 台本を用意する")
 
-    st.markdown("**① 医学論文PDFから台本を作る**")
-    st.caption(
-        "PDFを上げると、約15分のナレーション台本を作り、このアプリに取り込みます。"
-        "（Claude用のAPIキーが必要）"
+    input_mode = st.radio(
+        "入力方法",
+        options=["paper", "script"],
+        format_func=lambda x: (
+            "① 医学論文PDFから台本を作る"
+            if x == "paper"
+            else "①′ できあがった台本（Word / PDF）を取り込む"
+        ),
+        key="step1_input_mode",
+        horizontal=False,
     )
-    paper_pdf = st.file_uploader(
-        "医学論文PDF",
-        type=["pdf"],
-        key="paper_pdf_upload",
-        help="症例報告・医学論文のPDF（文字がコピーできるもの）",
-    )
-    if st.button(
-        "PDFから台本を作成して取り込む",
-        type="primary",
-        key="btn_pdf_to_script",
-        use_container_width=True,
-    ):
-        api_key = get_api_key()
-        if not api_key:
-            st.error(
-                "先に画面上部で ANTHROPIC_API_KEY（Claude用の鍵）を入力・保存してください。"
-            )
-        elif paper_pdf is None:
-            st.error("先にPDFファイルを選んでください。")
-        else:
-            try:
-                with st.spinner("PDFの文字を読み取っています…"):
-                    raw = paper_pdf.getvalue()
-                    paper_text = extract_text_from_pdf_bytes(raw)
-                with st.spinner(
-                    "台本を作成中です（数分かかることがあります）…"
-                ):
-                    script = generate_drama_script_from_paper(paper_text, api_key)
-                if not script.strip():
-                    st.error("台本が空でした。別のPDFで試してください。")
-                else:
-                    # 既存プロセスへ取り込み（レビュー／動画生成の流れへ）
-                    commit_loaded_script(
-                        script,
-                        f"pdf-{paper_pdf.name}-{len(script)}",
-                    )
-                    # 辞書を対照して難読用語に ｛用語｜よみ｝ を付与
-                    with st.spinner("辞書でルビを付けています…"):
-                        script_ruby, ruby_n, _ann = apply_dictionary_ruby_to_script(
-                            script
-                        )
-                    if ruby_n > 0:
-                        commit_loaded_script(
-                            script_ruby,
-                            f"pdf-{paper_pdf.name}-ruby-{len(script_ruby)}",
-                        )
-                        script = script_ruby
-                    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                    (OUTPUT_DIR / "last_script.txt").write_text(
-                        script, encoding="utf-8"
-                    )
-                    # 論文から Vancouver 方式の参考文献を作り、エンディングへ反映
-                    with st.spinner("参考文献（Vancouver形式）を作成中…"):
-                        citation = extract_vancouver_citation_from_paper(
-                            paper_text, api_key
-                        )
-                    if citation:
-                        apply_paper_reference_to_session(citation)
-                        st.caption(f"参考文献: {citation}")
+
+    if input_mode == "paper":
+        st.markdown("**① 医学論文PDFから台本を作る**")
+        st.caption(
+            "PDFを上げると、約15分のナレーション台本を作り、このアプリに取り込みます。"
+            "（Claude用のAPIキーが必要）"
+        )
+        paper_pdf = st.file_uploader(
+            "医学論文PDF",
+            type=["pdf"],
+            key="paper_pdf_upload",
+            help="症例報告・医学論文のPDF（文字がコピーできるもの）",
+        )
+        if st.button(
+            "PDFから台本を作成して取り込む",
+            type="primary",
+            key="btn_pdf_to_script",
+            use_container_width=True,
+        ):
+            api_key = get_api_key()
+            if not api_key:
+                st.error(
+                    "先に画面上部で ANTHROPIC_API_KEY（Claude用の鍵）を入力・保存してください。"
+                )
+            elif paper_pdf is None:
+                st.error("先にPDFファイルを選んでください。")
+            else:
+                try:
+                    with st.spinner("PDFの文字を読み取っています…"):
+                        raw = paper_pdf.getvalue()
+                        paper_text = extract_text_from_pdf_bytes(raw)
+                    with st.spinner(
+                        "台本を作成中です（数分かかることがあります）…"
+                    ):
+                        script = generate_drama_script_from_paper(paper_text, api_key)
+                    if not script.strip():
+                        st.error("台本が空でした。別のPDFで試してください。")
                     else:
-                        apply_paper_reference_to_session(
-                            f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
+                        # 既存プロセスへ取り込み（レビュー／動画生成の流れへ）
+                        commit_loaded_script(
+                            script,
+                            f"pdf-{paper_pdf.name}-{len(script)}",
                         )
-                    with st.spinner("タイトル案を作成中…"):
-                        title_idea = suggest_drama_title_from_paper(
-                            paper_text, api_key
+                        # 辞書を対照して難読用語に ｛用語｜よみ｝ を付与
+                        with st.spinner("辞書でルビを付けています…"):
+                            script_ruby, ruby_n, _ann = apply_dictionary_ruby_to_script(
+                                script
+                            )
+                        if ruby_n > 0:
+                            commit_loaded_script(
+                                script_ruby,
+                                f"pdf-{paper_pdf.name}-ruby-{len(script_ruby)}",
+                            )
+                            script = script_ruby
+                        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                        (OUTPUT_DIR / "last_script.txt").write_text(
+                            script, encoding="utf-8"
                         )
-                    set_pending_title_suggestion(title_idea)
-                    st.success(
-                        f"台本を作成し、取り込みました: {paper_pdf.name}"
-                        f"（約 {len(script):,} 字"
-                        + (f"・辞書ルビ {ruby_n} 件" if ruby_n else "")
-                        + "）"
-                    )
-                    st.info(
-                        "下のタイトル案を確認し、採用するか手入力してください。"
-                        "そのあと『1. AIで台本をレビューする』または"
-                        "『1′. レビューせずに進む』へ進みます。"
-                        "エンディングの参考文献はステップ3でも確認できます。"
-                    )
-            except Exception as e:  # noqa: BLE001
-                st.error(f"台本作成に失敗しました: {e}")
+                        # 論文から Vancouver 方式の参考文献を作り、エンディングへ反映
+                        with st.spinner("参考文献（Vancouver形式）を作成中…"):
+                            citation = extract_vancouver_citation_from_paper(
+                                paper_text, api_key
+                            )
+                        if citation:
+                            apply_paper_reference_to_session(citation)
+                            st.caption(f"参考文献: {citation}")
+                        else:
+                            apply_paper_reference_to_session(
+                                f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
+                            )
+                        with st.spinner("タイトル案を作成中…"):
+                            title_idea = suggest_drama_title_from_paper(
+                                paper_text, api_key
+                            )
+                        set_pending_title_suggestion(title_idea)
+                        st.success(
+                            f"台本を作成し、取り込みました: {paper_pdf.name}"
+                            f"（約 {len(script):,} 字"
+                            + (f"・辞書ルビ {ruby_n} 件" if ruby_n else "")
+                            + "）"
+                        )
+                        st.info(
+                            "下のタイトル案を確認し、採用するか手入力してください。"
+                            "そのあと『1. AIで台本をレビューする』または"
+                            "『1′. レビューせずに進む』へ進みます。"
+                            "エンディングの参考文献はステップ3でも確認できます。"
+                        )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"台本作成に失敗しました: {e}")
 
-    # タイトル案の採用／却下（PDF作成後・ステップ3より前）
+    else:
+        st.markdown("**①′ できあがった台本を取り込む**")
+        st.caption(
+            "すでに作った台本（Word .docx または PDF）を取り込むと、"
+            "台本作成は飛ばして、タイトル確認・ルビ・レビュー以降へ進みます。"
+        )
+        script_upload = st.file_uploader(
+            "台本ファイル（.docx / .pdf）",
+            type=["docx", "pdf"],
+            key="ready_script_upload",
+            help="ナレーション台本の Word または PDF",
+        )
+        if st.button(
+            "台本を取り込んで先へ進む",
+            type="primary",
+            key="btn_import_ready_script",
+            use_container_width=True,
+        ):
+            if script_upload is None:
+                st.error("先に台本ファイル（Word または PDF）を選んでください。")
+            else:
+                try:
+                    with st.spinner("台本を読み取っています…"):
+                        raw = script_upload.getvalue()
+                        script = extract_text_from_bytes(
+                            script_upload.name, raw
+                        ).strip()
+                    if not script:
+                        st.error(
+                            "台本が空でした。文字が入った Word / PDF か確認してください。"
+                        )
+                    else:
+                        commit_loaded_script(
+                            script,
+                            f"script-{script_upload.name}-{len(script)}",
+                        )
+                        with st.spinner("辞書でルビを付けています…"):
+                            script_ruby, ruby_n, _ann = (
+                                apply_dictionary_ruby_to_script(script)
+                            )
+                        if ruby_n > 0:
+                            commit_loaded_script(
+                                script_ruby,
+                                f"script-{script_upload.name}-ruby-{len(script_ruby)}",
+                            )
+                            script = script_ruby
+                        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                        (OUTPUT_DIR / "last_script.txt").write_text(
+                            script, encoding="utf-8"
+                        )
+                        # 台本本文からタイトル案を作る（論文作成はしない）
+                        api_key = get_api_key()
+                        with st.spinner("タイトル案を作成中…"):
+                            title_idea = suggest_drama_title_from_paper(
+                                script, api_key
+                            )
+                        set_pending_title_suggestion(title_idea)
+                        st.success(
+                            f"台本を取り込みました: {script_upload.name}"
+                            f"（約 {len(script):,} 字"
+                            + (f"・辞書ルビ {ruby_n} 件" if ruby_n else "")
+                            + "）"
+                        )
+                        st.info(
+                            "台本作成は完了扱いです。"
+                            "下のタイトル案を確認し、"
+                            "『1. AIで台本をレビューする』または"
+                            "『1′. レビューせずに進む』へ進んでください。"
+                            "参考文献はステップ3で入力・確認できます。"
+                        )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"台本の取り込みに失敗しました: {e}")
+
+    # タイトル案の採用／却下（取り込み後・ステップ3より前）
     if st.session_state.get("title_suggestion") and not st.session_state.get(
         "script_confirmed"
     ):
