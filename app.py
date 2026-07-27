@@ -68,6 +68,9 @@ BGM_CANDIDATE_URLS = [
 ]
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
+# ルビ辞書ファイル（用語とよみの対照表）
+RUBY_DICT_PATH = WORK_DIR / "data" / "medical_ruby_dict.tsv"
+
 # 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
 MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
 LANDSCAPE_DIR = MEDICAL_BG_DIR  # 互換エイリアス
@@ -491,14 +494,24 @@ def canonicalize_voicevox_ruby_delimiters(text: str) -> str:
     return _RUBY_TAG_RE.sub(_repl, text)
 
 
-def apply_voicevox_ruby(script: str, annotations: list[dict[str, str]]) -> str:
+def apply_voicevox_ruby(
+    script: str,
+    annotations: list[dict[str, str]],
+    *,
+    fullwidth: bool = True,
+) -> str:
     """
-    VOICEVOXルビ {表記|よみ} を台本へ付与する。
+    VOICEVOXルビを台本へ付与する。
+    fullwidth=True のとき ｛表記｜よみ｝、False のとき {表記|よみ}。
     半角/全角の区切り記号は区別しない。既にあるルビは壊さない。
     """
     text = canonicalize_voicevox_ruby_delimiters(script or "")
     if not annotations:
-        return text
+        return (
+            to_fullwidth_ruby_delimiters(text)
+            if fullwidth
+            else text
+        )
 
     protected: dict[str, str] = {}
 
@@ -533,15 +546,33 @@ def apply_voicevox_ruby(script: str, annotations: list[dict[str, str]]) -> str:
         text = protect_existing(text)
         if surface not in text:
             continue
-        ruby = "{" + surface + "|" + reading + "}"
+        if fullwidth:
+            ruby = "｛" + surface + "｜" + reading + "｝"
+        else:
+            ruby = "{" + surface + "|" + reading + "}"
         text = text.replace(surface, ruby)
 
     for key, val in protected.items():
         text = text.replace(key, val)
-    return canonicalize_voicevox_ruby_delimiters(text)
+    text = canonicalize_voicevox_ruby_delimiters(text)
+    return to_fullwidth_ruby_delimiters(text) if fullwidth else text
 
 
-# 簡易モード用: よく誤読されやすい医学用語のルビ辞書（必要に応じて増やす）
+def to_fullwidth_ruby_delimiters(text: str) -> str:
+    """半角ルビ {表記|よみ} を全角 ｛表記｜よみ｝ にそろえる。"""
+    text = canonicalize_voicevox_ruby_delimiters(text or "")
+    if not text:
+        return ""
+
+    def _repl(match: re.Match) -> str:
+        surface = match.group(1)
+        reading = normalize_voicevox_reading(match.group(2))
+        return "｛" + surface + "｜" + reading + "｝"
+
+    return _RUBY_TAG_RE.sub(_repl, text)
+
+
+# 組み込みの最低限辞書（ファイルが無いときの予備）
 DEFAULT_RUBY_DICT: list[tuple[str, str]] = [
     ("心筋梗塞", "しんきんこうそく"),
     ("心不全", "しんふぜん"),
@@ -583,19 +614,114 @@ DEFAULT_RUBY_DICT: list[tuple[str, str]] = [
     ("抗凝固", "こうぎょうこ"),
     ("抗生剤", "こうせいざい"),
     ("抗菌薬", "こうきんやく"),
-    ("ステロイド", "ステロイド"),
-    ("アドレナリン", "アドレナリン"),
-    ("ノルアドレナリン", "ノルアドレナリン"),
 ]
 
 
-def collect_default_ruby_annotations(script: str) -> list[dict[str, str]]:
-    """辞書ルビ候補を集める。※自動付与は現在OFFのため、呼び出し元なし。"""
+def parse_ruby_dict_text(raw: str) -> list[tuple[str, str]]:
+    """
+    辞書テキストを読む。
+    対応: 用語<TAB>よみ / 用語,よみ / 用語｜よみ / 用語|よみ
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in (raw or "").replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        surface = ""
+        reading = ""
+        if "\t" in line:
+            surface, _, reading = line.partition("\t")
+        elif "｜" in line:
+            surface, _, reading = line.partition("｜")
+        elif "|" in line and not line.startswith("{"):
+            surface, _, reading = line.partition("|")
+        elif "," in line:
+            surface, _, reading = line.partition(",")
+        else:
+            parts = re.split(r"\s{2,}", line, maxsplit=1)
+            if len(parts) == 2:
+                surface, reading = parts
+        surface = surface.strip().strip("「」『』\"'")
+        reading = normalize_voicevox_reading(reading)
+        if not surface or not reading or surface in seen or surface == reading:
+            continue
+        seen.add(surface)
+        out.append((surface, reading))
+    return out
+
+
+def load_ruby_dict_from_path(path: Path | None = None) -> list[tuple[str, str]]:
+    """辞書ファイル（TSVなど）を読み込む。無ければ空リスト。"""
+    p = path or RUBY_DICT_PATH
+    try:
+        if not p.is_file():
+            return []
+        return parse_ruby_dict_text(p.read_text(encoding="utf-8"))
+    except OSError:
+        return []
+
+
+def get_active_ruby_dictionary() -> list[tuple[str, str]]:
+    """
+    使うルビ辞書を返す。
+    優先: 画面で読み込んだ辞書 → data/medical_ruby_dict.tsv → 組み込み辞書
+    同じ用語は先勝ち。
+    """
+    merged: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(pairs: list[tuple[str, str]]) -> None:
+        for surface, reading in pairs:
+            surface = (surface or "").strip()
+            reading = normalize_voicevox_reading(reading)
+            if not surface or not reading or surface in seen or surface == reading:
+                continue
+            seen.add(surface)
+            merged.append((surface, reading))
+
+    custom = None
+    try:
+        custom = st.session_state.get("ruby_dict_custom")
+    except Exception:
+        custom = None
+    if isinstance(custom, list) and custom:
+        _add([(str(a), str(b)) for a, b in custom])
+    _add(load_ruby_dict_from_path(RUBY_DICT_PATH))
+    _add(DEFAULT_RUBY_DICT)
+    return merged
+
+
+def collect_dictionary_ruby_annotations(
+    script: str,
+    dictionary: list[tuple[str, str]] | None = None,
+) -> list[dict[str, str]]:
+    """台本中に現れる用語だけ、辞書からルビ候補を集める。"""
+    text = strip_voicevox_ruby(script or "")
+    dict_pairs = dictionary if dictionary is not None else get_active_ruby_dictionary()
     found: list[dict[str, str]] = []
-    for surface, reading in sorted(DEFAULT_RUBY_DICT, key=lambda x: len(x[0]), reverse=True):
-        if surface in script and surface != reading:
+    for surface, reading in sorted(dict_pairs, key=lambda x: len(x[0]), reverse=True):
+        if surface in text and surface != reading:
             found.append({"surface": surface, "reading": reading})
     return found
+
+
+def apply_dictionary_ruby_to_script(
+    script: str,
+    dictionary: list[tuple[str, str]] | None = None,
+) -> tuple[str, int, list[dict[str, str]]]:
+    """
+    辞書を対照して ｛用語｜よみ｝ を付与する。
+    戻り値: (ルビ付き台本, 付与件数, 使った注釈一覧)
+    """
+    annotations = collect_dictionary_ruby_annotations(script, dictionary)
+    out = apply_voicevox_ruby(script, annotations, fullwidth=True)
+    return out, count_voicevox_ruby(out), annotations
+
+
+def collect_default_ruby_annotations(script: str) -> list[dict[str, str]]:
+    """互換: 辞書ルビ候補を集める。"""
+    return collect_dictionary_ruby_annotations(script)
 
 
 def merge_ruby_annotations(
@@ -626,8 +752,7 @@ def prepare_script_for_voicevox(
 ) -> tuple[str, int]:
     """
     音声生成直前にルビを整える。
-    enabled=True（既定）: 追加注釈（レビュー等）のルビだけ付与して返す
-      ※辞書ルビの自動付与は行わない
+    enabled=True（既定）: 辞書ルビ＋追加注釈（レビュー等）を付与
     enabled=False: ルビを外した文を返す
     戻り値: (台本, ルビ件数)
     """
@@ -635,10 +760,13 @@ def prepare_script_for_voicevox(
     if not enabled:
         plain = strip_voicevox_ruby(text)
         return plain, 0
-    # 辞書ルビは付けない。台本に既にあるルビと、追加注釈だけ使う
-    annotations = merge_ruby_annotations(list(extra_annotations or []))
-    out = apply_voicevox_ruby(text, annotations)
-    return out, count_voicevox_ruby(out)
+    # 辞書を優先（誤読の少ないよみ）→ そのあとレビュー等の追加注釈
+    dict_ann = collect_dictionary_ruby_annotations(text)
+    annotations = merge_ruby_annotations(dict_ann, list(extra_annotations or []))
+    out = apply_voicevox_ruby(text, annotations, fullwidth=True)
+    # VOICEVOX処理のため内部は半角にそろえて件数カウント
+    out_half = canonicalize_voicevox_ruby_delimiters(out)
+    return out_half, count_voicevox_ruby(out_half)
 
 
 # 字幕折り返し／分割：行頭に置かない文字（閉じの 」 など）
@@ -1497,22 +1625,24 @@ def run_script_review(script: str) -> dict[str, Any]:
         result = heuristic_review(review_text)
     result["review_truncated"] = truncated
 
-    # AIが提案したルビだけ付与（辞書ルビの自動付与はOFF）
-    merged: list[dict[str, str]] = []
+    # 辞書ルビを優先し、そのあと AI 提案ルビ（同じ用語は辞書が勝つ）
+    dict_ann = collect_dictionary_ruby_annotations(script)
+    ai_ann: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in result.get("ruby_annotations") or []:
         surface = str(item.get("surface") or "").strip()
         if not surface or surface in seen:
             continue
         seen.add(surface)
-        merged.append(
+        ai_ann.append(
             {
                 "surface": surface,
                 "reading": normalize_voicevox_reading(str(item.get("reading") or "")),
             }
         )
+    merged = merge_ruby_annotations(dict_ann, ai_ann)
     result["ruby_annotations"] = merged
-    result["script_with_ruby"] = apply_voicevox_ruby(script, merged)
+    result["script_with_ruby"] = apply_voicevox_ruby(script, merged, fullwidth=True)
     return result
 
 
@@ -3208,6 +3338,8 @@ def init_state() -> None:
         "video_title": "命を賭けた決断",
         "title_suggestion": "",
         "title_decision": "",
+        "ruby_dict_custom": None,
+        "ruby_dict_source_name": "",
         "ending_credits_text": "",
         "reference_text": "",
         "last_script_path": "",
@@ -3390,6 +3522,46 @@ def main() -> None:
     # ----- Step 1: 台本を読み込む -----
     st.markdown("#### ステップ1: 台本を読み込む")
 
+    st.markdown("**ルビ辞書（用語とよみの対照表）**")
+    st.caption(
+        "読みにくい医学用語に ｛用語｜よみ｝ を付けるとき、この辞書を優先します。"
+        f" 標準ファイル: `data/{RUBY_DICT_PATH.name}`"
+    )
+    dict_file = st.file_uploader(
+        "ルビ辞書を読み込む（.tsv / .txt / .csv）",
+        type=["tsv", "txt", "csv"],
+        key="ruby_dict_upload",
+        help="1行に「用語」と「よみ」。TAB区切りがおすすめ",
+    )
+    if dict_file is not None:
+        try:
+            raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
+            pairs = parse_ruby_dict_text(raw_dict)
+            if not pairs:
+                st.warning("辞書から用語を読み取れませんでした。形式を確認してください。")
+            else:
+                file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
+                if st.session_state.get("_ruby_dict_file_id") != file_id:
+                    st.session_state.ruby_dict_custom = pairs
+                    st.session_state.ruby_dict_source_name = dict_file.name
+                    st.session_state._ruby_dict_file_id = file_id
+                    st.success(f"辞書を読み込みました: {dict_file.name}（{len(pairs)} 語）")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"辞書の読込失敗: {e}")
+    active_n = len(get_active_ruby_dictionary())
+    src_name = st.session_state.get("ruby_dict_source_name") or (
+        RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
+    )
+    st.caption(f"いま使う辞書: {src_name} ／ 登録 {active_n} 語")
+    if st.session_state.get("ruby_dict_custom") and st.button(
+        "アップロード辞書をやめて標準に戻す",
+        key="btn_reset_ruby_dict",
+    ):
+        st.session_state.ruby_dict_custom = None
+        st.session_state.ruby_dict_source_name = ""
+        st.session_state._ruby_dict_file_id = ""
+        st.rerun()
+
     st.markdown("**A. 医学論文PDFから台本を作る**")
     st.caption(
         "PDFを上げると、約15分のナレーション台本を作り、このアプリに取り込みます。"
@@ -3431,6 +3603,17 @@ def main() -> None:
                         script,
                         f"pdf-{paper_pdf.name}-{len(script)}",
                     )
+                    # 辞書を対照して難読用語に ｛用語｜よみ｝ を付与
+                    with st.spinner("辞書でルビを付けています…"):
+                        script_ruby, ruby_n, _ann = apply_dictionary_ruby_to_script(
+                            script
+                        )
+                    if ruby_n > 0:
+                        commit_loaded_script(
+                            script_ruby,
+                            f"pdf-{paper_pdf.name}-ruby-{len(script_ruby)}",
+                        )
+                        script = script_ruby
                     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                     (OUTPUT_DIR / "last_script.txt").write_text(
                         script, encoding="utf-8"
@@ -3454,7 +3637,9 @@ def main() -> None:
                     set_pending_title_suggestion(title_idea)
                     st.success(
                         f"台本を作成し、取り込みました: {paper_pdf.name}"
-                        f"（約 {len(script):,} 字）"
+                        f"（約 {len(script):,} 字"
+                        + (f"・辞書ルビ {ruby_n} 件" if ruby_n else "")
+                        + "）"
                     )
                     st.info(
                         "下のタイトル案を確認し、採用するか手入力してください。"
@@ -3547,6 +3732,28 @@ def main() -> None:
         with st.expander("台本（原文）", expanded=False):
             st.text(st.session_state.raw_script)
 
+        if st.button(
+            "いまの台本に辞書ルビを付ける／付け直す",
+            key="btn_apply_dict_ruby",
+            help="難読な医学用語に ｛用語｜よみ｝ を付けます",
+        ):
+            with st.spinner("辞書でルビを付けています…"):
+                ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(
+                    st.session_state.raw_script
+                )
+            st.session_state.raw_script = ruby_script
+            st.session_state.final_script = ruby_script
+            st.session_state.final_script_editor = ruby_script
+            try:
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                (OUTPUT_DIR / "last_script.txt").write_text(
+                    ruby_script, encoding="utf-8"
+                )
+            except Exception:
+                pass
+            st.success(f"辞書ルビを付けました（{ruby_n} 件）")
+            st.rerun()
+
         st.caption("次の進め方")
         col_rev, col_skip = st.columns(2)
         with col_rev:
@@ -3596,8 +3803,10 @@ def main() -> None:
 
     if skip_clicked:
         clear_review_decision_widgets(st.session_state.get("review"))
-        # 辞書ルビの自動付与はOFF。アップロードした台本をそのまま使う
-        plain_script = st.session_state.raw_script
+        # 辞書ルビを付与してから進む
+        plain_script, ruby_n, _ = apply_dictionary_ruby_to_script(
+            st.session_state.raw_script
+        )
         st.session_state.review = None
         st.session_state.review_done = True
         st.session_state.skip_review = True
@@ -3611,6 +3820,7 @@ def main() -> None:
         st.session_state.final_script_editor = plain_script
         st.success(
             "レビューをスキップしました。"
+            + (f" 辞書ルビを {ruby_n} 件付けました。" if ruby_n else "")
         )
 
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
@@ -4030,7 +4240,7 @@ def main() -> None:
                     extra_ruby = (
                         st.session_state.review.get("ruby_annotations") or []
                     )
-                # 辞書ルビは付けない。台本内の手書きルビ＋レビュー提案ルビのみ
+                # 辞書ルビは音声直前でも再適用される
                 voice_script, ruby_count = prepare_script_for_voicevox(
                     st.session_state.final_script,
                     extra_annotations=extra_ruby,
