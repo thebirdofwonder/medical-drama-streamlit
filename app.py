@@ -577,7 +577,13 @@ DEFAULT_RUBY_DICT: list[tuple[str, str]] = [
 def parse_ruby_dict_text(raw: str) -> list[tuple[str, str]]:
     """
     辞書テキストを読む。
-    対応: 用語<TAB>よみ / 用語,よみ / 用語｜よみ / 用語|よみ
+    対応:
+    - 用語<TAB>よみ
+    - 用語,よみ
+    - 用語｜よみ
+    - 用語|よみ
+    - 用語  よみ（空白2つ以上）
+    - 用語 よみ（空白1つ。右側がかな中心のとき）
     """
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -599,6 +605,13 @@ def parse_ruby_dict_text(raw: str) -> list[tuple[str, str]]:
             parts = re.split(r"\s{2,}", line, maxsplit=1)
             if len(parts) == 2:
                 surface, reading = parts
+            else:
+                # 1つの空白区切りも、右側が「よみ」らしいときは受け入れる
+                parts = line.split()
+                if len(parts) == 2:
+                    maybe_surface, maybe_reading = parts
+                    if re.fullmatch(r"[ぁ-んァ-ンー・ヴ゛゜A-Za-z0-9]+", maybe_reading):
+                        surface, reading = maybe_surface, maybe_reading
         surface = surface.strip().strip("「」『』\"'")
         reading = normalize_voicevox_reading(reading)
         if not surface or not reading or surface in seen or surface == reading:
@@ -3589,7 +3602,13 @@ def main() -> None:
             raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
             pairs = parse_ruby_dict_text(raw_dict)
             if not pairs:
-                st.warning("辞書から用語を読み取れませんでした。形式を確認してください。")
+                st.warning(
+                    "辞書から用語を読み取れませんでした。\n"
+                    "1行に1件、次のどれかの形で書いてください。\n"
+                    "例1: 心筋梗塞\tしんきんこうそく\n"
+                    "例2: 心筋梗塞,しんきんこうそく\n"
+                    "例3: 心筋梗塞｜しんきんこうそく"
+                )
             else:
                 file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
                 if st.session_state.get("_ruby_dict_file_id") != file_id:
