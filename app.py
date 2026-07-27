@@ -3588,7 +3588,8 @@ def main() -> None:
 
     st.markdown("**② ルビ辞書（用語とよみの対照表）**")
     st.caption(
-        "読みにくい医学用語に ｛用語｜よみ｝ を付けるとき、この辞書を優先します。"
+        "読みにくい医学用語に ｛用語｜よみ｝ を付けるとき、"
+        "標準辞書に加えてアップロード辞書も使えます。"
         f" 標準ファイル: `data/{RUBY_DICT_PATH.name}`"
     )
     dict_file = st.file_uploader(
@@ -3615,16 +3616,18 @@ def main() -> None:
                     st.session_state.ruby_dict_custom = pairs
                     st.session_state.ruby_dict_source_name = dict_file.name
                     st.session_state._ruby_dict_file_id = file_id
-                    st.success(f"辞書を読み込みました: {dict_file.name}（{len(pairs)} 語）")
+                    st.success(
+                        f"追加辞書を読み込みました: {dict_file.name}（{len(pairs)} 語）"
+                    )
         except Exception as e:  # noqa: BLE001
             st.error(f"辞書の読込失敗: {e}")
     active_n = len(get_active_ruby_dictionary())
     src_name = st.session_state.get("ruby_dict_source_name") or (
         RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
     )
-    st.caption(f"いま使う辞書: {src_name} ／ 登録 {active_n} 語")
+    st.caption(f"いま使う辞書: 標準 + {src_name} ／ 合計 {active_n} 語")
     if st.session_state.get("ruby_dict_custom") and st.button(
-        "アップロード辞書をやめて標準に戻す",
+        "追加辞書を外して標準だけに戻す",
         key="btn_reset_ruby_dict",
     ):
         st.session_state.ruby_dict_custom = None
