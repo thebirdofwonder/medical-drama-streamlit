@@ -1343,12 +1343,19 @@ YouTube医学ドラマ用の簡潔な日本語タイトルを1つだけ考えて
     return _heuristic_title_from_paper(paper)
 
 
+def _clear_title_manual_input_keys() -> None:
+    """場所ごとの手入力キーが残らないように消す。"""
+    for k in list(st.session_state.keys()):
+        if str(k) == "title_manual_input" or str(k).startswith("title_manual_input_"):
+            st.session_state.pop(k, None)
+
+
 def set_pending_title_suggestion(title: str) -> None:
     """タイトル案を提示待ち状態にする（採用はユーザーが選ぶ）。"""
     suggestion = normalize_title_mukougawa(title)
     st.session_state.title_suggestion = suggestion
     st.session_state.title_decision = "pending"
-    st.session_state.pop("title_manual_input", None)
+    _clear_title_manual_input_keys()
 
 
 def render_title_suggestion_ui(location: str = "main") -> None:
@@ -1360,11 +1367,11 @@ def render_title_suggestion_ui(location: str = "main") -> None:
     if not suggestion:
         return
     decision = str(st.session_state.get("title_decision") or "pending")
-    st.markdown("**タイトル案**")
-    st.caption("論文内容から作成。形式は「〜の向こう側」です。")
+    manual_key = f"title_manual_input_{location}"
+    st.markdown("**タイトル**")
 
     if decision == "pending":
-        st.info(f"提案: 「{suggestion}」")
+        st.write(f"「{suggestion}」")
         c1, c2 = st.columns(2)
         with c1:
             if st.button(
@@ -1378,7 +1385,7 @@ def render_title_suggestion_ui(location: str = "main") -> None:
                 st.rerun()
         with c2:
             if st.button(
-                "却下して手入力する",
+                "手入力する",
                 key=f"btn_reject_title_{location}",
                 use_container_width=True,
             ):
@@ -1387,19 +1394,17 @@ def render_title_suggestion_ui(location: str = "main") -> None:
         return
 
     if decision == "accepted":
-        st.success(f"採用中のタイトル: 「{st.session_state.get('video_title', suggestion)}」")
-        if st.button("タイトル案をやり直す", key=f"btn_reset_title_{location}"):
+        st.write(f"「{st.session_state.get('video_title', suggestion)}」")
+        if st.button("タイトルをやり直す", key=f"btn_reset_title_{location}"):
             st.session_state.title_decision = "pending"
             st.rerun()
         return
 
     # manual
-    st.warning(f"却下した案: 「{suggestion}」")
     st.text_input(
-        "別のタイトルを入力",
-        key="title_manual_input",
+        "タイトルを入力",
+        key=manual_key,
         placeholder="例: 沈黙のモニターの向こう側",
-        help="「〜の向こう側」形式がおすすめです。付け忘れなら自動で補います。",
     )
     c1, c2 = st.columns(2)
     with c1:
@@ -1409,7 +1414,7 @@ def render_title_suggestion_ui(location: str = "main") -> None:
             key=f"btn_confirm_manual_title_{location}",
             use_container_width=True,
         ):
-            custom = str(st.session_state.get("title_manual_input") or "").strip()
+            custom = str(st.session_state.get(manual_key) or "").strip()
             if not custom:
                 st.error("タイトルを入力してください。")
             else:
@@ -3113,21 +3118,15 @@ def render_review_section_interactive(
     for i, item in enumerate(items):
         label = item.get("original") or "（箇所）"
         with st.expander(f"{i + 1}. {label}", expanded=(i == 0)):
-            st.markdown("**問題点**")
             st.write(item.get("issue") or "（なし）")
-            st.markdown("**修正案**")
             st.write(item.get("suggestion") or "（なし）")
-            raw_sug = (item.get("suggestion_raw") or "").strip()
-            sug = (item.get("suggestion") or "").strip()
-            if raw_sug and raw_sug != sug:
-                st.caption("※ AIの解説文は除き、台本に入れる文だけを表示しています")
 
             choice_key = decision_widget_key(section_key, i)
             if choice_key not in st.session_state:
                 st.session_state[choice_key] = CHOICE_REJECT
 
             st.radio(
-                "この指摘への対応",
+                "対応",
                 options=[CHOICE_ACCEPT, CHOICE_REJECT, CHOICE_REVISE],
                 format_func=lambda x: CHOICE_LABELS.get(x, x),
                 key=choice_key,
@@ -3139,19 +3138,16 @@ def render_review_section_interactive(
                     item.get("suggestion") or "", item.get("original") or ""
                 )
                 if preview:
-                    st.info(f"承諾すると台本に入る文: {preview}")
+                    st.caption(f"反映文: {preview}")
                 else:
-                    st.warning(
-                        "この修正案は解説だけのため自動反映できません。"
-                        "「別案で直す」で本文を書いてください。"
-                    )
+                    st.warning("自動反映不可。「別案」で本文を書いてください。")
 
             if st.session_state.get(choice_key) == CHOICE_REVISE:
                 alt_key = alt_widget_key(section_key, i)
                 if alt_key not in st.session_state:
                     st.session_state[alt_key] = item.get("suggestion") or ""
                 st.text_area(
-                    "別案を入力（この文章で台本の該当箇所を置き換えます）",
+                    "別案",
                     key=alt_key,
                     height=100,
                 )
@@ -3451,11 +3447,9 @@ def main() -> None:
     init_state()
 
     st.markdown("### 医学ドラマ動画メーカー")
-    st.caption("論文PDFまたは台本 →（任意）レビュー → 音声・字幕・背景 → MP4")
 
     with st.sidebar:
         st.markdown("#### 設定")
-        st.caption("先に VOICEVOX を起動してください。")
         ok, ver = check_voicevox()
         if ok:
             st.success(f"VOICEVOX OK（{ver}）")
@@ -3464,18 +3458,16 @@ def main() -> None:
 
         st.divider()
         st.markdown("**APIキー**")
-        st.caption("Claude レビュー用。`.env` に保存可（GitHub非公開）。")
         load_dotenv_file()
         has_saved = bool(get_api_key())
         if has_saved:
-            st.caption("キー検出済み（本格レビュー）")
+            st.caption("保存済み")
         else:
-            st.caption("キーなし（簡易レビュー）")
+            st.caption("未設定")
 
         typed = st.text_input(
             "ANTHROPIC_API_KEY",
             type="password",
-            help="入力後「保存」で次回から自動読込",
         )
         if typed.strip():
             os.environ["ANTHROPIC_API_KEY"] = typed.strip()
@@ -3492,45 +3484,38 @@ def main() -> None:
                     st.error(f"保存失敗: {e}")
 
     # ----- Step 1: 台本を用意する -----
-    st.markdown("#### ステップ1: 台本を用意する")
+    st.markdown("#### ステップ1: 台本")
 
     input_mode = st.radio(
         "入力方法",
         options=["paper", "script"],
         format_func=lambda x: (
-            "① 医学論文PDFから台本を作る"
+            "論文PDFから作る"
             if x == "paper"
-            else "①′ できあがった台本（Word / PDF）を取り込む"
+            else "台本ファイルを取り込む"
         ),
         key="step1_input_mode",
         horizontal=False,
+        label_visibility="collapsed",
     )
 
     if input_mode == "paper":
-        st.markdown("**① 医学論文PDFから台本を作る**")
-        st.caption(
-            "PDFを上げると、VOICEVOX 1倍速で約10〜12分のナレーション台本を作ります。"
-            "難易度は研修医が理解できるレベルです。（Claude用のAPIキーが必要）"
-        )
         paper_pdf = st.file_uploader(
             "医学論文PDF",
             type=["pdf"],
             key="paper_pdf_upload",
-            help="症例報告・医学論文のPDF（文字がコピーできるもの）",
         )
         if st.button(
-            "PDFから台本を作成して取り込む",
+            "PDFから台本を作成",
             type="primary",
             key="btn_pdf_to_script",
             use_container_width=True,
         ):
             api_key = get_api_key()
             if not api_key:
-                st.error(
-                    "先に画面上部で ANTHROPIC_API_KEY（Claude用の鍵）を入力・保存してください。"
-                )
+                st.error("先にAPIキーを入力・保存してください。")
             elif paper_pdf is None:
-                st.error("先にPDFファイルを選んでください。")
+                st.error("PDFを選んでください。")
             else:
                 try:
                     with st.spinner("PDFの文字を読み取っています…"):
@@ -3564,13 +3549,12 @@ def main() -> None:
                             script, encoding="utf-8"
                         )
                         # 論文から Vancouver 方式の参考文献を作り、エンディングへ反映
-                        with st.spinner("参考文献（Vancouver形式）を作成中…"):
+                        with st.spinner("参考文献を作成中…"):
                             citation = extract_vancouver_citation_from_paper(
                                 paper_text, api_key
                             )
                         if citation:
                             apply_paper_reference_to_session(citation)
-                            st.caption(f"参考文献: {citation}")
                         else:
                             apply_paper_reference_to_session(
                                 f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
@@ -3581,40 +3565,28 @@ def main() -> None:
                             )
                         set_pending_title_suggestion(title_idea)
                         st.success(
-                            f"台本を作成し、取り込みました: {paper_pdf.name}"
+                            f"取り込み完了: {paper_pdf.name}"
                             f"（約 {len(script):,} 字"
-                            + (f"・辞書ルビ {ruby_n} 件" if ruby_n else "")
+                            + (f"・ルビ {ruby_n} 件" if ruby_n else "")
                             + "）"
-                        )
-                        st.info(
-                            "下のタイトル案を確認し、採用するか手入力してください。"
-                            "そのあと『1. AIで台本をレビューする』または"
-                            "『1′. レビューせずに進む』へ進みます。"
-                            "エンディングの参考文献はステップ3でも確認できます。"
                         )
                 except Exception as e:  # noqa: BLE001
                     st.error(f"台本作成に失敗しました: {e}")
 
     else:
-        st.markdown("**①′ できあがった台本を取り込む**")
-        st.caption(
-            "すでに作った台本（Word .docx または PDF）を取り込むと、"
-            "台本作成は飛ばして、タイトル確認・ルビ・レビュー以降へ進みます。"
-        )
         script_upload = st.file_uploader(
             "台本ファイル（.docx / .pdf）",
             type=["docx", "pdf"],
             key="ready_script_upload",
-            help="ナレーション台本の Word または PDF",
         )
         if st.button(
-            "台本を取り込んで先へ進む",
+            "台本を取り込む",
             type="primary",
             key="btn_import_ready_script",
             use_container_width=True,
         ):
             if script_upload is None:
-                st.error("先に台本ファイル（Word または PDF）を選んでください。")
+                st.error("台本ファイルを選んでください。")
             else:
                 try:
                     with st.spinner("台本を読み取っています…"):
@@ -3623,9 +3595,7 @@ def main() -> None:
                             script_upload.name, raw
                         ).strip()
                     if not script:
-                        st.error(
-                            "台本が空でした。文字が入った Word / PDF か確認してください。"
-                        )
+                        st.error("台本が空でした。")
                     else:
                         commit_loaded_script(
                             script,
@@ -3653,17 +3623,10 @@ def main() -> None:
                             )
                         set_pending_title_suggestion(title_idea)
                         st.success(
-                            f"台本を取り込みました: {script_upload.name}"
+                            f"取り込み完了: {script_upload.name}"
                             f"（約 {len(script):,} 字"
-                            + (f"・辞書ルビ {ruby_n} 件" if ruby_n else "")
+                            + (f"・ルビ {ruby_n} 件" if ruby_n else "")
                             + "）"
-                        )
-                        st.info(
-                            "台本作成は完了扱いです。"
-                            "下のタイトル案を確認し、"
-                            "『1. AIで台本をレビューする』または"
-                            "『1′. レビューせずに進む』へ進んでください。"
-                            "参考文献はステップ3で入力・確認できます。"
                         )
                 except Exception as e:  # noqa: BLE001
                     st.error(f"台本の取り込みに失敗しました: {e}")
@@ -3674,30 +3637,18 @@ def main() -> None:
     ):
         render_title_suggestion_ui(location="step1")
 
-    st.markdown("**② ルビ辞書（用語とよみの対照表）**")
-    st.caption(
-        "読みにくい医学用語に ｛用語｜よみ｝ を付けるとき、"
-        "標準辞書に加えてアップロード辞書も使えます。"
-        f" 標準ファイル: `data/{RUBY_DICT_PATH.name}`"
-    )
+    st.markdown("**ルビ辞書**")
     dict_file = st.file_uploader(
-        "ルビ辞書を読み込む（.tsv / .txt / .csv）",
+        "追加辞書（.tsv / .txt / .csv）",
         type=["tsv", "txt", "csv"],
         key="ruby_dict_upload",
-        help="1行に「用語」と「よみ」。TAB区切りがおすすめ",
     )
     if dict_file is not None:
         try:
             raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
             pairs = parse_ruby_dict_text(raw_dict)
             if not pairs:
-                st.warning(
-                    "辞書から用語を読み取れませんでした。\n"
-                    "1行に1件、次のどれかの形で書いてください。\n"
-                    "例1: 心筋梗塞\tしんきんこうそく\n"
-                    "例2: 心筋梗塞,しんきんこうそく\n"
-                    "例3: 心筋梗塞｜しんきんこうそく"
-                )
+                st.warning("辞書から用語を読み取れませんでした。")
             else:
                 file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
                 if st.session_state.get("_ruby_dict_file_id") != file_id:
@@ -3705,7 +3656,7 @@ def main() -> None:
                     st.session_state.ruby_dict_source_name = dict_file.name
                     st.session_state._ruby_dict_file_id = file_id
                     st.success(
-                        f"追加辞書を読み込みました: {dict_file.name}（{len(pairs)} 語）"
+                        f"追加辞書: {dict_file.name}（{len(pairs)} 語）"
                     )
         except Exception as e:  # noqa: BLE001
             st.error(f"辞書の読込失敗: {e}")
@@ -3713,9 +3664,9 @@ def main() -> None:
     src_name = st.session_state.get("ruby_dict_source_name") or (
         RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
     )
-    st.caption(f"いま使う辞書: 標準 + {src_name} ／ 合計 {active_n} 語")
+    st.caption(f"辞書: 標準 + {src_name}（{active_n} 語）")
     if st.session_state.get("ruby_dict_custom") and st.button(
-        "追加辞書を外して標準だけに戻す",
+        "追加辞書を外す",
         key="btn_reset_ruby_dict",
     ):
         st.session_state.ruby_dict_custom = None
@@ -3726,17 +3677,13 @@ def main() -> None:
     if st.session_state.raw_script:
         n_chars = len(st.session_state.raw_script)
         est_min = max(1, round(n_chars / 320))
-        st.caption(
-            f"約 {n_chars:,} 字 ／ VOICEVOX 1倍速の目安 約 {est_min} 分"
-            f"（目標 10〜12 分）"
-        )
+        st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
         with st.expander("台本（原文）", expanded=False):
             st.text(st.session_state.raw_script)
 
         if st.button(
-            "いまの台本に辞書ルビを付ける／付け直す",
+            "辞書ルビを付ける／付け直す",
             key="btn_apply_dict_ruby",
-            help="難読な医学用語に ｛用語｜よみ｝ を付けます",
         ):
             with st.spinner("辞書でルビを付けています…"):
                 ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(
@@ -3752,14 +3699,13 @@ def main() -> None:
                 )
             except Exception:
                 pass
-            st.success(f"辞書ルビを付けました（{ruby_n} 件）")
+            st.success(f"ルビ {ruby_n} 件")
             st.rerun()
 
-        st.caption("次の進め方")
         col_rev, col_skip = st.columns(2)
         with col_rev:
             review_clicked = st.button(
-                "1. AIで台本をレビューする",
+                "1. レビューする",
                 type="primary",
                 disabled=not bool(st.session_state.raw_script.strip()),
                 use_container_width=True,
@@ -3767,7 +3713,7 @@ def main() -> None:
             )
         with col_skip:
             skip_clicked = st.button(
-                "1′. レビューせずに進む",
+                "1′. レビューせず進む",
                 type="secondary",
                 disabled=not bool(st.session_state.raw_script.strip()),
                 use_container_width=True,
@@ -3820,47 +3766,41 @@ def main() -> None:
         st.session_state.final_script = plain_script
         st.session_state.final_script_editor = plain_script
         st.success(
-            "レビューをスキップしました。"
-            + (f" 辞書ルビを {ruby_n} 件付けました。" if ruby_n else "")
+            "レビューをスキップしました"
+            + (f"（ルビ {ruby_n} 件）" if ruby_n else "")
         )
 
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
     if st.session_state.review_done:
         if st.session_state.get("skip_review"):
             st.markdown("#### ステップ2: 台本を確定")
-            st.caption("必要なら直してから進む")
-            st.markdown("**最終台本**")
             if "final_script_editor" not in st.session_state:
                 st.session_state.final_script_editor = (
                     st.session_state.final_script or st.session_state.raw_script
                 )
             st.text_area(
-                "台本を編集できます（レビューなし）",
+                "最終台本",
                 height=320,
                 key="final_script_editor",
             )
-            if st.button("2. この台本で動画制作に進む", type="primary", key="btn_confirm_skip"):
+            if st.button("2. 動画制作へ", type="primary", key="btn_confirm_skip"):
                 edited = (st.session_state.get("final_script_editor") or "").strip()
                 if not edited:
-                    st.error("最終台本が空です。文章を入れてください。")
+                    st.error("最終台本が空です。")
                 else:
                     st.session_state.final_script = edited
                     st.session_state.script_confirmed = True
-                    st.success("台本を確定しました。")
+                    st.rerun()
 
         elif st.session_state.review:
-            st.markdown("#### ステップ2: レビュー結果")
+            st.markdown("#### ステップ2: レビュー")
             review = st.session_state.review
             mode = review.get("mode", "claude")
             if mode == "heuristic":
-                st.caption("簡易レビュー（APIキーがあると本格レビュー）")
-            else:
-                st.caption("各指摘で ①承諾／②却下／③別案")
-            st.caption("カタカナ医学用語の表記は指摘対象外")
+                st.caption("簡易レビュー")
             ruby_list = review.get("ruby_annotations") or []
             if ruby_list:
-                st.caption(f"ルビ {len(ruby_list)} 件を付与")
-                with st.expander("ルビ一覧", expanded=False):
+                with st.expander(f"ルビ一覧（{len(ruby_list)} 件）", expanded=False):
                     for item in ruby_list:
                         st.write(
                             f"- {{{item.get('surface')}|{item.get('reading')}}}"
@@ -3875,9 +3815,7 @@ def main() -> None:
                     review.get(section_key, []),
                 )
 
-            st.markdown("**採択を台本へ反映**")
-            st.caption("①承諾／②却下／③別案")
-            if st.button("採択・別案を台本に反映する", type="secondary"):
+            if st.button("採択・別案を台本に反映", type="secondary"):
                 base = (
                     st.session_state.get("final_script_editor")
                     or st.session_state.get("final_script")
@@ -3891,20 +3829,11 @@ def main() -> None:
                 st.session_state.review_apply_log = applied
                 st.session_state.review_manual_log = manual
                 if applied:
-                    st.success(
-                        f"{len(applied)} 件を台本に反映しました。"
-                        "下の最終台本を確認してください。"
-                    )
+                    st.success(f"{len(applied)} 件を反映しました")
                 else:
-                    st.info(
-                        "自動反映できた項目はありません"
-                        "（却下のみ、または手修正が必要）。"
-                    )
+                    st.info("自動反映できる項目はありませんでした")
                 if manual:
-                    st.warning(
-                        "次の項目は自動反映できませんでした。"
-                        "最終台本を手で直してください。"
-                    )
+                    st.warning("手修正が必要な項目があります")
 
             if st.session_state.get("review_apply_log"):
                 with st.expander("反映した内容", expanded=False):
@@ -3915,56 +3844,49 @@ def main() -> None:
                     for line in st.session_state.review_manual_log:
                         st.write(f"- {line}")
 
-            st.markdown("**最終台本**")
             if "final_script_editor" not in st.session_state:
                 st.session_state.final_script_editor = (
                     st.session_state.final_script or st.session_state.raw_script
                 )
             st.text_area(
-                "レビューを反映した文章を編集できます",
+                "最終台本",
                 height=320,
                 key="final_script_editor",
             )
 
             if st.button(
-                "2. この台本で動画制作に進む",
+                "2. 動画制作へ",
                 type="primary",
                 key="btn_confirm_review",
             ):
                 edited = (st.session_state.get("final_script_editor") or "").strip()
                 if not edited:
-                    st.error("最終台本が空です。文章を入れてください。")
+                    st.error("最終台本が空です。")
                 else:
                     st.session_state.final_script = edited
                     st.session_state.script_confirmed = True
-                    st.success("台本を確定しました。")
+                    st.rerun()
 
     # ----- Step 3: 動画生成 -----
     if st.session_state.script_confirmed:
-        st.markdown("#### ステップ3: 動画を作る")
-        st.caption("音声・字幕・医療背景（約1分ごと）→ MP4（BGMなし）")
+        st.markdown("#### ステップ3: 動画")
 
-        st.markdown("**① タイトル**")
         if st.session_state.get("title_suggestion"):
             render_title_suggestion_ui(location="step3")
-            # 採用済みなら念のため表示だけの確認欄も出す
             if st.session_state.get("title_decision") == "accepted":
                 st.text_input(
-                    "タイトル文字（必要なら微修正）",
+                    "タイトル（微修正可）",
                     key="video_title",
                 )
         else:
-            st.caption("動画の先頭に出すタイトル（手入力可）")
+            st.markdown("**タイトル**")
             st.text_input(
-                "タイトル文字",
+                "タイトル",
                 key="video_title",
+                label_visibility="collapsed",
             )
 
-        st.markdown("**② 参考文献**")
-        st.caption(
-            "エンディングに出る出典。論文PDFから作った場合は Vancouver 形式です。"
-            "手入力・.txt / .docx でも上書きできます。"
-        )
+        st.markdown("**参考文献**")
         ref_upload = st.file_uploader(
             "参考文献ファイル（.txt / .docx）",
             type=["txt", "docx"],
@@ -3978,7 +3900,7 @@ def main() -> None:
                     st.session_state.reference_text = loaded
                     st.session_state["_reference_file_id"] = file_id
                     save_reference_text(loaded)
-                    st.success(f"参考文献を読み込みました: {ref_upload.name}")
+                    st.success(f"読込: {ref_upload.name}")
                 except Exception as e:  # noqa: BLE001
                     st.error(f"参考文献の読込失敗: {e}")
 
@@ -4002,13 +3924,14 @@ def main() -> None:
             height=100,
             placeholder=DEFAULT_REFERENCE_EXAMPLE,
             on_change=persist_reference_from_widget,
+            label_visibility="collapsed",
         )
         ref_now = (st.session_state.get("reference_text") or "").strip()
         if ref_now:
             c_ref_txt, c_ref_docx = st.columns(2)
             with c_ref_txt:
                 st.download_button(
-                    "参考文献を .txt で保存",
+                    "参考文献 .txt",
                     data=ref_now.encode("utf-8"),
                     file_name="reference.txt",
                     mime="text/plain",
@@ -4016,16 +3939,14 @@ def main() -> None:
                 )
             with c_ref_docx:
                 st.download_button(
-                    "参考文献を .docx で保存",
+                    "参考文献 .docx",
                     data=text_to_docx_bytes(ref_now),
                     file_name="reference.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key="dl_reference_docx",
                 )
-        st.caption("変更は自動保存。エンディング文面は④で確認します。")
 
-        st.markdown("**③ 読み上げ（VOICEVOX）**")
-        st.caption("声優と声調を選ぶ")
+        st.markdown("**読み上げ**")
         selected_style_id = int(
             st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID)
         )
@@ -4038,10 +3959,7 @@ def main() -> None:
         try:
             ok_vv, _ver = check_voicevox()
             if not ok_vv:
-                st.warning(
-                    "VOICEVOXに接続できないため、声の一覧を表示できません。"
-                    "VOICEVOXを起動してから、このページを再読み込みしてください。"
-                )
+                st.warning("VOICEVOXに接続できません。起動して再読み込みしてください。")
             else:
                 speakers = fetch_voicevox_speakers()
                 speaker_names = [
@@ -4063,11 +3981,10 @@ def main() -> None:
                     col_a, col_b = st.columns(2)
                     with col_a:
                         chosen_name = st.selectbox(
-                            "声優（キャラクター）",
+                            "声優",
                             options=speaker_names,
                             index=name_index,
                             key="vvox_speaker_select",
-                            help="VOICEVOXにインストール済みの声優一覧です",
                         )
                     speaker_obj = next(
                         s for s in speakers if str(s.get("name") or "") == chosen_name
@@ -4112,11 +4029,10 @@ def main() -> None:
 
                     with col_b:
                         chosen_style = st.selectbox(
-                            "声調（ノーマル・ツンツンなど）",
+                            "声調",
                             options=style_labels,
                             index=style_index,
                             key="vvox_style_select",
-                            help="同じ声優でも声の雰囲気が変わります",
                         )
                     selected_style_id = style_ids[style_labels.index(chosen_style)]
                     selected_speaker_name = chosen_name
@@ -4124,49 +4040,23 @@ def main() -> None:
                     st.session_state.vvox_speaker_name = chosen_name
                     st.session_state.vvox_style_name = chosen_style
                     st.session_state.vvox_style_id = selected_style_id
-                    st.success(
-                        f"選択中: {chosen_name} / {chosen_style}"
-                        f"（内部ID: {selected_style_id}）"
-                    )
-                    st.caption(
-                        "エンディング音声表記: "
-                        + format_voicevox_credit(chosen_name)
-                        + f"（読み上げ声調: {chosen_style}）"
-                    )
         except Exception as e:  # noqa: BLE001
-            st.warning(f"声優一覧の取得に失敗しました: {e}")
-            st.caption(
-                f"代わりに初期設定（{DEFAULT_SPEAKER_NAME} / {DEFAULT_STYLE_NAME}）"
-                f"で生成を試みます。"
-            )
+            st.warning(f"声優一覧の取得に失敗: {e}")
             selected_style_id = DEFAULT_SPEAKER_ID
             selected_speaker_name = DEFAULT_SPEAKER_NAME
             selected_style_name = DEFAULT_STYLE_NAME
 
-        st.caption(
-            "ルビON。半角/全角の {｝| は同じ扱い。"
-        )
-        st.markdown("**読み上げ速度**")
         st.slider(
-            "VOICEVOXの速さ",
+            "読み上げ速度",
             min_value=float(VOICEVOX_SPEED_MIN),
             max_value=float(VOICEVOX_SPEED_MAX),
             step=float(VOICEVOX_SPEED_STEP),
             key="vvox_speed_scale",
-            help=f"初期値は {VOICEVOX_SPEED_SCALE:.1f} 倍。0.8〜1.5 を 0.1 刻みで選べます。",
             format="%.1f倍",
-        )
-        st.caption(
-            f"いま {clamp_voicevox_speed(st.session_state.get('vvox_speed_scale', VOICEVOX_SPEED_SCALE)):.1f} 倍"
-            f"（初期 {VOICEVOX_SPEED_SCALE:.1f}）"
         )
 
         # ----- ④ エンディング画面の確認・修正 -----
-        st.markdown("**④ エンディング画面の確認・修正**")
-        st.caption(
-            f"音声終了後 {int(ENDING_FADE_SEC)} 秒でフェードし、"
-            f"約 {int(ENDING_DURATION_SEC)} 秒表示。下の文面が画面に出ます。"
-        )
+        st.markdown("**エンディング**")
         ending_speaker = str(
             st.session_state.get("vvox_speaker_name", selected_speaker_name)
             or DEFAULT_SPEAKER_NAME
@@ -4183,23 +4073,17 @@ def main() -> None:
             st.session_state.ending_credits_text = latest_ending
             st.session_state._ending_auto_text = latest_ending
             st.session_state._ending_prefill_sig = ending_sig
-        elif st.session_state.get("_ending_prefill_sig") != ending_sig:
-            st.caption(
-                "参考文献または声優が変わっています。"
-                "必要なら「最新で入れ直す」を押してください。"
-            )
 
-        if st.button("最新の参考文献・声優で入れ直す", key="btn_refresh_ending"):
+        if st.button("参考文献・声優で入れ直す", key="btn_refresh_ending"):
             st.session_state.ending_credits_text = latest_ending
             st.session_state._ending_auto_text = latest_ending
             st.session_state._ending_prefill_sig = ending_sig
             st.rerun()
 
         st.text_area(
-            "エンディング文面（編集可）",
+            "エンディング文面",
             key="ending_credits_text",
             height=280,
-            help="フィクション表示・参考文献・音声クレジットなど。ここを直した内容が動画に使われます。",
         )
 
         if st.button("3. 動画を生成する", type="primary"):
@@ -4402,16 +4286,8 @@ def main() -> None:
                     st.session_state.mp4_name = desktop_name
                     st.session_state.mp4_bytes = None
                     progress.progress(100, text="完了")
-                    themes_used = (
-                        f"{len(schedule)} 枚の医療背景"
-                        f"（約{int(SCENE_INTERVAL_SEC/60)}分ごと）"
-                    )
                     status.success(
-                        "動画の生成が完了しました。\n"
-                        f"デスクトップに保存: {desktop_path}\n"
-                        f"（作業用コピー: {out_path}）\n"
-                        f"音声: {speaker_name}（{style_name}）\n"
-                        f"背景: {themes_used}"
+                        f"完了。デスクトップ: {desktop_path}"
                     )
 
             except Exception as e:  # noqa: BLE001
@@ -4423,7 +4299,7 @@ def main() -> None:
         mp4_path = st.session_state.get("mp4_path") or ""
         if mp4_path and Path(mp4_path).exists():
             size_mb = Path(mp4_path).stat().st_size / (1024 * 1024)
-            st.success(f"完成ファイル: `{mp4_path}` （約 {size_mb:.1f} MB）")
+            st.success(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
             # 大きいMP4を毎回メモリに載せると落ちやすいので上限を設ける
             if size_mb < 180:
                 st.download_button(
@@ -4434,33 +4310,26 @@ def main() -> None:
                     type="primary",
                 )
             else:
-                st.info(
-                    "ファイルが大きいため、ブラウザからのダウンロードは省略しました。"
-                    "Finder で次の場所を開いてください。"
-                )
+                st.info("ファイルが大きいため、Finder で開いてください。")
                 st.code(mp4_path)
-            st.caption(
-                "30分前後の動画はブラウザ再生が重いことがあります。"
-                "QuickTime などで確認してください。"
-            )
             frame = OUTPUT_DIR / "last_frame.png"
             if frame.exists():
                 st.image(
                     str(frame),
-                    caption="本編の静止画フレーム（先頭シーン）",
+                    caption="本編フレーム",
                     use_container_width=True,
                 )
             ending_prev = OUTPUT_DIR / "last_ending.png"
             if ending_prev.exists():
                 st.image(
                     str(ending_prev),
-                    caption=f"エンディング（約{int(ENDING_DURATION_SEC)}秒・著作権／出典）",
+                    caption="エンディング",
                     use_container_width=True,
                 )
             script_saved = st.session_state.get("last_script_path") or ""
             if script_saved and Path(script_saved).exists():
                 st.download_button(
-                    label="今回の台本を Word（.docx）でダウンロード",
+                    label="台本を Word で保存",
                     data=Path(script_saved).read_bytes(),
                     file_name="last_script.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
