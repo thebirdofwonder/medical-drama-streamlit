@@ -174,11 +174,11 @@ CLAUDE_MODEL_CANDIDATES = [
 ]
 # レビュー用に送る台本の上限（長すぎると API が失敗しやすい）
 REVIEW_SCRIPT_MAX_CHARS = 12000
-# 論文PDF→台本化：論文本文の送付上限・15分ナレーション目安
+# 論文PDF→台本化：論文本文の送付上限・VOICEVOX 1倍速 10〜12分目安
 PAPER_TEXT_MAX_CHARS = 100000
-# 日本語ナレーション目安 約300〜350字/分 × 15分
-DRAMA_SCRIPT_TARGET_CHARS_MIN = 4500
-DRAMA_SCRIPT_TARGET_CHARS_MAX = 5500
+# 日本語ナレーション目安 約300〜330字/分 × 10〜12分（VOICEVOX 1.0倍速）
+DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
+DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 
 
 # ---------------------------------------------------------------------------
@@ -989,11 +989,11 @@ def build_drama_script_prompt(paper_text: str) -> str:
 次の医学論文（または症例報告）の内容をもとに、ナレーション台本だけを書いてください。
 
 【必須条件】
-① 約15分の YouTube 医学ドラマ台本にする（本文の文字数はおおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字を目安）。
+① VOICEVOX 1.0倍速で読み上げたとき約10〜12分に収まる YouTube 医学ドラマ台本にする（本文の文字数はおおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字を目安。これより長くしない）。
 ② すべてナレーターが話し、ドラマが展開する。場面転換もナレーションで示す。
 ③ 読み上げる台本本文以外は一切書かない。タイトル見出し、サブタイトル、シーン番号、「注釈」「解説」「制作メモ」、私への説明、前置き、後書き、Markdown記法は禁止。
 ④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
-⑤ 主な視聴者は医療従事者。専門用語はそのまま使ってよい。
+⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。
 ⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。
 ⑦ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
 ⑧ 登場人物のセリフには必ずカギ括弧「」を付ける。
@@ -1108,6 +1108,8 @@ def polish_drama_script_medically(script: str, api_key: str) -> str:
 - 出力は修正後の台本本文のみ（説明・箇条書きの修正リストは禁止）
 - ナレーションのみの形式を維持する
 - ドラマ前半で正しい診断を明示しないルールは維持する
+- 難易度は医師免許を持つ研修医が理解できるレベルを維持する（過度に高度化しない）
+- 長さは VOICEVOX 1.0倍速で約10〜12分（おおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字）を超えないよう、長くしすぎない
 - セリフの「」、ルビ ｛用語｜よみがな｝、列挙の読点ルールは崩さない
 - 不要な前置き・後書きを付けない
 
@@ -1120,7 +1122,7 @@ def polish_drama_script_medically(script: str, api_key: str) -> str:
 
 def generate_drama_script_from_paper(paper_text: str, api_key: str) -> str:
     """
-    医学論文テキストから約15分のナレーション台本を作る。
+    医学論文テキストから、VOICEVOX 1倍速で約10〜12分のナレーション台本を作る。
     生成後に医学的な自己校正パスを1回行う。
     """
     paper = (paper_text or "").strip()
@@ -3507,8 +3509,8 @@ def main() -> None:
     if input_mode == "paper":
         st.markdown("**① 医学論文PDFから台本を作る**")
         st.caption(
-            "PDFを上げると、約15分のナレーション台本を作り、このアプリに取り込みます。"
-            "（Claude用のAPIキーが必要）"
+            "PDFを上げると、VOICEVOX 1倍速で約10〜12分のナレーション台本を作ります。"
+            "難易度は研修医が理解できるレベルです。（Claude用のAPIキーが必要）"
         )
         paper_pdf = st.file_uploader(
             "医学論文PDF",
@@ -3724,7 +3726,10 @@ def main() -> None:
     if st.session_state.raw_script:
         n_chars = len(st.session_state.raw_script)
         est_min = max(1, round(n_chars / 320))
-        st.caption(f"約 {n_chars:,} 字 ／ 読み上げ目安 約 {est_min} 分")
+        st.caption(
+            f"約 {n_chars:,} 字 ／ VOICEVOX 1倍速の目安 約 {est_min} 分"
+            f"（目標 10〜12 分）"
+        )
         with st.expander("台本（原文）", expanded=False):
             st.text(st.session_state.raw_script)
 
