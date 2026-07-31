@@ -90,11 +90,21 @@ def get_desktop_dir() -> Path:
 
 def make_desktop_mp4_filename(title: str = "") -> str:
     """デスクトップ保存用のファイル名（上書きしにくいよう日時つき）。"""
-    raw = (title or "").strip() or "medical_drama"
-    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", raw)
-    safe = re.sub(r"_+", "_", safe).strip("._")[:40] or "medical_drama"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{safe}_{stamp}.mp4"
+    return f"{make_title_basename(title)}_{stamp}.mp4"
+
+
+def make_title_basename(title: str = "", fallback: str = "medical_drama") -> str:
+    """タイトルをファイル名に使える文字だけにする。"""
+    raw = (title or "").strip() or fallback
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", raw)
+    safe = re.sub(r"_+", "_", safe).strip("._")[:80] or fallback
+    return safe
+
+
+def make_script_docx_filename(title: str = "") -> str:
+    """台本 Word 用ファイル名（動画タイトルと同一）。"""
+    return f"{make_title_basename(title)}.docx"
 
 
 def load_saved_reference_text() -> str:
@@ -993,7 +1003,7 @@ def build_drama_script_prompt(paper_text: str) -> str:
 ② すべてナレーターが話し、ドラマが展開する。場面転換もナレーションで示す。
 ③ 読み上げる台本本文以外は一切書かない。タイトル見出し、サブタイトル、シーン番号、「注釈」「解説」「制作メモ」、私への説明、前置き、後書き、Markdown記法は禁止。
 ④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
-⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。
+⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。ただし台本本文で視聴者に呼びかけない。「研修医のみなさん」「みなさん」「皆さん」などへの呼びかける表現は禁止（難易度の目安と、台詞・ナレーションの相手は別）。
 ⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。
 ⑦ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
 ⑧ 登場人物のセリフには必ずカギ括弧「」を付ける。
@@ -1109,6 +1119,7 @@ def polish_drama_script_medically(script: str, api_key: str) -> str:
 - ナレーションのみの形式を維持する
 - ドラマ前半で正しい診断を明示しないルールは維持する
 - 難易度は医師免許を持つ研修医が理解できるレベルを維持する（過度に高度化しない）
+- 「研修医のみなさん」「みなさん」など視聴者への呼びかけは入れない／残っていれば削除する
 - 長さは VOICEVOX 1.0倍速で約10〜12分（おおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字）を超えないよう、長くしすぎない
 - セリフの「」、ルビ ｛用語｜よみがな｝、列挙の読点ルールは崩さない
 - 不要な前置き・後書きを付けない
@@ -1368,14 +1379,13 @@ def render_title_suggestion_ui(location: str = "main") -> None:
         return
     decision = str(st.session_state.get("title_decision") or "pending")
     manual_key = f"title_manual_input_{location}"
-    st.markdown("**タイトル**")
 
     if decision == "pending":
         st.write(f"「{suggestion}」")
         c1, c2 = st.columns(2)
         with c1:
             if st.button(
-                "このタイトルを使う",
+                "使う",
                 type="primary",
                 key=f"btn_accept_title_{location}",
                 use_container_width=True,
@@ -1385,7 +1395,7 @@ def render_title_suggestion_ui(location: str = "main") -> None:
                 st.rerun()
         with c2:
             if st.button(
-                "手入力する",
+                "手入力",
                 key=f"btn_reject_title_{location}",
                 use_container_width=True,
             ):
@@ -1395,21 +1405,16 @@ def render_title_suggestion_ui(location: str = "main") -> None:
 
     if decision == "accepted":
         st.write(f"「{st.session_state.get('video_title', suggestion)}」")
-        if st.button("タイトルをやり直す", key=f"btn_reset_title_{location}"):
+        if st.button("やり直す", key=f"btn_reset_title_{location}"):
             st.session_state.title_decision = "pending"
             st.rerun()
         return
 
-    # manual
-    st.text_input(
-        "タイトルを入力",
-        key=manual_key,
-        placeholder="例: 沈黙のモニターの向こう側",
-    )
+    st.text_input("タイトル", key=manual_key)
     c1, c2 = st.columns(2)
     with c1:
         if st.button(
-            "手入力タイトルを確定",
+            "確定",
             type="primary",
             key=f"btn_confirm_manual_title_{location}",
             use_container_width=True,
@@ -1423,7 +1428,7 @@ def render_title_suggestion_ui(location: str = "main") -> None:
                 st.rerun()
     with c2:
         if st.button(
-            "提案に戻る",
+            "戻る",
             key=f"btn_back_to_suggestion_{location}",
             use_container_width=True,
         ):
@@ -3311,6 +3316,8 @@ def init_state() -> None:
         "ending_credits_text": "",
         "reference_text": "",
         "last_script_path": "",
+        "last_script_name": "medical_drama.docx",
+        "video_encoding": False,
         "review_apply_log": [],
         "review_manual_log": [],
         "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
@@ -3352,86 +3359,183 @@ def init_state() -> None:
 # ---------------------------------------------------------------------------
 # Streamlit メイン
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 動画書き出し
+# ---------------------------------------------------------------------------
+def run_video_export(progress, status) -> None:
+    """
+    音声・背景・字幕・エンディングをまとめて MP4 にする。
+    progress / status は Streamlit の表示用オブジェクト。
+    """
+    ok, ver = check_voicevox()
+    if not ok:
+        raise RuntimeError(
+            "VOICEVOX に接続できません。アプリを起動してから再実行してください。"
+            f"（詳細: {ver}）"
+        )
+
+    style_id = int(st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID))
+    speaker_name = str(
+        st.session_state.get("vvox_speaker_name", DEFAULT_SPEAKER_NAME)
+    )
+    style_name = str(st.session_state.get("vvox_style_name", DEFAULT_STYLE_NAME))
+    ending_body = (st.session_state.get("ending_credits_text") or "").strip()
+    if not ending_body:
+        ending_body = build_ending_credits_text(
+            st.session_state.get("reference_text", ""),
+            speaker_name,
+        )
+        st.session_state.ending_credits_text = ending_body
+        st.session_state._ending_auto_text = ending_body
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    speed_scale = clamp_voicevox_speed(
+        st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
+    )
+    extra_ruby = []
+    if st.session_state.get("review"):
+        extra_ruby = st.session_state.review.get("ruby_annotations") or []
+    voice_script, ruby_count = prepare_script_for_voicevox(
+        st.session_state.final_script,
+        extra_annotations=extra_ruby,
+        enabled=True,
+    )
+    if voice_script:
+        st.session_state.final_script = voice_script
+
+    save_reference_text(st.session_state.get("reference_text", ""))
+
+    video_title = str(st.session_state.get("video_title") or "").strip()
+    script_docx_name = make_script_docx_filename(video_title)
+    script_path = OUTPUT_DIR / "last_script.txt"
+    script_path.write_text(voice_script, encoding="utf-8")
+    script_docx_path = OUTPUT_DIR / script_docx_name
+    script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
+    # 旧固定名も残す（互換）
+    (OUTPUT_DIR / "last_script.docx").write_bytes(script_docx_path.read_bytes())
+    tts_script = expand_voicevox_ruby_to_reading(voice_script)
+    sub_script = strip_voicevox_ruby(voice_script)
+    (OUTPUT_DIR / "last_script_tts.txt").write_text(tts_script, encoding="utf-8")
+    (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
+        sub_script, encoding="utf-8"
+    )
+    st.session_state.last_script_path = str(script_docx_path)
+    st.session_state.last_script_name = script_docx_name
+
+    with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
+        tmp_path = Path(tmp)
+        ruby_msg = f"ルビ{ruby_count}件"
+        status.info(
+            f"音声生成中（{speaker_name} / {style_name}・{ruby_msg}・"
+            f"{speed_scale:.1f}倍）…"
+        )
+        wav_path = tmp_path / "narration.wav"
+        n_chunks = len(split_text_for_voicevox(voice_script))
+
+        def _voice_prog(done: int, total: int) -> None:
+            pct = 5 + int(45 * (done / max(total, 1)))
+            progress.progress(
+                min(pct, 50),
+                text=f"音声 {done}/{total}",
+            )
+            status.info(
+                f"読み上げ中 {done}/{total}"
+                f"（予定 {n_chunks}・{speaker_name} / {style_name}）"
+            )
+
+        wav_path, subtitle_cues = generate_narration_wav_to_file(
+            voice_script,
+            wav_path,
+            progress_callback=_voice_prog,
+            speaker=style_id,
+            speed_scale=speed_scale,
+        )
+        sync_issues = validate_audio_subtitle_sync(wav_path, subtitle_cues)
+        if sync_issues:
+            raise RuntimeError(
+                "音声と字幕の同期チェックに失敗しました:\n"
+                + "\n".join(f"- {m}" for m in sync_issues)
+            )
+
+        import wave as _wave
+
+        with _wave.open(str(wav_path), "rb") as wf:
+            audio_sec = wf.getnframes() / float(wf.getframerate())
+
+        schedule = plan_scene_schedule(st.session_state.final_script, audio_sec)
+        status.info(f"背景準備（{len(schedule)} 枚）…")
+        progress.progress(52, text="背景ダウンロード…")
+        bg_indices = [
+            int(item.get("landscape_index", item["index"])) for item in schedule
+        ]
+        landscapes = ensure_landscape_images(bg_indices)
+        progress.progress(55, text="シーン合成…")
+        scene_dir = tmp_path / "scenes"
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        scene_clips: list[tuple[Path, float]] = []
+        for item in schedule:
+            i = int(item["index"])
+            li = int(item.get("landscape_index", i))
+            dur = float(item["duration"])
+            frame_path = scene_dir / f"scene_{i:03d}.png"
+            land = landscapes[i % len(landscapes)]
+            create_scene_frame(
+                frame_path,
+                landscape_path=land,
+                title=st.session_state.get("video_title", ""),
+                title_img=None,
+                show_title=(i == 0),
+                disclaimer=DISCLAIMER_TEXT,
+                landscape_index=li,
+            )
+            scene_clips.append((frame_path, dur))
+            pct = 55 + int(12 * ((i + 1) / max(len(schedule), 1)))
+            progress.progress(min(pct, 67), text=f"シーン {i+1}/{len(schedule)}")
+
+        status.info("エンディング…")
+        progress.progress(70, text="エンディング…")
+        ending_path = tmp_path / "ending_credits.png"
+        create_ending_credits_frame(ending_path, ending_text=ending_body)
+        (OUTPUT_DIR / "last_ending.png").write_bytes(ending_path.read_bytes())
+        (OUTPUT_DIR / "last_frame.png").write_bytes(
+            scene_clips[0][0].read_bytes()
+        )
+
+        status.info("MP4 エンコード中…操作しないでください")
+        progress.progress(85, text="MP4 エンコード中…")
+        out_path = OUTPUT_DIR / "medical_drama.mp4"
+        build_mp4(
+            wav_path,
+            scene_clips,
+            out_path,
+            ending_png=ending_path,
+            ending_duration=ENDING_DURATION_SEC,
+            subtitle_cues=subtitle_cues,
+            subtitle_dir=tmp_path / "_subs",
+        )
+
+        desktop_dir = get_desktop_dir()
+        desktop_name = make_desktop_mp4_filename(video_title)
+        desktop_path = desktop_dir / desktop_name
+        shutil.copy2(out_path, desktop_path)
+
+        st.session_state.mp4_path = str(desktop_path)
+        st.session_state.mp4_name = desktop_name
+        st.session_state.mp4_bytes = None
+        progress.progress(100, text="完了")
+        status.success(f"完了: {desktop_path}")
+
+
 def inject_app_theme() -> None:
-    """アプリ画面は白黒基調。大きな活字は使わず、コントラストを確保する。"""
+    """余計な装飾を抑え、読みやすい白背景にする。"""
     st.markdown(
         """
 <style>
-  /* 全体：白背景・黒文字 */
-  [data-testid="stAppViewContainer"] {
-    background: #ffffff !important;
-    color: #000000 !important;
-  }
-  [data-testid="stHeader"] {
-    background: #ffffff !important;
-  }
-  [data-testid="stSidebar"] {
-    background: #f7f7f7 !important;
-    border-right: 1px solid #000000 !important;
-  }
-  [data-testid="stMarkdownContainer"] p,
-  [data-testid="stMarkdownContainer"] li,
-  label {
-    color: #000000 !important;
-  }
-  /* 見出しを大きくしない */
-  h1, h2, h3, h4 {
-    font-size: 1.05rem !important;
-    font-weight: 600 !important;
-    color: #000000 !important;
-  }
-  /* 主ボタン：黒背景＋白文字 */
-  .stButton > button,
-  .stButton > button[kind="primary"],
-  .stButton > button[data-testid="baseButton-primary"],
-  button[kind="primary"],
-  button[data-testid="baseButton-primary"] {
-    background-color: #000000 !important;
-    border: 1px solid #000000 !important;
-    color: #ffffff !important;
-  }
-  .stButton > button p,
-  .stButton > button span,
-  .stButton > button div,
-  button[kind="primary"] p,
-  button[kind="primary"] span,
-  button[data-testid="baseButton-primary"] p,
-  button[data-testid="baseButton-primary"] span {
-    color: #ffffff !important;
-  }
-  /* 副ボタン：白背景＋黒文字＋黒枠 */
-  .stButton > button[kind="secondary"],
-  .stButton > button[data-testid="baseButton-secondary"],
-  button[kind="secondary"],
-  button[data-testid="baseButton-secondary"] {
-    background-color: #ffffff !important;
-    border: 1px solid #000000 !important;
-    color: #000000 !important;
-  }
-  .stButton > button[kind="secondary"] p,
-  .stButton > button[kind="secondary"] span,
-  .stButton > button[data-testid="baseButton-secondary"] p,
-  .stButton > button[data-testid="baseButton-secondary"] span,
-  button[kind="secondary"] p,
-  button[kind="secondary"] span {
-    color: #000000 !important;
-  }
-  /* 情報枠も白黒 */
-  div[data-testid="stAlert"] {
-    background-color: #ffffff !important;
-    color: #000000 !important;
-    border: 1px solid #000000 !important;
-  }
-  .stCaption, [data-testid="stCaptionContainer"] {
-    color: #222222 !important;
-    font-size: 0.85rem !important;
-  }
-  /* 入力欄も黒枠 */
-  .stTextInput input, .stTextArea textarea, [data-baseweb="select"] {
-    border-color: #000000 !important;
-    color: #000000 !important;
-    background: #ffffff !important;
-  }
+  [data-testid="stAppViewContainer"] { background: #fff; color: #111; }
+  [data-testid="stHeader"] { background: #fff; }
+  [data-testid="stSidebar"] { background: #fafafa; }
+  h1, h2, h3, h4 { font-size: 1rem !important; font-weight: 600 !important; }
+  div[data-testid="stAlert"] { border: 1px solid #ccc !important; }
 </style>
         """,
         unsafe_allow_html=True,
@@ -3447,45 +3551,58 @@ def main() -> None:
     inject_app_theme()
     init_state()
 
-    st.markdown("### 医学ドラマ動画メーカー")
+    # MP4作成中は他UIを出さず、誤操作を防ぐ
+    if st.session_state.get("video_encoding"):
+        st.write("医学ドラマ動画メーカー")
+        st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
+        progress = st.progress(0, text="準備中…")
+        status = st.empty()
+        try:
+            run_video_export(progress, status)
+        except Exception as e:  # noqa: BLE001
+            st.session_state.mp4_path = ""
+            st.session_state.mp4_bytes = None
+            st.session_state.video_encoding = False
+            st.error(f"動画生成に失敗しました: {e}")
+            st.exception(e)
+            st.stop()
+        st.session_state.video_encoding = False
+        st.rerun()
+
+    st.write("医学ドラマ動画メーカー")
 
     with st.sidebar:
-        st.markdown("#### 設定")
+        st.write("設定")
         ok, ver = check_voicevox()
         if ok:
-            st.success(f"VOICEVOX OK（{ver}）")
+            st.caption(f"VOICEVOX OK（{ver}）")
         else:
             st.error(f"VOICEVOX 未接続: {ver}")
 
-        st.divider()
-        st.markdown("**APIキー**")
         load_dotenv_file()
         has_saved = bool(get_api_key())
-        if has_saved:
-            st.caption("保存済み")
-        else:
-            st.caption("未設定")
-
         typed = st.text_input(
-            "ANTHROPIC_API_KEY",
+            "APIキー",
             type="password",
+            placeholder="ANTHROPIC_API_KEY",
+            help="保存済み" if has_saved else "未設定",
         )
         if typed.strip():
             os.environ["ANTHROPIC_API_KEY"] = typed.strip()
 
-        if st.button("キーをローカルに保存"):
+        if st.button("キーを保存"):
             to_save = typed.strip() or get_api_key()
             if not to_save:
                 st.error("先にキーを入力してください。")
             else:
                 try:
                     saved_path = save_api_key_to_env_file(to_save)
-                    st.success(f"保存しました: `{saved_path.name}`")
+                    st.success(f"保存: `{saved_path.name}`")
                 except Exception as e:  # noqa: BLE001
                     st.error(f"保存失敗: {e}")
 
-    # ----- Step 1: 台本を用意する -----
-    st.markdown("#### ステップ1: 台本")
+    # ----- Step 1 -----
+    st.write("1. 台本")
 
     input_mode = st.radio(
         "入力方法",
@@ -3638,7 +3755,7 @@ def main() -> None:
     ):
         render_title_suggestion_ui(location="step1")
 
-    st.markdown("**ルビ辞書**")
+    st.write("ルビ辞書")
     dict_file = st.file_uploader(
         "追加辞書（.tsv / .txt / .csv）",
         type=["tsv", "txt", "csv"],
@@ -3774,7 +3891,7 @@ def main() -> None:
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
     if st.session_state.review_done:
         if st.session_state.get("skip_review"):
-            st.markdown("#### ステップ2: 台本を確定")
+            st.write("2. 台本を確定")
             if "final_script_editor" not in st.session_state:
                 st.session_state.final_script_editor = (
                     st.session_state.final_script or st.session_state.raw_script
@@ -3794,7 +3911,7 @@ def main() -> None:
                     st.rerun()
 
         elif st.session_state.review:
-            st.markdown("#### ステップ2: レビュー")
+            st.write("2. レビュー")
             review = st.session_state.review
             mode = review.get("mode", "claude")
             if mode == "heuristic":
@@ -3870,24 +3987,22 @@ def main() -> None:
 
     # ----- Step 3: 動画生成 -----
     if st.session_state.script_confirmed:
-        st.markdown("#### ステップ3: 動画")
+        st.write("3. 動画")
 
         if st.session_state.get("title_suggestion"):
             render_title_suggestion_ui(location="step3")
             if st.session_state.get("title_decision") == "accepted":
                 st.text_input(
-                    "タイトル（微修正可）",
+                    "タイトル",
                     key="video_title",
                 )
         else:
-            st.markdown("**タイトル**")
             st.text_input(
                 "タイトル",
                 key="video_title",
-                label_visibility="collapsed",
             )
 
-        st.markdown("**参考文献**")
+        st.write("参考文献")
         ref_upload = st.file_uploader(
             "参考文献ファイル（.txt / .docx）",
             type=["txt", "docx"],
@@ -3947,7 +4062,7 @@ def main() -> None:
                     key="dl_reference_docx",
                 )
 
-        st.markdown("**読み上げ**")
+        st.write("読み上げ")
         selected_style_id = int(
             st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID)
         )
@@ -4057,7 +4172,7 @@ def main() -> None:
         )
 
         # ----- ④ エンディング画面の確認・修正 -----
-        st.markdown("**エンディング**")
+        st.write("エンディング")
         ending_speaker = str(
             st.session_state.get("vvox_speaker_name", selected_speaker_name)
             or DEFAULT_SPEAKER_NAME
@@ -4088,219 +4203,14 @@ def main() -> None:
         )
 
         if st.button("3. 動画を生成する", type="primary"):
-            progress = st.progress(0, text="準備中…")
-            status = st.empty()
-            try:
-                ok, ver = check_voicevox()
-                if not ok:
-                    raise RuntimeError(
-                        "VOICEVOX に接続できません。アプリを起動してから再実行してください。"
-                        f"（詳細: {ver}）"
-                    )
-
-                style_id = int(
-                    st.session_state.get("vvox_style_id", selected_style_id)
-                )
-                speaker_name = str(
-                    st.session_state.get("vvox_speaker_name", selected_speaker_name)
-                )
-                style_name = str(
-                    st.session_state.get("vvox_style_name", selected_style_name)
-                )
-                # ④で確認・修正した文面を使う（空なら最新で組み立て）
-                ending_body = (st.session_state.get("ending_credits_text") or "").strip()
-                if not ending_body:
-                    ending_body = build_ending_credits_text(
-                        st.session_state.get("reference_text", ""),
-                        speaker_name,
-                    )
-                    st.session_state.ending_credits_text = ending_body
-                    st.session_state._ending_auto_text = ending_body
-
-                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                speed_scale = clamp_voicevox_speed(
-                    st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
-                )
-                extra_ruby = []
-                if st.session_state.get("review"):
-                    extra_ruby = (
-                        st.session_state.review.get("ruby_annotations") or []
-                    )
-                # 辞書ルビは音声直前でも再適用される
-                voice_script, ruby_count = prepare_script_for_voicevox(
-                    st.session_state.final_script,
-                    extra_annotations=extra_ruby,
-                    enabled=True,
-                )
-                # 音声用台本だけ更新（final_script_editor は画面ウィジェット済みなので触らない）
-                if voice_script:
-                    st.session_state.final_script = voice_script
-
-                # 参考文献を保存（次回も残す）
-                save_reference_text(st.session_state.get("reference_text", ""))
-
-                script_path = OUTPUT_DIR / "last_script.txt"
-                script_path.write_text(voice_script, encoding="utf-8")
-                script_docx_path = OUTPUT_DIR / "last_script.docx"
-                script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
-                # VOICEVOX送信用（よみのみ）と字幕用（表記のみ）も保存
-                tts_script = expand_voicevox_ruby_to_reading(voice_script)
-                sub_script = strip_voicevox_ruby(voice_script)
-                (OUTPUT_DIR / "last_script_tts.txt").write_text(
-                    tts_script, encoding="utf-8"
-                )
-                (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
-                    sub_script, encoding="utf-8"
-                )
-                st.session_state.last_script_path = str(script_docx_path)
-
-                with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
-                    tmp_path = Path(tmp)
-
-                    ruby_msg = f"ルビ{ruby_count}件"
-                    status.info(
-                        f"① 音声を生成しています"
-                        f"（{speaker_name} / {style_name}・{ruby_msg}・{speed_scale:.1f}倍速）…"
-                    )
-                    wav_path = tmp_path / "narration.wav"
-                    n_chunks = len(split_text_for_voicevox(voice_script))
-
-                    def _voice_prog(done: int, total: int) -> None:
-                        pct = 5 + int(45 * (done / max(total, 1)))
-                        progress.progress(
-                            min(pct, 50),
-                            text=f"VOICEVOX 音声生成中… {done}/{total} 区間",
-                        )
-                        status.info(
-                            f"① {speaker_name}（{style_name}・{ruby_msg}・"
-                            f"{speed_scale:.1f}倍速）で読み上げ中"
-                            f"（{done}/{total}）… 予定区間数 {n_chunks}"
-                        )
-
-                    wav_path, subtitle_cues = generate_narration_wav_to_file(
-                        voice_script,
-                        wav_path,
-                        progress_callback=_voice_prog,
-                        speaker=style_id,
-                        speed_scale=speed_scale,
-                    )
-                    sync_issues = validate_audio_subtitle_sync(
-                        wav_path, subtitle_cues
-                    )
-                    if sync_issues:
-                        raise RuntimeError(
-                            "音声と字幕の同期チェックに失敗しました:\n"
-                            + "\n".join(f"- {m}" for m in sync_issues)
-                        )
-                    status.info(
-                        f"①′ 字幕キュー {len(subtitle_cues)} 件を作成"
-                        "（表記のみ）／音声との同期チェック OK"
-                    )
-
-                    # 音声の長さを知り、1分ごとの医療背景シーンを計画
-                    import wave as _wave
-
-                    with _wave.open(str(wav_path), "rb") as wf:
-                        audio_sec = wf.getnframes() / float(wf.getframerate())
-
-                    schedule = plan_scene_schedule(
-                        st.session_state.final_script, audio_sec
-                    )
-                    status.info(
-                        f"② 医療背景を用意（{len(schedule)} 枚・"
-                        f"約{SCENE_INTERVAL_SEC/60:.0f}分ごと切替）…"
-                    )
-                    progress.progress(52, text="医療背景をダウンロード中…")
-                    bg_indices = [
-                        int(item.get("landscape_index", item["index"]))
-                        for item in schedule
-                    ]
-                    landscapes = ensure_landscape_images(bg_indices)
-                    progress.progress(55, text="シーン画像を合成中…")
-                    scene_dir = tmp_path / "scenes"
-                    scene_dir.mkdir(parents=True, exist_ok=True)
-                    scene_clips: list[tuple[Path, float]] = []
-                    for item in schedule:
-                        i = int(item["index"])
-                        li = int(item.get("landscape_index", i))
-                        dur = float(item["duration"])
-                        frame_path = scene_dir / f"scene_{i:03d}.png"
-                        land = landscapes[i % len(landscapes)]
-                        create_scene_frame(
-                            frame_path,
-                            landscape_path=land,
-                            title=st.session_state.get("video_title", ""),
-                            title_img=None,
-                            show_title=(i == 0),
-                            disclaimer=DISCLAIMER_TEXT,
-                            landscape_index=li,
-                        )
-                        scene_clips.append((frame_path, dur))
-                        pct = 55 + int(12 * ((i + 1) / max(len(schedule), 1)))
-                        progress.progress(
-                            min(pct, 67),
-                            text=f"シーン {i+1}/{len(schedule)}",
-                        )
-
-                    # エンディング（著作権・出典）
-                    status.info(
-                        f"②′ エンディングへフェード"
-                        f"（{int(ENDING_FADE_SEC)}秒）＋表示"
-                        f"（約{int(ENDING_DURATION_SEC)}秒）…"
-                    )
-                    progress.progress(70, text="エンディング画像を生成中…")
-                    ending_path = tmp_path / "ending_credits.png"
-                    create_ending_credits_frame(
-                        ending_path,
-                        ending_text=ending_body,
-                    )
-                    # プレビューはエンディングも保存
-                    (OUTPUT_DIR / "last_ending.png").write_bytes(
-                        ending_path.read_bytes()
-                    )
-                    # 本編プレビューは最初のシーン
-                    preview_path = OUTPUT_DIR / "last_frame.png"
-                    preview_path.write_bytes(scene_clips[0][0].read_bytes())
-
-                    status.info("③ 本編＋字幕＋エンディングをMP4にしています…")
-                    progress.progress(85, text="MP4へエンコード中…")
-                    out_path = OUTPUT_DIR / "medical_drama.mp4"
-                    build_mp4(
-                        wav_path,
-                        scene_clips,
-                        out_path,
-                        ending_png=ending_path,
-                        ending_duration=ENDING_DURATION_SEC,
-                        subtitle_cues=subtitle_cues,
-                        subtitle_dir=tmp_path / "_subs",
-                    )
-
-                    # 完成MP4をデスクトップへコピー（Finderですぐ見つかる）
-                    desktop_dir = get_desktop_dir()
-                    desktop_name = make_desktop_mp4_filename(
-                        st.session_state.get("video_title", "")
-                    )
-                    desktop_path = desktop_dir / desktop_name
-                    shutil.copy2(out_path, desktop_path)
-
-                    st.session_state.mp4_path = str(desktop_path)
-                    st.session_state.mp4_name = desktop_name
-                    st.session_state.mp4_bytes = None
-                    progress.progress(100, text="完了")
-                    status.success(
-                        f"完了。デスクトップ: {desktop_path}"
-                    )
-
-            except Exception as e:  # noqa: BLE001
-                st.session_state.mp4_path = ""
-                st.session_state.mp4_bytes = None
-                st.error(f"動画生成に失敗しました: {e}")
-                st.exception(e)
+            # 次の描画で作業専用画面にし、他ボタンを出さない
+            st.session_state.video_encoding = True
+            st.rerun()
 
         mp4_path = st.session_state.get("mp4_path") or ""
         if mp4_path and Path(mp4_path).exists():
             size_mb = Path(mp4_path).stat().st_size / (1024 * 1024)
-            st.success(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
+            st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
             # 大きいMP4を毎回メモリに載せると落ちやすいので上限を設ける
             if size_mb < 180:
                 st.download_button(
@@ -4315,24 +4225,22 @@ def main() -> None:
                 st.code(mp4_path)
             frame = OUTPUT_DIR / "last_frame.png"
             if frame.exists():
-                st.image(
-                    str(frame),
-                    caption="本編フレーム",
-                    use_container_width=True,
-                )
+                st.image(str(frame), use_container_width=True)
             ending_prev = OUTPUT_DIR / "last_ending.png"
             if ending_prev.exists():
-                st.image(
-                    str(ending_prev),
-                    caption="エンディング",
-                    use_container_width=True,
-                )
+                st.image(str(ending_prev), use_container_width=True)
             script_saved = st.session_state.get("last_script_path") or ""
             if script_saved and Path(script_saved).exists():
+                script_dl_name = (
+                    st.session_state.get("last_script_name")
+                    or make_script_docx_filename(
+                        st.session_state.get("video_title", "")
+                    )
+                )
                 st.download_button(
                     label="台本を Word で保存",
                     data=Path(script_saved).read_bytes(),
-                    file_name="last_script.docx",
+                    file_name=script_dl_name,
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
         elif st.session_state.mp4_bytes:
