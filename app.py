@@ -32,7 +32,7 @@ DEFAULT_SPEAKER_ID = 29
 DEFAULT_SPEAKER_NAME = "No.7"
 DEFAULT_STYLE_NAME = "ノーマル"
 # 読み上げ速度（画面のスライダーで変更可）
-VOICEVOX_SPEED_SCALE = 1.1  # 初期値
+VOICEVOX_SPEED_SCALE = 1.0  # 初期値
 VOICEVOX_SPEED_MIN = 0.8
 VOICEVOX_SPEED_MAX = 1.5
 VOICEVOX_SPEED_STEP = 0.1
@@ -3328,15 +3328,16 @@ def init_state() -> None:
         if saved_ref:
             st.session_state.reference_text = saved_ref
 
-    # 読み上げ速度を 0.8〜1.5（初期 1.1）にそろえる
+    # 読み上げ速度を 0.8〜1.5（初期 1.0）にそろえる
     st.session_state.vvox_speed_scale = clamp_voicevox_speed(
         st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
     )
-    # 旧・固定1.2 のまま残っている場合は、新しい初期値 1.1 に一度だけ更新
-    if st.session_state.get("_vvox_speed_default_v11") is not True:
-        if abs(float(st.session_state.vvox_speed_scale) - 1.2) < 1e-9:
+    # 旧初期値 1.1 / 1.2 のまま残っている場合は、新しい初期値 1.0 に一度だけ更新
+    if st.session_state.get("_vvox_speed_default_v10") is not True:
+        cur = float(st.session_state.vvox_speed_scale)
+        if abs(cur - 1.1) < 1e-9 or abs(cur - 1.2) < 1e-9:
             st.session_state.vvox_speed_scale = float(VOICEVOX_SPEED_SCALE)
-        st.session_state["_vvox_speed_default_v11"] = True
+        st.session_state["_vvox_speed_default_v10"] = True
 
     # 声優初期値の移行（旧・青山龍星 → No.7 ノーマル）を一度だけ
     if st.session_state.get("_vvox_default_v2") is not True:
