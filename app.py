@@ -15,7 +15,7 @@ import tempfile
 import wave
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 import streamlit as st
@@ -1354,86 +1354,33 @@ YouTube医学ドラマ用の簡潔な日本語タイトルを1つだけ考えて
     return _heuristic_title_from_paper(paper)
 
 
-def _clear_title_manual_input_keys() -> None:
-    """場所ごとの手入力キーが残らないように消す。"""
-    for k in list(st.session_state.keys()):
-        if str(k) == "title_manual_input" or str(k).startswith("title_manual_input_"):
-            st.session_state.pop(k, None)
-
-
-def set_pending_title_suggestion(title: str) -> None:
-    """タイトル案を提示待ち状態にする（採用はユーザーが選ぶ）。"""
-    suggestion = normalize_title_mukougawa(title)
-    st.session_state.title_suggestion = suggestion
-    st.session_state.title_decision = "pending"
-    _clear_title_manual_input_keys()
-
-
-def render_title_suggestion_ui(location: str = "main") -> None:
+def render_video_title_input() -> None:
     """
-    タイトル案の提示・採用／却下（手入力）UI。
-    location は Streamlit の key 衝突防止用。
+    タイトル手入力欄。提案はしない。
+    一度入れた内容は、ユーザーが上書きするまで session に残る。
     """
-    suggestion = str(st.session_state.get("title_suggestion") or "").strip()
-    if not suggestion:
-        return
-    decision = str(st.session_state.get("title_decision") or "pending")
-    manual_key = f"title_manual_input_{location}"
+    st.text_input(
+        "タイトル",
+        key="video_title",
+        placeholder="例: 動脈硬化の向こう側",
+    )
 
-    if decision == "pending":
-        st.write(f"「{suggestion}」")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button(
-                "使う",
-                type="primary",
-                key=f"btn_accept_title_{location}",
-                use_container_width=True,
-            ):
-                st.session_state.video_title = suggestion
-                st.session_state.title_decision = "accepted"
-                st.rerun()
-        with c2:
-            if st.button(
-                "手入力",
-                key=f"btn_reject_title_{location}",
-                use_container_width=True,
-            ):
-                st.session_state.title_decision = "manual"
-                st.rerun()
-        return
 
-    if decision == "accepted":
-        st.write(f"「{st.session_state.get('video_title', suggestion)}」")
-        if st.button("やり直す", key=f"btn_reset_title_{location}"):
-            st.session_state.title_decision = "pending"
-            st.rerun()
-        return
-
-    st.text_input("タイトル", key=manual_key)
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button(
-            "確定",
-            type="primary",
-            key=f"btn_confirm_manual_title_{location}",
-            use_container_width=True,
-        ):
-            custom = str(st.session_state.get(manual_key) or "").strip()
-            if not custom:
-                st.error("タイトルを入力してください。")
-            else:
-                st.session_state.video_title = normalize_title_mukougawa(custom)
-                st.session_state.title_decision = "accepted"
-                st.rerun()
-    with c2:
-        if st.button(
-            "戻る",
-            key=f"btn_back_to_suggestion_{location}",
-            use_container_width=True,
-        ):
-            st.session_state.title_decision = "pending"
-            st.rerun()
+def update_export_progress(
+    progress,
+    pct_box,
+    status,
+    pct: int,
+    message: str = "",
+) -> None:
+    """進捗バーと％数字を同時に更新する。"""
+    n = max(0, min(100, int(pct)))
+    progress.progress(n)
+    label = f"**{n}%**"
+    if message:
+        label += f"  {message}"
+        status.info(message)
+    pct_box.markdown(label)
 
 
 def heuristic_review(script: str) -> dict[str, Any]:
@@ -2875,6 +2822,7 @@ def build_mp4(
     ending_duration: float = ENDING_DURATION_SEC,
     subtitle_cues: list[dict[str, Any]] | None = None,
     subtitle_dir: Path | None = None,
+    progress_callback: Callable[[float], None] | None = None,
 ) -> Path:
     """
     医療静止画シーン + 長尺音声 + 同期字幕 + エンディング著作権表示。
@@ -3007,6 +2955,23 @@ def build_mp4(
     ]
 
     last_err: Exception | None = None
+    encode_logger = None
+    if progress_callback is not None:
+        try:
+            from proglog import ProgressBarLogger
+
+            class _EncodeProgressLogger(ProgressBarLogger):
+                def bars_callback(self, bar, attr, value, old_value=None):
+                    if bar != "t" or attr != "index":
+                        return
+                    total = (self.bars.get("t") or {}).get("total") or 0
+                    if total:
+                        progress_callback(float(value) / float(total))
+
+            encode_logger = _EncodeProgressLogger()
+        except Exception:
+            encode_logger = None
+
     for opts in encode_attempts:
         try:
             kwargs = {
@@ -3014,7 +2979,7 @@ def build_mp4(
                 "codec": opts["codec"],
                 "audio_codec": opts["audio_codec"],
                 "threads": 0,
-                "logger": None,
+                "logger": encode_logger,
             }
             if "preset" in opts:
                 kwargs["preset"] = opts["preset"]
@@ -3308,7 +3273,7 @@ def init_state() -> None:
         "mp4_path": "",
         "mp4_name": "medical_drama.mp4",
         "last_error": "",
-        "video_title": "命を賭けた決断",
+        "video_title": "",
         "title_suggestion": "",
         "title_decision": "",
         "ruby_dict_custom": None,
@@ -3318,6 +3283,7 @@ def init_state() -> None:
         "last_script_path": "",
         "last_script_name": "medical_drama.docx",
         "video_encoding": False,
+        "_export_job": None,
         "review_apply_log": [],
         "review_manual_log": [],
         "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
@@ -3362,11 +3328,14 @@ def init_state() -> None:
 # ---------------------------------------------------------------------------
 # 動画書き出し
 # ---------------------------------------------------------------------------
-def run_video_export(progress, status) -> None:
+def run_video_export(progress, pct_box, status) -> None:
     """
     音声・背景・字幕・エンディングをまとめて MP4 にする。
-    progress / status は Streamlit の表示用オブジェクト。
+    progress / pct_box / status は Streamlit の表示用オブジェクト。
     """
+    def _pct(n: int, msg: str = "") -> None:
+        update_export_progress(progress, pct_box, status, n, msg)
+
     ok, ver = check_voicevox()
     if not ok:
         raise RuntimeError(
@@ -3395,6 +3364,7 @@ def run_video_export(progress, status) -> None:
     extra_ruby = []
     if st.session_state.get("review"):
         extra_ruby = st.session_state.review.get("ruby_annotations") or []
+    _pct(2, "台本を準備中…")
     voice_script, ruby_count = prepare_script_for_voicevox(
         st.session_state.final_script,
         extra_annotations=extra_ruby,
@@ -3425,22 +3395,20 @@ def run_video_export(progress, status) -> None:
     with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
         tmp_path = Path(tmp)
         ruby_msg = f"ルビ{ruby_count}件"
-        status.info(
+        _pct(
+            5,
             f"音声生成中（{speaker_name} / {style_name}・{ruby_msg}・"
-            f"{speed_scale:.1f}倍）…"
+            f"{speed_scale:.1f}倍）…",
         )
         wav_path = tmp_path / "narration.wav"
         n_chunks = len(split_text_for_voicevox(voice_script))
 
         def _voice_prog(done: int, total: int) -> None:
             pct = 5 + int(45 * (done / max(total, 1)))
-            progress.progress(
+            _pct(
                 min(pct, 50),
-                text=f"音声 {done}/{total}",
-            )
-            status.info(
                 f"読み上げ中 {done}/{total}"
-                f"（予定 {n_chunks}・{speaker_name} / {style_name}）"
+                f"（予定 {n_chunks}・{speaker_name} / {style_name}）",
             )
 
         wav_path, subtitle_cues = generate_narration_wav_to_file(
@@ -3463,13 +3431,12 @@ def run_video_export(progress, status) -> None:
             audio_sec = wf.getnframes() / float(wf.getframerate())
 
         schedule = plan_scene_schedule(st.session_state.final_script, audio_sec)
-        status.info(f"背景準備（{len(schedule)} 枚）…")
-        progress.progress(52, text="背景ダウンロード…")
+        _pct(52, f"背景準備（{len(schedule)} 枚）…")
         bg_indices = [
             int(item.get("landscape_index", item["index"])) for item in schedule
         ]
         landscapes = ensure_landscape_images(bg_indices)
-        progress.progress(55, text="シーン合成…")
+        _pct(55, "シーン合成…")
         scene_dir = tmp_path / "scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
         scene_clips: list[tuple[Path, float]] = []
@@ -3490,10 +3457,9 @@ def run_video_export(progress, status) -> None:
             )
             scene_clips.append((frame_path, dur))
             pct = 55 + int(12 * ((i + 1) / max(len(schedule), 1)))
-            progress.progress(min(pct, 67), text=f"シーン {i+1}/{len(schedule)}")
+            _pct(min(pct, 67), f"シーン {i+1}/{len(schedule)}")
 
-        status.info("エンディング…")
-        progress.progress(70, text="エンディング…")
+        _pct(70, "エンディング…")
         ending_path = tmp_path / "ending_credits.png"
         create_ending_credits_frame(ending_path, ending_text=ending_body)
         (OUTPUT_DIR / "last_ending.png").write_bytes(ending_path.read_bytes())
@@ -3501,8 +3467,13 @@ def run_video_export(progress, status) -> None:
             scene_clips[0][0].read_bytes()
         )
 
-        status.info("MP4 エンコード中…操作しないでください")
-        progress.progress(85, text="MP4 エンコード中…")
+        _pct(75, "MP4 エンコード中…")
+
+        def _encode_prog(frac: float) -> None:
+            # 75%〜99% をエンコード進捗に割り当て
+            pct = 75 + int(24 * max(0.0, min(1.0, float(frac))))
+            _pct(min(pct, 99), f"MP4 エンコード中… {int(frac * 100)}%")
+
         out_path = OUTPUT_DIR / "medical_drama.mp4"
         build_mp4(
             wav_path,
@@ -3512,6 +3483,7 @@ def run_video_export(progress, status) -> None:
             ending_duration=ENDING_DURATION_SEC,
             subtitle_cues=subtitle_cues,
             subtitle_dir=tmp_path / "_subs",
+            progress_callback=_encode_prog,
         )
 
         desktop_dir = get_desktop_dir()
@@ -3522,7 +3494,7 @@ def run_video_export(progress, status) -> None:
         st.session_state.mp4_path = str(desktop_path)
         st.session_state.mp4_name = desktop_name
         st.session_state.mp4_bytes = None
-        progress.progress(100, text="完了")
+        _pct(100, "完了")
         status.success(f"完了: {desktop_path}")
 
 
@@ -3552,21 +3524,45 @@ def main() -> None:
     init_state()
 
     # MP4作成中は他UIを出さず、誤操作を防ぐ
+    # Stop／再読み込みで中断されたあとも通常画面に戻れるようにする
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
         st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
-        progress = st.progress(0, text="準備中…")
+        if st.button("中止して通常画面に戻る", key="btn_cancel_video_encoding"):
+            st.session_state.video_encoding = False
+            st.session_state._export_job = None
+            st.rerun()
+
+        job = st.session_state.get("_export_job")
+        # pending / running 以外（古い状態・不明）は自動再開せず中断扱いにする
+        if job not in ("pending", "running"):
+            job = "running"
+        # Stop などで中断されたあと：自動再開せず、再開／中止を選ばせる
+        if job == "running":
+            st.error("前回の作成が中断されたか、作成モードのまま残っています。")
+            if st.button("最初から再開する", type="primary", key="btn_restart_export"):
+                st.session_state._export_job = "pending"
+                st.rerun()
+            st.stop()
+
+        # pending → 書き出し開始
+        st.session_state._export_job = "running"
+        progress = st.progress(0)
+        pct_box = st.empty()
         status = st.empty()
+        update_export_progress(progress, pct_box, status, 0, "準備中…")
         try:
-            run_video_export(progress, status)
+            run_video_export(progress, pct_box, status)
         except Exception as e:  # noqa: BLE001
             st.session_state.mp4_path = ""
             st.session_state.mp4_bytes = None
             st.session_state.video_encoding = False
+            st.session_state._export_job = None
             st.error(f"動画生成に失敗しました: {e}")
             st.exception(e)
             st.stop()
         st.session_state.video_encoding = False
+        st.session_state._export_job = None
         st.rerun()
 
     st.write("医学ドラマ動画メーカー")
@@ -3677,11 +3673,6 @@ def main() -> None:
                             apply_paper_reference_to_session(
                                 f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
                             )
-                        with st.spinner("タイトル案を作成中…"):
-                            title_idea = suggest_drama_title_from_paper(
-                                paper_text, api_key
-                            )
-                        set_pending_title_suggestion(title_idea)
                         st.success(
                             f"取り込み完了: {paper_pdf.name}"
                             f"（約 {len(script):,} 字"
@@ -3733,13 +3724,6 @@ def main() -> None:
                         (OUTPUT_DIR / "last_script.txt").write_text(
                             script, encoding="utf-8"
                         )
-                        # 台本本文からタイトル案を作る（論文作成はしない）
-                        api_key = get_api_key()
-                        with st.spinner("タイトル案を作成中…"):
-                            title_idea = suggest_drama_title_from_paper(
-                                script, api_key
-                            )
-                        set_pending_title_suggestion(title_idea)
                         st.success(
                             f"取り込み完了: {script_upload.name}"
                             f"（約 {len(script):,} 字"
@@ -3749,11 +3733,11 @@ def main() -> None:
                 except Exception as e:  # noqa: BLE001
                     st.error(f"台本の取り込みに失敗しました: {e}")
 
-    # タイトル案の採用／却下（取り込み後・ステップ3より前）
-    if st.session_state.get("title_suggestion") and not st.session_state.get(
+    # タイトルは手入力のみ（提案しない）。値は上書きするまで保持。
+    if st.session_state.get("raw_script") and not st.session_state.get(
         "script_confirmed"
     ):
-        render_title_suggestion_ui(location="step1")
+        render_video_title_input()
 
     st.write("ルビ辞書")
     dict_file = st.file_uploader(
@@ -3988,19 +3972,7 @@ def main() -> None:
     # ----- Step 3: 動画生成 -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
-
-        if st.session_state.get("title_suggestion"):
-            render_title_suggestion_ui(location="step3")
-            if st.session_state.get("title_decision") == "accepted":
-                st.text_input(
-                    "タイトル",
-                    key="video_title",
-                )
-        else:
-            st.text_input(
-                "タイトル",
-                key="video_title",
-            )
+        render_video_title_input()
 
         st.write("参考文献")
         ref_upload = st.file_uploader(
@@ -4205,6 +4177,7 @@ def main() -> None:
         if st.button("3. 動画を生成する", type="primary"):
             # 次の描画で作業専用画面にし、他ボタンを出さない
             st.session_state.video_encoding = True
+            st.session_state._export_job = "pending"
             st.rerun()
 
         mp4_path = st.session_state.get("mp4_path") or ""
