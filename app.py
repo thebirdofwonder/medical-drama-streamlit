@@ -1356,13 +1356,13 @@ YouTube医学ドラマ用の簡潔な日本語タイトルを1つだけ考えて
 
 def render_video_title_input() -> None:
     """
-    タイトル手入力欄。提案はしない。
+    タイトル手入力欄のみ（自動提案なし）。
     一度入れた内容は、ユーザーが上書きするまで session に残る。
     """
     st.text_input(
-        "タイトル",
+        "動画のタイトル（自分で入力）",
         key="video_title",
-        placeholder="例: 動脈硬化の向こう側",
+        placeholder="ここにタイトルを入力",
     )
 
 
