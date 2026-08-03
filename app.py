@@ -2664,8 +2664,9 @@ def create_scene_frame(
     landscape_index: int = 0,
 ) -> Path:
     """
-    医療写真背景＋タイトル＋注意書き。
-    本編には VOICEVOX クレジット・サブタイトル・場面ラベルを出さない。
+    医療写真背景＋注意書き。
+    本編にはタイトル文字・VOICEVOXクレジット・場面ラベルを出さない
+    （タイトルはタイトル画像側で扱う）。
     """
     w, h = VIDEO_SIZE
     if landscape_path is not None and Path(landscape_path).exists():
@@ -3449,9 +3450,9 @@ def run_video_export(progress, pct_box, status) -> None:
             create_scene_frame(
                 frame_path,
                 landscape_path=land,
-                title=st.session_state.get("video_title", ""),
+                title="",
                 title_img=None,
-                show_title=(i == 0),
+                show_title=False,
                 disclaimer=DISCLAIMER_TEXT,
                 landscape_index=li,
             )
