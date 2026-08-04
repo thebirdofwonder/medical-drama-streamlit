@@ -59,6 +59,7 @@ DEFAULT_REFERENCE_EXAMPLE = (
 SCENE_INTERVAL_SEC = 60.0  # 1分ごとに背景切替
 ENDING_DURATION_SEC = 10.0  # エンディング画面を出し続ける秒数（フェード完了後）
 ENDING_FADE_SEC = 5.0  # 本編音声終了後、エンディングへ完全移行するフェード秒数
+INTRO_SILENCE_SEC = 3.0  # 冒頭の無音（朗読開始までの余白）
 BGM_FILENAME = "bgm.mp3"
 # Pixabay のフリー音源（暗め・シリアス寄り）。取得失敗時は簡易BGMを自動生成します。
 BGM_CANDIDATE_URLS = [
@@ -2062,6 +2063,38 @@ def concat_wav_files(wav_paths: list[Path], out_path: Path, pause_ms: int = 350)
     return out_path
 
 
+def prepend_silence_to_wav(wav_path: Path, silence_sec: float) -> Path:
+    """既存WAVの先頭に無音を足す（朗読開始までの余白用）。"""
+    silence_sec = max(0.0, float(silence_sec))
+    if silence_sec <= 0:
+        return wav_path
+    tmp = wav_path.with_suffix(".intro_silence.tmp.wav")
+    with wave.open(str(wav_path), "rb") as src:
+        params = src.getparams()
+        body = src.readframes(src.getnframes())
+    n_silent = int(params.framerate * silence_sec)
+    silence = b"\x00" * n_silent * params.nchannels * params.sampwidth
+    with wave.open(str(tmp), "wb") as out_w:
+        out_w.setparams(params)
+        out_w.writeframes(silence)
+        out_w.writeframes(body)
+    tmp.replace(wav_path)
+    return wav_path
+
+
+def shift_subtitle_cues(
+    cues: list[dict[str, Any]], offset_sec: float
+) -> list[dict[str, Any]]:
+    """字幕の開始・終了時刻をまとめてずらす（冒頭無音と同期させる）。"""
+    offset_sec = float(offset_sec)
+    if abs(offset_sec) < 1e-9:
+        return cues
+    for cue in cues:
+        cue["start"] = float(cue.get("start", 0)) + offset_sec
+        cue["end"] = float(cue.get("end", 0)) + offset_sec
+    return cues
+
+
 def strip_voicevox_ruby(text: str) -> str:
     """
     VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ などを外し、
@@ -2765,7 +2798,7 @@ def create_scene_frame(
     landscape_path: Path | None = None,
     title: str = "",
     title_img: Image.Image | None = None,
-    show_title: bool = True,
+    show_title: bool = False,
     disclaimer: str = DISCLAIMER_TEXT,
     landscape_index: int = 0,
 ) -> Path:
@@ -2862,7 +2895,7 @@ def create_background_image(
         landscape_path=None,
         title=title,
         title_img=title_img,
-        show_title=True,
+        show_title=False,
         landscape_index=0,
     )
 
@@ -3529,12 +3562,20 @@ def run_video_export(progress, pct_box, status) -> None:
             speaker=style_id,
             speed_scale=speed_scale,
         )
+        # 同期確認は無音を足す前（朗読と字幕の対応を検査）
         sync_issues = validate_audio_subtitle_sync(wav_path, subtitle_cues)
         if sync_issues:
             raise RuntimeError(
                 "音声と字幕の同期チェックに失敗しました:\n"
                 + "\n".join(f"- {m}" for m in sync_issues)
             )
+
+        # 冒頭に無音を入れ、字幕も同じ秒数だけ後ろへずらす
+        intro_silence = float(INTRO_SILENCE_SEC)
+        if intro_silence > 0:
+            _pct(51, f"冒頭に {intro_silence:.0f} 秒の無音を追加…")
+            prepend_silence_to_wav(wav_path, intro_silence)
+            shift_subtitle_cues(subtitle_cues, intro_silence)
 
         import wave as _wave
 
