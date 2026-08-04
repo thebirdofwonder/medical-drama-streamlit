@@ -261,14 +261,25 @@ def extract_text_from_pdf_bytes(raw: bytes) -> str:
     return text
 
 
+def normalize_script_keeping_ruby(text: str) -> str:
+    """台本を整え、既存ルビは残したまま返す。"""
+    script = canonicalize_voicevox_ruby_delimiters(text or "").strip()
+    if count_voicevox_ruby(script):
+        script = to_fullwidth_ruby_delimiters(script)
+    return script
+
+
 def commit_loaded_script(text: str, source_id: str) -> None:
-    """読み込んだ台本をセッションに入れ、以降の工程を最初からにする（ルビなし）。"""
+    """
+    読み込んだ台本をセッションに入れ、以降の工程を最初からにする。
+    すでに付いているルビ ｛用語｜よみ｝ は削除しない。
+    """
     clear_review_decision_widgets(st.session_state.get("review"))
-    plain = strip_voicevox_ruby(text or "").strip()
-    st.session_state.raw_script = plain
-    st.session_state.final_script = plain
-    st.session_state.final_script_editor = plain
-    st.session_state.final_script_editor_widget = plain
+    script = normalize_script_keeping_ruby(text)
+    st.session_state.raw_script = script
+    st.session_state.final_script = script
+    st.session_state.final_script_editor = script
+    st.session_state.final_script_editor_widget = script
     st.session_state.review = None
     st.session_state.review_done = False
     st.session_state.skip_review = False
@@ -278,6 +289,7 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.ruby_script_baseline = ""
     st.session_state.ruby_skipped = False
     st.session_state.pop("ruby_script_editor", None)
+    st.session_state.pop("raw_script_editor_widget", None)
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
     st.session_state.review_apply_log = []
@@ -1264,13 +1276,13 @@ def build_drama_script_prompt(paper_text: str) -> str:
 ④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
 ⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。ただし台本本文で視聴者に呼びかけない。「研修医のみなさん」「みなさん」「皆さん」などへの呼びかける表現は禁止（難易度の目安と、台詞・ナレーションの相手は別）。
 ⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。ただし単位は原文の表記をそのまま使う（例: mg/dL, mEq/L, g/dL, IU/L）。単位を日本語訳や別表記に変えない。
-⑦ 薬物名（一般名）はアルファベット表記のまま書く（例: vancomycin, meropenem）。カタカナ化や漢字訳にしない。
+⑦ 薬物名はアルファベットでもカタカナでもよい（例: vancomycin / バンコマイシン）。漢字訳にはしない。
 ⑧ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
 ⑨ 登場人物のセリフには必ずカギ括弧「」を付ける。
 ⑩ 必ずしも一文ごとに改行しない。1画面の字幕に収まる長さなら、複数文を改行せずにつなげてよい。
 ⑪ 次の画面（改ページ／改行）へ移るときは、原則として句読点（。、！？ など）の直後で切る。単語の途中（漢字熟語の途中、英単語や単位・薬物名の途中）では切らない。
 ⑫ 鑑別診断の診断名を列挙するときは、診断名どうしを読点「、」だけで区切る。句点「。」では区切らない（禁止例: 心筋梗塞。心不全。肺炎。／正しい例: 心筋梗塞、心不全、肺炎。）。臓器名などの列挙も同様に読点でつなぎ、途中で改行しない。列挙全体の文末だけ句点で閉じる。例：胃、小腸、大腸、肝臓、胆嚢、骨盤内。
-⑬ この段階ではルビ（｛用語｜よみ｝）を付けない。漢字のまま書く（ルビは後工程で辞書から付与する）。
+⑬ この段階ではルビ（｛用語｜よみ｝）を付けない。漢字のまま書く（ルビは後工程で辞書から付与する）。ただし、入力側にすでにルビがある場合は消さない（この工程では新規には付けない）。
 ⑭ 出力する前に、医師として医学的に違和感のある表現・論理の破綻を自分で直し、その最終稿だけを出す。
 
 【出力形式】
@@ -1385,9 +1397,9 @@ def polish_drama_script_medically(script: str, api_key: str) -> str:
 - セリフの「」、列挙の読点ルールは崩さない
 - 鑑別診断の診断名を列挙するときは読点「、」で区切り、句点「。」では区切らない（文末の一句点だけ可）
 - 検査値の単位は原文表記のまま（mg/dL, mEq/L など）。単位を書き換えない
-- 薬物名はアルファベットのまま。カタカナ化しない
+- 薬物名はアルファベットでもカタカナでもよい（漢字訳にはしない）
 - 改行・改ページは原則として句読点の直後。単語・単位・薬物名の途中では切らない
-- ルビ ｛用語｜よみ｝ は付けない／残っていれば外す（ルビは後工程）
+- すでに付いているルビ ｛用語｜よみ｝ は削除しない（新規には付けない）
 - 不要な前置き・後書きを付けない
 
 【台本】
@@ -3999,13 +4011,12 @@ def main() -> None:
                     if not script.strip():
                         st.error("台本が空でした。別のPDFで試してください。")
                     else:
-                        # ルビなし原稿として取り込む（ルビは動画直前に付与）
-                        plain = strip_voicevox_ruby(script).strip()
+                        # 既存ルビがあれば残して取り込む
+                        script = normalize_script_keeping_ruby(script)
                         commit_loaded_script(
-                            plain,
-                            f"pdf-{paper_pdf.name}-{len(plain)}",
+                            script,
+                            f"pdf-{paper_pdf.name}-{len(script)}",
                         )
-                        script = plain
                         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                         (OUTPUT_DIR / "last_script.txt").write_text(
                             script, encoding="utf-8"
@@ -4021,9 +4032,11 @@ def main() -> None:
                             apply_paper_reference_to_session(
                                 f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
                             )
+                        n_ruby = count_voicevox_ruby(script)
+                        ruby_note = f"・ルビ {n_ruby} 件" if n_ruby else ""
                         st.success(
                             f"取り込み完了: {paper_pdf.name}"
-                            f"（約 {len(script):,} 字・ルビなし）"
+                            f"（約 {len(script):,} 字{ruby_note}）"
                         )
                 except Exception as e:  # noqa: BLE001
                     st.error(f"台本作成に失敗しました: {e}")
@@ -4052,19 +4065,20 @@ def main() -> None:
                     if not script:
                         st.error("台本が空でした。")
                     else:
-                        plain = strip_voicevox_ruby(script).strip()
+                        script = normalize_script_keeping_ruby(script)
                         commit_loaded_script(
-                            plain,
-                            f"script-{script_upload.name}-{len(plain)}",
+                            script,
+                            f"script-{script_upload.name}-{len(script)}",
                         )
-                        script = plain
                         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                         (OUTPUT_DIR / "last_script.txt").write_text(
                             script, encoding="utf-8"
                         )
+                        n_ruby = count_voicevox_ruby(script)
+                        ruby_note = f"・ルビ {n_ruby} 件" if n_ruby else ""
                         st.success(
                             f"取り込み完了: {script_upload.name}"
-                            f"（約 {len(script):,} 字・ルビなし）"
+                            f"（約 {len(script):,} 字{ruby_note}）"
                         )
                 except Exception as e:  # noqa: BLE001
                     st.error(f"台本の取り込みに失敗しました: {e}")
@@ -4078,9 +4092,31 @@ def main() -> None:
     if st.session_state.raw_script:
         n_chars = len(st.session_state.raw_script)
         est_min = max(1, round(n_chars / 320))
-        st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分（ルビなし原稿）")
-        with st.expander("台本（原文・ルビなし）", expanded=False):
-            st.text(st.session_state.raw_script)
+        n_ruby_raw = count_voicevox_ruby(st.session_state.raw_script)
+        ruby_cap = f"・ルビ {n_ruby_raw} 件" if n_ruby_raw else ""
+        st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分{ruby_cap}")
+        # 台本表示窓は常に編集・上書き可能
+        if "raw_script_editor_widget" not in st.session_state:
+            st.session_state.raw_script_editor_widget = st.session_state.raw_script
+        st.text_area(
+            "台本（編集・上書き可）",
+            height=280,
+            key="raw_script_editor_widget",
+        )
+        if st.button("この内容で台本を上書き", key="btn_overwrite_raw_script"):
+            edited_raw = normalize_script_keeping_ruby(
+                st.session_state.get("raw_script_editor_widget") or ""
+            )
+            if not edited_raw:
+                st.error("台本が空です。")
+            else:
+                st.session_state.raw_script = edited_raw
+                st.session_state.final_script = edited_raw
+                st.session_state.final_script_editor = edited_raw
+                # 表示中の最終台本ウィジェットは触らず、次回初期化用だけ更新
+                st.session_state.pop("final_script_editor_widget", None)
+                st.success("台本を上書きしました（既存ルビは残しています）。")
+                st.rerun()
 
         col_rev, col_skip = st.columns(2)
         with col_rev:
@@ -4108,8 +4144,10 @@ def main() -> None:
             try:
                 # 古い採否の選択を消してから新しいレビューを入れる
                 clear_review_decision_widgets(st.session_state.get("review"))
-                plain = strip_voicevox_ruby(st.session_state.raw_script)
-                st.session_state.review = run_script_review(plain)
+                # レビュー用は読みやすい平文、保存用は既存ルビを残す
+                kept = normalize_script_keeping_ruby(st.session_state.raw_script)
+                review_plain = strip_voicevox_ruby(kept)
+                st.session_state.review = run_script_review(review_plain)
                 st.session_state.review_done = True
                 st.session_state.skip_review = False
                 st.session_state.script_confirmed = False
@@ -4119,17 +4157,16 @@ def main() -> None:
                 st.session_state.review_apply_log = []
                 st.session_state.review_manual_log = []
                 st.session_state.last_error = ""
-                # 最終台本はルビなしで確定する
-                st.session_state.final_script = plain
-                st.session_state.final_script_editor = plain
-                st.session_state.final_script_editor_widget = plain
+                st.session_state.final_script = kept
+                st.session_state.final_script_editor = kept
+                st.session_state.pop("final_script_editor_widget", None)
             except Exception as e:  # noqa: BLE001
                 st.session_state.last_error = str(e)
                 st.error(f"レビューに失敗しました: {e}")
 
     if skip_clicked:
         clear_review_decision_widgets(st.session_state.get("review"))
-        plain = strip_voicevox_ruby(st.session_state.raw_script)
+        kept = normalize_script_keeping_ruby(st.session_state.raw_script)
         st.session_state.review = None
         st.session_state.review_done = True
         st.session_state.skip_review = True
@@ -4140,26 +4177,26 @@ def main() -> None:
         st.session_state.review_apply_log = []
         st.session_state.review_manual_log = []
         st.session_state.last_error = ""
-        st.session_state.final_script = plain
-        st.session_state.final_script_editor = plain
-        st.session_state.final_script_editor_widget = plain
-        st.success("レビューをスキップしました（ルビなし原稿）")
+        st.session_state.final_script = kept
+        st.session_state.final_script_editor = kept
+        st.session_state.pop("final_script_editor_widget", None)
+        st.success("レビューをスキップしました（既存ルビは残しています）")
 
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
     if st.session_state.review_done:
         if st.session_state.get("skip_review"):
-            st.write("2. ルビなし原稿を確定")
+            st.write("2. 原稿を確定")
             if "final_script_editor_widget" not in st.session_state:
-                st.session_state.final_script_editor_widget = strip_voicevox_ruby(
+                st.session_state.final_script_editor_widget = (
                     st.session_state.final_script or st.session_state.raw_script
                 )
             st.text_area(
-                "最終台本（ルビなし）",
+                "最終台本（編集・上書き可）",
                 height=320,
                 key="final_script_editor_widget",
             )
             if st.button("2. 確定してルビ準備へ", type="primary", key="btn_confirm_skip"):
-                edited = strip_voicevox_ruby(
+                edited = normalize_script_keeping_ruby(
                     (st.session_state.get("final_script_editor_widget") or "").strip()
                 )
                 if not edited:
@@ -4199,9 +4236,11 @@ def main() -> None:
                 new_text, applied, manual = apply_review_decisions_to_script(
                     base, review
                 )
+                new_text = normalize_script_keeping_ruby(new_text)
                 st.session_state.final_script = new_text
                 st.session_state.final_script_editor = new_text
-                st.session_state.final_script_editor_widget = new_text
+                # 表示中の入力欄キーは触らず、消してから再表示する
+                st.session_state.pop("final_script_editor_widget", None)
                 st.session_state.review_apply_log = applied
                 st.session_state.review_manual_log = manual
                 if applied:
@@ -4210,6 +4249,7 @@ def main() -> None:
                     st.info("自動反映できる項目はありませんでした")
                 if manual:
                     st.warning("手修正が必要な項目があります")
+                st.rerun()
 
             if st.session_state.get("review_apply_log"):
                 with st.expander("反映した内容", expanded=False):
@@ -4221,11 +4261,11 @@ def main() -> None:
                         st.write(f"- {line}")
 
             if "final_script_editor_widget" not in st.session_state:
-                st.session_state.final_script_editor_widget = strip_voicevox_ruby(
+                st.session_state.final_script_editor_widget = (
                     st.session_state.final_script or st.session_state.raw_script
                 )
             st.text_area(
-                "最終台本（ルビなし）",
+                "最終台本（編集・上書き可）",
                 height=320,
                 key="final_script_editor_widget",
             )
@@ -4235,7 +4275,7 @@ def main() -> None:
                 type="primary",
                 key="btn_confirm_review",
             ):
-                edited = strip_voicevox_ruby(
+                edited = normalize_script_keeping_ruby(
                     (st.session_state.get("final_script_editor_widget") or "").strip()
                 )
                 if not edited:
@@ -4320,14 +4360,15 @@ def main() -> None:
             )
 
         if apply_ruby_clicked:
-            plain = strip_voicevox_ruby(
+            # 既存ルビは消さず、辞書ルビを足す
+            base = normalize_script_keeping_ruby(
                 st.session_state.get("final_script") or ""
-            ).strip()
-            if not plain:
-                st.error("ルビなし原稿が空です。先に台本を確定してください。")
+            )
+            if not base:
+                st.error("原稿が空です。先に台本を確定してください。")
             else:
                 with st.spinner("辞書でルビを付けています…"):
-                    ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(plain)
+                    ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(base)
                 st.session_state.ruby_script = ruby_script
                 st.session_state.ruby_script_baseline = ruby_script
                 st.session_state.pop("ruby_script_editor", None)
@@ -4336,17 +4377,18 @@ def main() -> None:
                 st.rerun()
 
         if skip_ruby_clicked:
-            plain = strip_voicevox_ruby(
+            # 既存ルビがあればそのまま残す
+            base = normalize_script_keeping_ruby(
                 st.session_state.get("final_script") or ""
-            ).strip()
-            if not plain:
-                st.error("ルビなし原稿が空です。先に台本を確定してください。")
+            )
+            if not base:
+                st.error("原稿が空です。先に台本を確定してください。")
             else:
-                st.session_state.ruby_script = plain
-                st.session_state.ruby_script_baseline = plain
+                st.session_state.ruby_script = base
+                st.session_state.ruby_script_baseline = base
                 st.session_state.pop("ruby_script_editor", None)
                 st.session_state.ruby_ready = True
-                st.session_state.ruby_skipped = True
+                st.session_state.ruby_skipped = not bool(count_voicevox_ruby(base))
                 st.session_state.ruby_dict_last_updates = []
                 st.rerun()
 
@@ -4401,13 +4443,12 @@ def main() -> None:
                 type="primary",
                 key="btn_confirm_ruby_script",
             ):
-                edited_ruby = (
+                edited_ruby = normalize_script_keeping_ruby(
                     st.session_state.get("ruby_script_editor") or ""
-                ).strip()
+                )
                 if not edited_ruby:
                     st.error("ルビ入り原稿が空です。")
                 else:
-                    edited_ruby = canonicalize_voicevox_ruby_delimiters(edited_ruby)
                     baseline = str(
                         st.session_state.get("ruby_script_baseline")
                         or st.session_state.get("ruby_script")
@@ -4731,13 +4772,13 @@ def main() -> None:
                 else:
                     try:
                         loaded = load_text_from_upload(next_script).strip()
-                        plain = strip_voicevox_ruby(loaded).strip()
-                        if not plain:
+                        script = normalize_script_keeping_ruby(loaded)
+                        if not script:
                             st.error("原稿が空でした。")
                         else:
                             commit_loaded_script(
-                                plain,
-                                f"loop-{next_script.name}-{len(plain)}",
+                                script,
+                                f"loop-{next_script.name}-{len(script)}",
                             )
                             # レビューを飛ばしてルビ準備へ（ループ用）
                             st.session_state.review_done = True
@@ -4745,17 +4786,18 @@ def main() -> None:
                             st.session_state.script_confirmed = True
                             st.session_state.ruby_ready = False
                             st.session_state.ruby_skipped = False
-                            st.session_state.ruby_script = ""
-                            st.session_state.ruby_script_baseline = ""
+                            # 既存ルビがあればルビ原稿としても保持
+                            st.session_state.ruby_script = script
+                            st.session_state.ruby_script_baseline = script
                             st.session_state.pop("ruby_script_editor", None)
                             st.session_state.mp4_bytes = None
                             st.session_state.mp4_path = ""
-                            st.session_state.final_script = plain
-                            st.session_state.final_script_editor = plain
-                            st.session_state.final_script_editor_widget = plain
+                            st.session_state.final_script = script
+                            st.session_state.final_script_editor = script
+                            st.session_state.pop("final_script_editor_widget", None)
                             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                             (OUTPUT_DIR / "last_script.txt").write_text(
-                                plain, encoding="utf-8"
+                                script, encoding="utf-8"
                             )
                             st.rerun()
                     except Exception as e:  # noqa: BLE001
