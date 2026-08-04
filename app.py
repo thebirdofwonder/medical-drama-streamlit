@@ -481,6 +481,9 @@ def apply_voicevox_ruby(
     VOICEVOXルビを台本へ付与する。
     fullwidth=True のとき ｛表記｜よみ｝、False のとき {表記|よみ}。
     半角/全角の区切り記号は区別しない。既にあるルビは壊さない。
+
+    同じ位置に複数の辞書語が当てはまるときは、文字数が多い用語を優先する。
+    例: 「所」と「所見」なら「所見」を採用する。
     """
     text = canonicalize_voicevox_ruby_delimiters(script or "")
     if not annotations:
@@ -516,23 +519,64 @@ def apply_voicevox_ruby(
         seen.add(surface)
         pairs.append((surface, reading))
 
-    pairs.sort(key=lambda x: len(x[0]), reverse=True)
+    # 長い用語を先に試し、短い用語（例:「所」）より「所見」を優先
+    pairs.sort(key=lambda x: (len(x[0]), x[0]), reverse=True)
     text = protect_existing(text)
-    for surface, reading in pairs:
-        # 直前までに付与したルビも保護し、入れ子置換を防ぐ
-        text = protect_existing(text)
-        if surface not in text:
-            continue
-        if fullwidth:
-            ruby = "｛" + surface + "｜" + reading + "｝"
-        else:
-            ruby = "{" + surface + "|" + reading + "}"
-        text = text.replace(surface, ruby)
+
+    # プレースホルダ以外の平文だけを、左から最長一致で置換する
+    placeholder_re = re.compile(r"\x00RUBY\d+\x00")
+    pieces: list[str] = []
+    last = 0
+    for m in placeholder_re.finditer(text):
+        if m.start() > last:
+            pieces.append(
+                _apply_ruby_longest_match(text[last:m.start()], pairs, fullwidth)
+            )
+        pieces.append(m.group(0))
+        last = m.end()
+    if last < len(text):
+        pieces.append(_apply_ruby_longest_match(text[last:], pairs, fullwidth))
+    text = "".join(pieces)
 
     for key, val in protected.items():
         text = text.replace(key, val)
     text = canonicalize_voicevox_ruby_delimiters(text)
     return to_fullwidth_ruby_delimiters(text) if fullwidth else text
+
+
+def _apply_ruby_longest_match(
+    segment: str,
+    pairs: list[tuple[str, str]],
+    fullwidth: bool,
+) -> str:
+    """
+    平文の先頭から順に見て、その位置で一致する用語のうち
+    いちばん文字数が多いものをルビにする。
+    pairs は文字数の多い順に並べておくこと。
+    """
+    if not segment or not pairs:
+        return segment
+    out: list[str] = []
+    i = 0
+    n = len(segment)
+    while i < n:
+        matched = False
+        for surface, reading in pairs:
+            length = len(surface)
+            if length <= 0 or i + length > n:
+                continue
+            if segment[i : i + length] == surface:
+                if fullwidth:
+                    out.append("｛" + surface + "｜" + reading + "｝")
+                else:
+                    out.append("{" + surface + "|" + reading + "}")
+                i += length
+                matched = True
+                break
+        if not matched:
+            out.append(segment[i])
+            i += 1
+    return "".join(out)
 
 
 def to_fullwidth_ruby_delimiters(text: str) -> str:
@@ -823,11 +867,17 @@ def collect_dictionary_ruby_annotations(
     script: str,
     dictionary: list[tuple[str, str]] | None = None,
 ) -> list[dict[str, str]]:
-    """台本中に現れる用語だけ、辞書からルビ候補を集める。"""
+    """
+    台本中に現れる用語だけ、辞書からルビ候補を集める。
+    文字数の多い用語を先に並べる（適用時の優先と揃える）。
+    """
     text = strip_voicevox_ruby(script or "")
     dict_pairs = dictionary if dictionary is not None else get_active_ruby_dictionary()
     found: list[dict[str, str]] = []
-    for surface, reading in sorted(dict_pairs, key=lambda x: len(x[0]), reverse=True):
+    # 長い用語を先に（例: 「所見」を「所」より優先）
+    for surface, reading in sorted(
+        dict_pairs, key=lambda x: (len(x[0]), x[0]), reverse=True
+    ):
         if surface in text and surface != reading:
             found.append({"surface": surface, "reading": reading})
     return found
@@ -839,6 +889,7 @@ def apply_dictionary_ruby_to_script(
 ) -> tuple[str, int, list[dict[str, str]]]:
     """
     辞書を対照して ｛用語｜よみ｝ を付与する。
+    同じ位置では文字数が多い用語を優先（例: 所 < 所見）。
     戻り値: (ルビ付き台本, 付与件数, 使った注釈一覧)
     """
     annotations = collect_dictionary_ruby_annotations(script, dictionary)
