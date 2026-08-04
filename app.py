@@ -748,6 +748,11 @@ def extract_ruby_pairs_from_script(script: str) -> list[tuple[str, str]]:
     return [(s, mapping[s]) for s in order]
 
 
+def is_ruby_dict_surface_allowed(surface: str) -> bool:
+    """ルビ辞書へ学習反映してよい用語かを返す。1文字語は取り込まない。"""
+    return len((surface or "").strip()) >= 2
+
+
 def find_ruby_dict_updates(
     baseline_script: str,
     edited_script: str,
@@ -758,6 +763,8 @@ def find_ruby_dict_updates(
     base_map = {s: r for s, r in extract_ruby_pairs_from_script(baseline_script)}
     updates: list[tuple[str, str]] = []
     for surface, reading in extract_ruby_pairs_from_script(edited_script):
+        if not is_ruby_dict_surface_allowed(surface):
+            continue
         if base_map.get(surface) != reading:
             updates.append((surface, reading))
     return updates
@@ -780,6 +787,8 @@ def find_rubies_missing_from_dictionary(
     }
     missing: list[tuple[str, str]] = []
     for surface, reading in extract_ruby_pairs_from_script(script):
+        if not is_ruby_dict_surface_allowed(surface):
+            continue
         if dict_map.get(surface) != reading:
             missing.append((surface, reading))
     return missing
@@ -850,6 +859,8 @@ def apply_ruby_updates_to_learned_dict(
         surface = (surface or "").strip()
         reading = normalize_voicevox_reading(reading)
         if not surface or not reading or surface == reading:
+            continue
+        if not is_ruby_dict_surface_allowed(surface):
             continue
         if learned_map.get(surface) == reading:
             continue
@@ -4088,7 +4099,6 @@ def main() -> None:
                 else:
                     st.session_state.final_script = edited
                     st.session_state.final_script_editor = edited
-                    st.session_state.final_script_editor_widget = edited
                     st.session_state.raw_script = edited
                     st.session_state.script_confirmed = True
                     st.session_state.ruby_ready = False
@@ -4165,7 +4175,6 @@ def main() -> None:
                 else:
                     st.session_state.final_script = edited
                     st.session_state.final_script_editor = edited
-                    st.session_state.final_script_editor_widget = edited
                     st.session_state.raw_script = edited
                     st.session_state.script_confirmed = True
                     st.session_state.ruby_ready = False
