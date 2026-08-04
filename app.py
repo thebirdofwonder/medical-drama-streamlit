@@ -274,6 +274,7 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.ruby_ready = False
     st.session_state.ruby_script = ""
     st.session_state.ruby_script_baseline = ""
+    st.session_state.ruby_skipped = False
     st.session_state.pop("ruby_script_editor", None)
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
@@ -3376,6 +3377,7 @@ def init_state() -> None:
         "script_confirmed": False,
         "ruby_ready": False,
         "ruby_script": "",
+        "ruby_skipped": False,
         "skip_review": False,
         "mp4_bytes": None,
         "mp4_path": "",
@@ -4003,7 +4005,7 @@ def main() -> None:
         render_video_title_input()
 
         st.write("ルビ準備（動画の直前）")
-        st.caption("①辞書 → ②ルビ作成 → ③修正 → 確定、のあと動画へ進みます")
+        st.caption("①辞書 → ②ルビ作成（またはルビなしで進む）→ ③修正 → 確定、のあと動画へ")
 
         # ① 辞書読み込み
         st.write("① 辞書読み込み")
@@ -4049,13 +4051,24 @@ def main() -> None:
                 key="dl_ruby_dict_pre_video",
             )
 
-        # ② ルビ入り原稿を作成
+        # ② ルビ入り原稿を作成（スキップ可）
         st.write("② ルビ入り原稿を作成")
-        if st.button(
-            "辞書でルビを付ける",
-            type="primary",
-            key="btn_apply_dict_ruby_pre_video",
-        ):
+        col_ruby_on, col_ruby_skip = st.columns(2)
+        with col_ruby_on:
+            apply_ruby_clicked = st.button(
+                "辞書でルビを付ける",
+                type="primary",
+                key="btn_apply_dict_ruby_pre_video",
+                use_container_width=True,
+            )
+        with col_ruby_skip:
+            skip_ruby_clicked = st.button(
+                "ルビなしで進む",
+                key="btn_skip_ruby_pre_video",
+                use_container_width=True,
+            )
+
+        if apply_ruby_clicked:
             plain = strip_voicevox_ruby(
                 st.session_state.get("final_script") or ""
             ).strip()
@@ -4066,9 +4079,24 @@ def main() -> None:
                     ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(plain)
                 st.session_state.ruby_script = ruby_script
                 st.session_state.ruby_script_baseline = ruby_script
-                st.session_state.ruby_script_editor = ruby_script
+                st.session_state.pop("ruby_script_editor", None)
                 st.session_state.ruby_ready = False
-                st.success(f"ルビ {ruby_n} 件を付けました。③で確認・修正してください。")
+                st.session_state.ruby_skipped = False
+                st.rerun()
+
+        if skip_ruby_clicked:
+            plain = strip_voicevox_ruby(
+                st.session_state.get("final_script") or ""
+            ).strip()
+            if not plain:
+                st.error("ルビなし原稿が空です。先に台本を確定してください。")
+            else:
+                st.session_state.ruby_script = plain
+                st.session_state.ruby_script_baseline = plain
+                st.session_state.pop("ruby_script_editor", None)
+                st.session_state.ruby_ready = True
+                st.session_state.ruby_skipped = True
+                st.session_state.ruby_dict_last_updates = []
                 st.rerun()
 
         # ③ ルビ入り原稿を修正（確定後も上書き可）
@@ -4095,7 +4123,10 @@ def main() -> None:
                 n_ruby = count_voicevox_ruby(
                     st.session_state.get("ruby_script") or ""
                 )
-                st.write(f"確定済み（ルビ {n_ruby} 件）。下の欄で上書きできます。")
+                if st.session_state.get("ruby_skipped"):
+                    st.write("確定済み（ルビなしで進行）。必要なら下の欄で追記・上書きできます。")
+                else:
+                    st.write(f"確定済み（ルビ {n_ruby} 件）。下の欄で上書きできます。")
                 last_updates = st.session_state.get("ruby_dict_last_updates") or []
                 if last_updates:
                     st.caption(
@@ -4134,8 +4165,9 @@ def main() -> None:
                     updates = find_ruby_dict_updates(baseline, edited_ruby)
                     applied = apply_ruby_updates_to_learned_dict(updates)
                     st.session_state.ruby_script = edited_ruby
-                    st.session_state.ruby_script_editor = edited_ruby
+                    # ruby_script_editor は text_area の key なので、ここでは書き換えない
                     st.session_state.ruby_ready = True
+                    st.session_state.ruby_skipped = False
                     st.session_state.ruby_dict_last_updates = applied
                     st.rerun()
 
@@ -4152,6 +4184,7 @@ def main() -> None:
                 key="btn_reset_ruby_ready",
             ):
                 st.session_state.ruby_ready = False
+                st.session_state.ruby_skipped = False
                 st.rerun()
 
         if not st.session_state.get("ruby_ready"):
@@ -4431,6 +4464,7 @@ def main() -> None:
                             st.session_state.skip_review = True
                             st.session_state.script_confirmed = True
                             st.session_state.ruby_ready = False
+                            st.session_state.ruby_skipped = False
                             st.session_state.ruby_script = ""
                             st.session_state.ruby_script_baseline = ""
                             st.session_state.pop("ruby_script_editor", None)
