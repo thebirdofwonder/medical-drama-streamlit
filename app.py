@@ -27,9 +27,9 @@ from pypdf import PdfReader
 # 定数
 # ---------------------------------------------------------------------------
 VOICEVOX_URL = "http://127.0.0.1:50021"
-# 初期値（UIで変更可）。声優「No.7」のノーマル
-DEFAULT_SPEAKER_ID = 29
-DEFAULT_SPEAKER_NAME = "No.7"
+# 初期値（UIで変更可）。声優「青山龍星」のノーマル
+DEFAULT_SPEAKER_ID = 13
+DEFAULT_SPEAKER_NAME = "青山龍星"
 DEFAULT_STYLE_NAME = "ノーマル"
 # 読み上げ速度（画面のスライダーで変更可）
 VOICEVOX_SPEED_SCALE = 1.0  # 初期値
@@ -69,6 +69,9 @@ WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
 # ルビ辞書ファイル（用語とよみの対照表）
 RUBY_DICT_PATH = WORK_DIR / "data" / "medical_ruby_dict.tsv"
+# 修正反映後のダウンロード用辞書
+RUBY_DICT_EXPORT_NAME = "ルビ辞書.txt"
+RUBY_DICT_EXPORT_PATH = OUTPUT_DIR / RUBY_DICT_EXPORT_NAME
 
 # 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
 MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
@@ -270,6 +273,7 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.script_confirmed = False
     st.session_state.ruby_ready = False
     st.session_state.ruby_script = ""
+    st.session_state.ruby_script_baseline = ""
     st.session_state.pop("ruby_script_editor", None)
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
@@ -649,7 +653,7 @@ def load_ruby_dict_from_path(path: Path | None = None) -> list[tuple[str, str]]:
 def get_active_ruby_dictionary() -> list[tuple[str, str]]:
     """
     使うルビ辞書を返す。
-    優先: 画面で読み込んだ辞書 → data/medical_ruby_dict.tsv → 組み込み辞書
+    優先: 編集で学習した語 → 画面で読み込んだ辞書 → 標準辞書 → 組み込み
     同じ用語は先勝ち。
     """
     merged: list[tuple[str, str]] = []
@@ -664,16 +668,112 @@ def get_active_ruby_dictionary() -> list[tuple[str, str]]:
             seen.add(surface)
             merged.append((surface, reading))
 
+    learned = None
     custom = None
     try:
+        learned = st.session_state.get("ruby_dict_learned")
         custom = st.session_state.get("ruby_dict_custom")
     except Exception:
+        learned = None
         custom = None
+    if isinstance(learned, list) and learned:
+        _add([(str(a), str(b)) for a, b in learned])
     if isinstance(custom, list) and custom:
         _add([(str(a), str(b)) for a, b in custom])
     _add(load_ruby_dict_from_path(RUBY_DICT_PATH))
     _add(DEFAULT_RUBY_DICT)
     return merged
+
+
+def extract_ruby_pairs_from_script(script: str) -> list[tuple[str, str]]:
+    """台本中の ｛用語｜よみ｝ をすべて取り出す（同じ用語は後勝ち）。"""
+    text = canonicalize_voicevox_ruby_delimiters(script or "")
+    order: list[str] = []
+    mapping: dict[str, str] = {}
+    for m in _RUBY_TAG_RE.finditer(text):
+        surface = (m.group(1) or "").strip()
+        reading = normalize_voicevox_reading(m.group(2) or "")
+        if not surface or not reading or surface == reading:
+            continue
+        if surface not in mapping:
+            order.append(surface)
+        mapping[surface] = reading
+    return [(s, mapping[s]) for s in order]
+
+
+def find_ruby_dict_updates(
+    baseline_script: str,
+    edited_script: str,
+) -> list[tuple[str, str]]:
+    """
+    自動付与稿と修正稿を比べ、新規または読みが変わったルビを返す。
+    """
+    base_map = {s: r for s, r in extract_ruby_pairs_from_script(baseline_script)}
+    updates: list[tuple[str, str]] = []
+    for surface, reading in extract_ruby_pairs_from_script(edited_script):
+        if base_map.get(surface) != reading:
+            updates.append((surface, reading))
+    return updates
+
+
+def format_ruby_dict_text(pairs: list[tuple[str, str]]) -> str:
+    """用語\\tよみ 形式の辞書テキストにする。"""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for surface, reading in pairs:
+        surface = (surface or "").strip()
+        reading = normalize_voicevox_reading(reading)
+        if not surface or not reading or surface == reading or surface in seen:
+            continue
+        seen.add(surface)
+        lines.append(f"{surface}\t{reading}")
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def apply_ruby_updates_to_learned_dict(
+    updates: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """
+    修正ルビを学習辞書に反映し、ルビ辞書.txt を書き出す。
+    戻り値: 今回反映した更新一覧
+    """
+    if not updates:
+        return []
+    learned_raw = st.session_state.get("ruby_dict_learned") or []
+    learned_map: dict[str, str] = {}
+    order: list[str] = []
+    for item in learned_raw:
+        try:
+            surface, reading = item[0], item[1]
+        except Exception:
+            continue
+        surface = str(surface).strip()
+        reading = normalize_voicevox_reading(str(reading))
+        if not surface or not reading:
+            continue
+        if surface not in learned_map:
+            order.append(surface)
+        learned_map[surface] = reading
+    applied: list[tuple[str, str]] = []
+    for surface, reading in updates:
+        surface = (surface or "").strip()
+        reading = normalize_voicevox_reading(reading)
+        if not surface or not reading or surface == reading:
+            continue
+        if learned_map.get(surface) == reading:
+            continue
+        if surface not in learned_map:
+            order.append(surface)
+        learned_map[surface] = reading
+        applied.append((surface, reading))
+    st.session_state.ruby_dict_learned = [(s, learned_map[s]) for s in order]
+    # いま有効な全辞書を書き出し（学習反映後）
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    export_text = format_ruby_dict_text(get_active_ruby_dictionary())
+    RUBY_DICT_EXPORT_PATH.write_text(export_text, encoding="utf-8")
+    st.session_state.ruby_dict_export_ready = True
+    st.session_state.ruby_dict_last_updates = applied
+    return applied
 
 
 def collect_dictionary_ruby_annotations(
@@ -1786,7 +1886,7 @@ def resolve_default_voice_selection(
     speakers: list[dict[str, Any]],
 ) -> tuple[str, str, int]:
     """
-    初期選択: できれば No.7 ＋ ノーマル。無ければ先頭の声優＋ノーマル優先。
+    初期選択: できれば 青山龍星 ＋ ノーマル。無ければ先頭の声優＋ノーマル優先。
     戻り値: (声優名, 声調名, style_id)
     """
     by_name = {str(s.get("name") or ""): s for s in speakers}
@@ -3286,6 +3386,10 @@ def init_state() -> None:
         "title_decision": "",
         "ruby_dict_custom": None,
         "ruby_dict_source_name": "",
+        "ruby_dict_learned": [],
+        "ruby_dict_export_ready": False,
+        "ruby_dict_last_updates": [],
+        "ruby_script_baseline": "",
         "ending_credits_text": "",
         "reference_text": "",
         "last_script_path": "",
@@ -3320,14 +3424,14 @@ def init_state() -> None:
             st.session_state.vvox_speed_scale = float(VOICEVOX_SPEED_SCALE)
         st.session_state["_vvox_speed_default_v10"] = True
 
-    # 声優初期値の移行（旧・青山龍星 → No.7 ノーマル）を一度だけ
-    if st.session_state.get("_vvox_default_v2") is not True:
+    # 声優初期値の移行（旧・No.7 → 青山龍星 ノーマル）を一度だけ
+    if st.session_state.get("_vvox_default_v3") is not True:
         old_name = st.session_state.get("vvox_speaker_name")
-        if old_name in (None, "", "青山龍星"):
+        if old_name in (None, "", "No.7"):
             st.session_state.vvox_speaker_name = DEFAULT_SPEAKER_NAME
             st.session_state.vvox_style_name = DEFAULT_STYLE_NAME
             st.session_state.vvox_style_id = DEFAULT_SPEAKER_ID
-        st.session_state["_vvox_default_v2"] = True
+        st.session_state["_vvox_default_v3"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -3930,16 +4034,20 @@ def main() -> None:
         src_name = st.session_state.get("ruby_dict_source_name") or (
             RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
         )
-        st.caption(f"辞書: 標準 + {src_name}（{active_n} 語）")
-        if st.session_state.get("ruby_dict_custom") and st.button(
-            "追加辞書を外す",
-            key="btn_reset_ruby_dict",
-        ):
-            st.session_state.ruby_dict_custom = None
-            st.session_state.ruby_dict_source_name = ""
-            st.session_state._ruby_dict_file_id = ""
-            st.session_state.ruby_ready = False
-            st.rerun()
+        learned_n = len(st.session_state.get("ruby_dict_learned") or [])
+        st.caption(
+            f"辞書: 標準 + {src_name}（{active_n} 語"
+            + (f"・修正反映 {learned_n} 語" if learned_n else "")
+            + "）"
+        )
+        if st.session_state.get("ruby_dict_export_ready") and RUBY_DICT_EXPORT_PATH.is_file():
+            st.download_button(
+                "ルビ辞書.txt をダウンロード",
+                data=RUBY_DICT_EXPORT_PATH.read_bytes(),
+                file_name=RUBY_DICT_EXPORT_NAME,
+                mime="text/plain",
+                key="dl_ruby_dict_pre_video",
+            )
 
         # ② ルビ入り原稿を作成
         st.write("② ルビ入り原稿を作成")
@@ -3957,37 +4065,57 @@ def main() -> None:
                 with st.spinner("辞書でルビを付けています…"):
                     ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(plain)
                 st.session_state.ruby_script = ruby_script
+                st.session_state.ruby_script_baseline = ruby_script
                 st.session_state.ruby_script_editor = ruby_script
                 st.session_state.ruby_ready = False
                 st.success(f"ルビ {ruby_n} 件を付けました。③で確認・修正してください。")
                 st.rerun()
 
-        # ③ ルビ入り原稿を修正
+        # ③ ルビ入り原稿を修正（確定後も上書き可）
         st.write("③ ルビ入り原稿を修正")
-        if st.session_state.get("ruby_ready"):
-            n_ruby = count_voicevox_ruby(st.session_state.get("ruby_script") or "")
-            st.write(f"ルビ入り原稿を確定済み（ルビ {n_ruby} 件）")
-            with st.expander("確定したルビ入り原稿", expanded=False):
-                st.text(st.session_state.get("ruby_script") or "")
-            if st.button("ルビ準備をやり直す", key="btn_reset_ruby_ready"):
-                st.session_state.ruby_ready = False
-                st.rerun()
-        elif not (st.session_state.get("ruby_script") or "").strip() and not (
-            st.session_state.get("ruby_script_editor") or ""
-        ).strip():
+        has_ruby_draft = bool(
+            (st.session_state.get("ruby_script") or "").strip()
+            or (st.session_state.get("ruby_script_editor") or "").strip()
+        )
+        if not has_ruby_draft:
             st.info("②でルビを付けたあと、ここで直して確定します。")
         else:
             if "ruby_script_editor" not in st.session_state:
                 st.session_state.ruby_script_editor = (
                     st.session_state.get("ruby_script") or ""
                 )
+            elif st.session_state.get("ruby_ready") and not (
+                st.session_state.get("ruby_script_editor") or ""
+            ).strip():
+                st.session_state.ruby_script_editor = (
+                    st.session_state.get("ruby_script") or ""
+                )
+
+            if st.session_state.get("ruby_ready"):
+                n_ruby = count_voicevox_ruby(
+                    st.session_state.get("ruby_script") or ""
+                )
+                st.write(f"確定済み（ルビ {n_ruby} 件）。下の欄で上書きできます。")
+                last_updates = st.session_state.get("ruby_dict_last_updates") or []
+                if last_updates:
+                    st.caption(
+                        "辞書に反映した修正: "
+                        + "、".join(f"{s}→{r}" for s, r in last_updates[:12])
+                        + ("…" if len(last_updates) > 12 else "")
+                    )
+
             st.text_area(
-                "ルビ入り原稿（編集可）",
+                "ルビ入り原稿（編集・上書き可）",
                 height=320,
                 key="ruby_script_editor",
             )
+            confirm_label = (
+                "上書きして確定"
+                if st.session_state.get("ruby_ready")
+                else "ルビ入り原稿を確定して動画設定へ"
+            )
             if st.button(
-                "ルビ入り原稿を確定して動画設定へ",
+                confirm_label,
                 type="primary",
                 key="btn_confirm_ruby_script",
             ):
@@ -3997,11 +4125,34 @@ def main() -> None:
                 if not edited_ruby:
                     st.error("ルビ入り原稿が空です。")
                 else:
-                    st.session_state.ruby_script = canonicalize_voicevox_ruby_delimiters(
-                        edited_ruby
+                    edited_ruby = canonicalize_voicevox_ruby_delimiters(edited_ruby)
+                    baseline = str(
+                        st.session_state.get("ruby_script_baseline")
+                        or st.session_state.get("ruby_script")
+                        or ""
                     )
+                    updates = find_ruby_dict_updates(baseline, edited_ruby)
+                    applied = apply_ruby_updates_to_learned_dict(updates)
+                    st.session_state.ruby_script = edited_ruby
+                    st.session_state.ruby_script_editor = edited_ruby
                     st.session_state.ruby_ready = True
+                    st.session_state.ruby_dict_last_updates = applied
                     st.rerun()
+
+            if RUBY_DICT_EXPORT_PATH.is_file():
+                st.download_button(
+                    "ルビ辞書.txt をダウンロード",
+                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
+                    file_name=RUBY_DICT_EXPORT_NAME,
+                    mime="text/plain",
+                    key="dl_ruby_dict_after_confirm",
+                )
+            if st.session_state.get("ruby_ready") and st.button(
+                "ルビ準備をやり直す",
+                key="btn_reset_ruby_ready",
+            ):
+                st.session_state.ruby_ready = False
+                st.rerun()
 
         if not st.session_state.get("ruby_ready"):
             st.caption("①②③が終わるまで、動画生成には進めません。")
@@ -4249,6 +4400,51 @@ def main() -> None:
                     file_name=script_dl_name,
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
+
+            # 次の原稿 → もう一度 MP4 を作るループ
+            st.write("次の動画")
+            next_script = st.file_uploader(
+                "次の原稿（.txt / .docx）",
+                type=["txt", "docx"],
+                key="next_loop_script_upload",
+            )
+            if st.button(
+                "この原稿で次の動画を作る",
+                type="primary",
+                key="btn_next_video_loop",
+            ):
+                if next_script is None:
+                    st.error("原稿ファイル（.txt または .docx）を選んでください。")
+                else:
+                    try:
+                        loaded = load_text_from_upload(next_script).strip()
+                        plain = strip_voicevox_ruby(loaded).strip()
+                        if not plain:
+                            st.error("原稿が空でした。")
+                        else:
+                            commit_loaded_script(
+                                plain,
+                                f"loop-{next_script.name}-{len(plain)}",
+                            )
+                            # レビューを飛ばしてルビ準備へ（ループ用）
+                            st.session_state.review_done = True
+                            st.session_state.skip_review = True
+                            st.session_state.script_confirmed = True
+                            st.session_state.ruby_ready = False
+                            st.session_state.ruby_script = ""
+                            st.session_state.ruby_script_baseline = ""
+                            st.session_state.pop("ruby_script_editor", None)
+                            st.session_state.mp4_bytes = None
+                            st.session_state.mp4_path = ""
+                            st.session_state.final_script = plain
+                            st.session_state.final_script_editor = plain
+                            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                            (OUTPUT_DIR / "last_script.txt").write_text(
+                                plain, encoding="utf-8"
+                            )
+                            st.rerun()
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"原稿の取り込みに失敗しました: {e}")
         elif st.session_state.mp4_bytes:
             st.download_button(
                 label="MP4をダウンロード",
