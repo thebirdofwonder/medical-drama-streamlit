@@ -961,6 +961,12 @@ def prepare_script_for_voicevox(
 
 # 字幕折り返し／分割：行頭に置かない文字（閉じの 」 など）
 SUBTITLE_NO_LINE_START = frozenset("」』）)]］】》〉、。，．！？!?ー…‥")
+# 改ページ・折り返しで優先する切れ目（句読点など）
+SUBTITLE_BREAK_AFTER = frozenset("。、，．！？!?…‥；;")
+# 英単語・単位・薬物名など、途中で切りたくない文字
+_LATIN_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./%-"
+)
 
 
 def _ruby_incomplete(fragment: str) -> bool:
@@ -972,8 +978,41 @@ def _ruby_incomplete(fragment: str) -> bool:
     return ("}" not in tail) and ("｝" not in tail)
 
 
+def _find_preferred_break(buf: str) -> int:
+    """
+    折り返し候補の切れ目を返す（その位置より前を1行にする）。
+    優先: 句読点の直後 → 空白の直後。見つからなければ -1。
+    """
+    if not buf:
+        return -1
+    for i in range(len(buf) - 1, -1, -1):
+        if buf[i] in SUBTITLE_BREAK_AFTER and i + 1 < len(buf):
+            # 行が極端に短くならない範囲で句読点直後を優先
+            if i + 1 >= max(4, len(buf) // 4):
+                return i + 1
+    for i in range(len(buf) - 1, -1, -1):
+        if buf[i].isspace() and i + 1 < len(buf):
+            if i + 1 >= max(4, len(buf) // 4):
+                return i + 1
+    return -1
+
+
+def _latin_token_start(buf: str) -> int:
+    """buf 末尾が英数字トークンの途中なら、その開始位置。そうでなければ -1。"""
+    if not buf or buf[-1] not in _LATIN_TOKEN_CHARS:
+        return -1
+    i = len(buf) - 1
+    while i >= 0 and buf[i] in _LATIN_TOKEN_CHARS:
+        i -= 1
+    start = i + 1
+    return start if start < len(buf) else -1
+
+
 def _safe_force_chunks(text: str, max_chars: int) -> list[str]:
-    """文字数で切るが、ルビ {表記|よみ} の途中や 」 の直前では切らない。"""
+    """
+    文字数で切るが、原則は句読点直後。
+    ルビ途中・」直前・英単語／単位の途中では切らない。
+    """
     if len(text) <= max_chars:
         return [text]
     out: list[str] = []
@@ -987,7 +1026,17 @@ def _safe_force_chunks(text: str, max_chars: int) -> list[str]:
         # 閉じ括弧・句読点が次チャンク先頭に来ないよう、同じチャンクに含める
         while end < n and text[end] in SUBTITLE_NO_LINE_START:
             end += 1
-        # 次チャンク先頭がルビの途中にならないよう調整は上記で足りる
+        # 可能なら句読点直後まで戻して切る（単語途中切断を避ける）
+        if end < n:
+            window = text[i:end]
+            pref = _find_preferred_break(window)
+            if pref > 0:
+                end = i + pref
+            else:
+                # 英単語・単位の途中なら、トークン先頭まで戻す
+                tok = _latin_token_start(window)
+                if tok > 0:
+                    end = i + tok
         if end <= i:
             end = min(i + 1, n)
         out.append(text[i:end])
@@ -1214,13 +1263,15 @@ def build_drama_script_prompt(paper_text: str) -> str:
 ③ 読み上げる台本本文以外は一切書かない。タイトル見出し、サブタイトル、シーン番号、「注釈」「解説」「制作メモ」、私への説明、前置き、後書き、Markdown記法は禁止。
 ④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
 ⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。ただし台本本文で視聴者に呼びかけない。「研修医のみなさん」「みなさん」「皆さん」などへの呼びかける表現は禁止（難易度の目安と、台詞・ナレーションの相手は別）。
-⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。
-⑦ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
-⑧ 登場人物のセリフには必ずカギ括弧「」を付ける。
-⑨ 必ずしも一文ごとに改行しない。1画面の字幕に収まる長さなら、複数文を改行せずにつなげてよい。
-⑩ 鑑別診断・臓器名などを列挙するときは、単語ごとに読点でつなぎ、途中で改行しない。最後は句点。例：胃、小腸、大腸、肝臓、胆嚢、骨盤内。
-⑪ この段階ではルビ（｛用語｜よみ｝）を付けない。漢字のまま書く（ルビは後工程で辞書から付与する）。
-⑫ 出力する前に、医師として医学的に違和感のある表現・論理の破綻を自分で直し、その最終稿だけを出す。
+⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。ただし単位は原文の表記をそのまま使う（例: mg/dL, mEq/L, g/dL, IU/L）。単位を日本語訳や別表記に変えない。
+⑦ 薬物名（一般名）はアルファベット表記のまま書く（例: vancomycin, meropenem）。カタカナ化や漢字訳にしない。
+⑧ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
+⑨ 登場人物のセリフには必ずカギ括弧「」を付ける。
+⑩ 必ずしも一文ごとに改行しない。1画面の字幕に収まる長さなら、複数文を改行せずにつなげてよい。
+⑪ 次の画面（改ページ／改行）へ移るときは、原則として句読点（。、！？ など）の直後で切る。単語の途中（漢字熟語の途中、英単語や単位・薬物名の途中）では切らない。
+⑫ 鑑別診断の診断名を列挙するときは、診断名どうしを読点「、」だけで区切る。句点「。」では区切らない（禁止例: 心筋梗塞。心不全。肺炎。／正しい例: 心筋梗塞、心不全、肺炎。）。臓器名などの列挙も同様に読点でつなぎ、途中で改行しない。列挙全体の文末だけ句点で閉じる。例：胃、小腸、大腸、肝臓、胆嚢、骨盤内。
+⑬ この段階ではルビ（｛用語｜よみ｝）を付けない。漢字のまま書く（ルビは後工程で辞書から付与する）。
+⑭ 出力する前に、医師として医学的に違和感のある表現・論理の破綻を自分で直し、その最終稿だけを出す。
 
 【出力形式】
 - 台本本文のみ（プレーンテキスト）
@@ -1332,6 +1383,10 @@ def polish_drama_script_medically(script: str, api_key: str) -> str:
 - 「研修医のみなさん」「みなさん」など視聴者への呼びかけは入れない／残っていれば削除する
 - 長さは VOICEVOX 1.0倍速で約10〜12分（おおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字）を超えないよう、長くしすぎない
 - セリフの「」、列挙の読点ルールは崩さない
+- 鑑別診断の診断名を列挙するときは読点「、」で区切り、句点「。」では区切らない（文末の一句点だけ可）
+- 検査値の単位は原文表記のまま（mg/dL, mEq/L など）。単位を書き換えない
+- 薬物名はアルファベットのまま。カタカナ化しない
+- 改行・改ページは原則として句読点の直後。単語・単位・薬物名の途中では切らない
 - ルビ ｛用語｜よみ｝ は付けない／残っていれば外す（ルビは後工程）
 - 不要な前置き・後書きを付けない
 
@@ -2519,7 +2574,8 @@ def wrap_text_to_width(
     text: str, font: ImageFont.ImageFont, max_width: int, draw: ImageDraw.ImageDraw
 ) -> list[str]:
     """
-    画面幅に収まるよう、日本語を1文字ずつ折り返す。
+    画面幅に収まるよう折り返す。
+    原則: 句読点の直後で改行。英単語・単位・薬物名の途中では切らない。
     「」で囲んだセリフでは、閉じの 」 の直前では改行しない（行頭禁則）。
     """
     text = (text or "").replace("\r\n", "\n").strip()
@@ -2541,6 +2597,18 @@ def wrap_text_to_width(
             if ch in SUBTITLE_NO_LINE_START and buf:
                 lines.append(buf + ch)
                 buf = ""
+                continue
+            # 句読点直後（なければ空白）で切る
+            pref = _find_preferred_break(buf)
+            if pref > 0:
+                lines.append(buf[:pref])
+                buf = buf[pref:] + ch
+                continue
+            # 英単語・単位の途中なら、トークンごと次行へ
+            tok = _latin_token_start(buf)
+            if tok > 0 and ch in _LATIN_TOKEN_CHARS:
+                lines.append(buf[:tok])
+                buf = buf[tok:] + ch
                 continue
             if buf:
                 lines.append(buf)
