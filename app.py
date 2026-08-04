@@ -268,6 +268,7 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.raw_script = plain
     st.session_state.final_script = plain
     st.session_state.final_script_editor = plain
+    st.session_state.final_script_editor_widget = plain
     st.session_state.review = None
     st.session_state.review_done = False
     st.session_state.skip_review = False
@@ -4042,6 +4043,7 @@ def main() -> None:
                 # 最終台本はルビなしで確定する
                 st.session_state.final_script = plain
                 st.session_state.final_script_editor = plain
+                st.session_state.final_script_editor_widget = plain
             except Exception as e:  # noqa: BLE001
                 st.session_state.last_error = str(e)
                 st.error(f"レビューに失敗しました: {e}")
@@ -4061,29 +4063,32 @@ def main() -> None:
         st.session_state.last_error = ""
         st.session_state.final_script = plain
         st.session_state.final_script_editor = plain
+        st.session_state.final_script_editor_widget = plain
         st.success("レビューをスキップしました（ルビなし原稿）")
 
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
     if st.session_state.review_done:
         if st.session_state.get("skip_review"):
             st.write("2. ルビなし原稿を確定")
-            if "final_script_editor" not in st.session_state:
-                st.session_state.final_script_editor = strip_voicevox_ruby(
+            if "final_script_editor_widget" not in st.session_state:
+                st.session_state.final_script_editor_widget = strip_voicevox_ruby(
                     st.session_state.final_script or st.session_state.raw_script
                 )
             st.text_area(
                 "最終台本（ルビなし）",
                 height=320,
-                key="final_script_editor",
+                key="final_script_editor_widget",
             )
             if st.button("2. 確定してルビ準備へ", type="primary", key="btn_confirm_skip"):
                 edited = strip_voicevox_ruby(
-                    (st.session_state.get("final_script_editor") or "").strip()
+                    (st.session_state.get("final_script_editor_widget") or "").strip()
                 )
                 if not edited:
                     st.error("最終台本が空です。")
                 else:
                     st.session_state.final_script = edited
+                    st.session_state.final_script_editor = edited
+                    st.session_state.final_script_editor_widget = edited
                     st.session_state.raw_script = edited
                     st.session_state.script_confirmed = True
                     st.session_state.ruby_ready = False
@@ -4109,7 +4114,7 @@ def main() -> None:
 
             if st.button("採択・別案を台本に反映", type="secondary"):
                 base = (
-                    st.session_state.get("final_script_editor")
+                    st.session_state.get("final_script_editor_widget")
                     or st.session_state.get("final_script")
                     or st.session_state.raw_script
                 )
@@ -4118,6 +4123,7 @@ def main() -> None:
                 )
                 st.session_state.final_script = new_text
                 st.session_state.final_script_editor = new_text
+                st.session_state.final_script_editor_widget = new_text
                 st.session_state.review_apply_log = applied
                 st.session_state.review_manual_log = manual
                 if applied:
@@ -4136,14 +4142,14 @@ def main() -> None:
                     for line in st.session_state.review_manual_log:
                         st.write(f"- {line}")
 
-            if "final_script_editor" not in st.session_state:
-                st.session_state.final_script_editor = strip_voicevox_ruby(
+            if "final_script_editor_widget" not in st.session_state:
+                st.session_state.final_script_editor_widget = strip_voicevox_ruby(
                     st.session_state.final_script or st.session_state.raw_script
                 )
             st.text_area(
                 "最終台本（ルビなし）",
                 height=320,
-                key="final_script_editor",
+                key="final_script_editor_widget",
             )
 
             if st.button(
@@ -4152,12 +4158,14 @@ def main() -> None:
                 key="btn_confirm_review",
             ):
                 edited = strip_voicevox_ruby(
-                    (st.session_state.get("final_script_editor") or "").strip()
+                    (st.session_state.get("final_script_editor_widget") or "").strip()
                 )
                 if not edited:
                     st.error("最終台本が空です。")
                 else:
                     st.session_state.final_script = edited
+                    st.session_state.final_script_editor = edited
+                    st.session_state.final_script_editor_widget = edited
                     st.session_state.raw_script = edited
                     st.session_state.script_confirmed = True
                     st.session_state.ruby_ready = False
@@ -4667,6 +4675,7 @@ def main() -> None:
                             st.session_state.mp4_path = ""
                             st.session_state.final_script = plain
                             st.session_state.final_script_editor = plain
+                            st.session_state.final_script_editor_widget = plain
                             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                             (OUTPUT_DIR / "last_script.txt").write_text(
                                 plain, encoding="utf-8"
