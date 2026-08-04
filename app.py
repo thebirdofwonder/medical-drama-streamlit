@@ -718,6 +718,50 @@ def find_ruby_dict_updates(
     return updates
 
 
+def find_rubies_missing_from_dictionary(
+    script: str,
+    dictionary: list[tuple[str, str]] | None = None,
+) -> list[tuple[str, str]]:
+    """
+    ルビ入り原稿にあるが、辞書に無い（または読みが違う）ルビを返す。
+    """
+    dict_map = {
+        s: r
+        for s, r in (
+            dictionary
+            if dictionary is not None
+            else get_active_ruby_dictionary()
+        )
+    }
+    missing: list[tuple[str, str]] = []
+    for surface, reading in extract_ruby_pairs_from_script(script):
+        if dict_map.get(surface) != reading:
+            missing.append((surface, reading))
+    return missing
+
+
+def export_active_ruby_dictionary_file() -> Path:
+    """いま有効なルビ辞書を ルビ辞書.txt に書き出す。"""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    export_text = format_ruby_dict_text(get_active_ruby_dictionary())
+    RUBY_DICT_EXPORT_PATH.write_text(export_text, encoding="utf-8")
+    st.session_state.ruby_dict_export_ready = True
+    return RUBY_DICT_EXPORT_PATH
+
+
+def sync_script_rubies_into_dictionary(script: str) -> list[tuple[str, str]]:
+    """
+    ルビ入り最終原稿と辞書を比べ、足りないルビを辞書へ追加する。
+    追加後の辞書ファイルも書き出す。戻り値は今回追加した一覧。
+    """
+    missing = find_rubies_missing_from_dictionary(script)
+    applied = apply_ruby_updates_to_learned_dict(missing) if missing else []
+    # 追加がなくても、完成後にダウンロードできるよう最新版を書き出す
+    export_active_ruby_dictionary_file()
+    st.session_state.ruby_dict_post_video_updates = applied
+    return applied
+
+
 def format_ruby_dict_text(pairs: list[tuple[str, str]]) -> str:
     """用語\\tよみ 形式の辞書テキストにする。"""
     lines: list[str] = []
@@ -770,10 +814,7 @@ def apply_ruby_updates_to_learned_dict(
         applied.append((surface, reading))
     st.session_state.ruby_dict_learned = [(s, learned_map[s]) for s in order]
     # いま有効な全辞書を書き出し（学習反映後）
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    export_text = format_ruby_dict_text(get_active_ruby_dictionary())
-    RUBY_DICT_EXPORT_PATH.write_text(export_text, encoding="utf-8")
-    st.session_state.ruby_dict_export_ready = True
+    export_active_ruby_dictionary_file()
     st.session_state.ruby_dict_last_updates = applied
     return applied
 
@@ -1480,14 +1521,28 @@ def update_export_progress(
     pct: int,
     message: str = "",
 ) -> None:
-    """進捗バーと％数字を同時に更新する。"""
+    """進捗バーと％数字を同時に更新する（画面中央付近で大きく表示）。"""
     n = max(0, min(100, int(pct)))
-    progress.progress(n)
-    label = f"**{n}%**"
-    if message:
-        label += f"  {message}"
-        status.info(message)
-    pct_box.markdown(label)
+    msg = (message or "").strip()
+    bar_text = f"{n}%"
+    if msg:
+        bar_text = f"{n}%  {msg}"
+    # Streamlit 1.50+: バー上にも％を出す
+    try:
+        progress.progress(n, text=bar_text)
+    except TypeError:
+        progress.progress(n / 100.0 if n <= 100 else 1.0)
+    pct_box.markdown(
+        f'<div style="font-size:2.4rem;font-weight:700;line-height:1.2;'
+        f'margin:0.4rem 0 0.2rem 0;color:#111;">進捗 {n}%</div>',
+        unsafe_allow_html=True,
+    )
+    if msg:
+        status.info(f"{n}% — {msg}")
+    else:
+        status.info(f"{n}%")
+    st.session_state.export_progress_pct = n
+    st.session_state.export_progress_msg = msg
 
 
 def heuristic_review(script: str) -> dict[str, Any]:
@@ -3424,6 +3479,9 @@ def init_state() -> None:
         "ruby_dict_learned": [],
         "ruby_dict_export_ready": False,
         "ruby_dict_last_updates": [],
+        "ruby_dict_post_video_updates": [],
+        "export_progress_pct": 0,
+        "export_progress_msg": "",
         "ruby_script_baseline": "",
         "ending_credits_text": "",
         "reference_text": "",
@@ -3646,7 +3704,16 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.mp4_path = str(desktop_path)
         st.session_state.mp4_name = desktop_name
         st.session_state.mp4_bytes = None
-        _pct(100, "完了")
+        # ルビ入り最終原稿 ↔ 辞書を比較し、足りないルビを追加
+        _pct(99, "ルビ辞書を更新中…")
+        applied = sync_script_rubies_into_dictionary(voice_script)
+        if applied:
+            _pct(
+                100,
+                f"完了（辞書にルビを {len(applied)} 件追加）",
+            )
+        else:
+            _pct(100, "完了")
         status.success(f"完了: {desktop_path}")
 
 
@@ -3680,6 +3747,11 @@ def main() -> None:
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
         st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
+        st.markdown(
+            '<div style="font-size:1.2rem;margin-bottom:0.5rem;">'
+            "作業の進捗（パーセント）</div>",
+            unsafe_allow_html=True,
+        )
         if st.button("中止して通常画面に戻る", key="btn_cancel_video_encoding"):
             st.session_state.video_encoding = False
             st.session_state._export_job = None
@@ -3699,7 +3771,9 @@ def main() -> None:
 
         # pending → 書き出し開始
         st.session_state._export_job = "running"
-        progress = st.progress(0)
+        st.session_state.export_progress_pct = 0
+        st.session_state.export_progress_msg = "準備中…"
+        progress = st.progress(0, text="0%  準備中…")
         pct_box = st.empty()
         status = st.empty()
         update_export_progress(progress, pct_box, status, 0, "準備中…")
@@ -4436,6 +4510,9 @@ def main() -> None:
             # 次の描画で作業専用画面にし、他ボタンを出さない
             st.session_state.video_encoding = True
             st.session_state._export_job = "pending"
+            st.session_state.ruby_dict_post_video_updates = []
+            st.session_state.export_progress_pct = 0
+            st.session_state.export_progress_msg = ""
             st.rerun()
 
         mp4_path = st.session_state.get("mp4_path") or ""
@@ -4473,6 +4550,32 @@ def main() -> None:
                     data=Path(script_saved).read_bytes(),
                     file_name=script_dl_name,
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+
+            # 動画作成後: ルビ入り最終原稿と辞書の差分を反映済み
+            post_ruby = st.session_state.get("ruby_dict_post_video_updates") or []
+            st.write("ルビ辞書（動画作成後）")
+            if post_ruby:
+                st.success(
+                    f"ルビ入り最終原稿にあって辞書になかったルビを "
+                    f"{len(post_ruby)} 件、辞書へ追加しました。"
+                )
+                preview = "、".join(f"{s}（{r}）" for s, r in post_ruby[:15])
+                if len(post_ruby) > 15:
+                    preview += "…"
+                st.caption(preview)
+            else:
+                st.caption(
+                    "今回、辞書に足りないルビはありませんでした"
+                    "（原稿のルビはすべて辞書にありました）。"
+                )
+            if RUBY_DICT_EXPORT_PATH.is_file():
+                st.download_button(
+                    label="ルビ辞書.txt をダウンロード",
+                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
+                    file_name=RUBY_DICT_EXPORT_NAME,
+                    mime="text/plain",
+                    key="dl_ruby_dict_after_video",
                 )
 
             # 次の原稿 → もう一度 MP4 を作るループ
