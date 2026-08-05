@@ -56,7 +56,8 @@ DEFAULT_REFERENCE_EXAMPLE = (
     "Infection Mimicking Acute Surgical Abdomen in an Adult. "
     "Cureus. 2024;16(11):e73665. doi:10.7759/cureus.73665"
 )
-SCENE_INTERVAL_SEC = 60.0  # 1分ごとに背景切替
+SCENE_INTERVAL_SEC = 35.0  # 同じ場面が続く場合の背景切替上限
+SCENE_MIN_DURATION_SEC = 8.0  # 背景が短時間で頻繁に変わるのを防ぐ
 ENDING_DURATION_SEC = 10.0  # エンディング画面を出し続ける秒数（フェード完了後）
 ENDING_FADE_SEC = 5.0  # 本編音声終了後、エンディングへ完全移行するフェード秒数
 INTRO_SILENCE_SEC = 3.0  # 冒頭の無音（朗読開始までの余白）
@@ -162,16 +163,36 @@ MEDICAL_BACKGROUND_URLS = [
     # 検査・ラボ
     "https://images.unsplash.com/photo-1582719471384-894fbb16e074?auto=format&fit=crop&w=1920&h=1080&q=80",
 ]
-# 台本の場面に近い写真を優先するための対応（URLリストの番号）
+# 場面ごとに使える写真（URLリストの番号）。同じ場面が続くときだけ候補内で交替。
+THEME_TO_BG_INDICES: dict[str, list[int]] = {
+    "corridor": [0],
+    "er": [2, 9, 10],
+    "icu": [2, 9, 3],
+    "surgery": [1, 5, 6],
+    "imaging": [7, 2],
+    "lab": [11, 2],
+    "ward": [3, 0],
+    "consult": [8, 4],
+    "pharma": [4, 9],
+    "ambulance": [10],
+}
+# 旧名を参照する処理との互換用
 THEME_TO_BG_INDEX = {
-    "er": 10,
-    "icu": 2,
-    "surgery": 1,
-    "lab": 11,
-    "ward": 3,
-    "consult": 8,
-    "pharma": 4,
-    "ambulance": 10,
+    theme: indices[0] for theme, indices in THEME_TO_BG_INDICES.items()
+}
+BG_INDEX_TO_THEME = {
+    0: "corridor",
+    1: "surgery",
+    2: "icu",
+    3: "ward",
+    4: "pharma",
+    5: "surgery",
+    6: "surgery",
+    7: "imaging",
+    8: "consult",
+    9: "icu",
+    10: "ambulance",
+    11: "lab",
 }
 LANDSCAPE_IMAGE_URLS = MEDICAL_BACKGROUND_URLS  # 互換エイリアス
 # 1区間＝1字幕にするため短め（句点で区切り、長文のみここで切る）
@@ -2778,9 +2799,11 @@ def draw_medical_scene(theme: str) -> Image.Image:
     """シンプルな医学イメージを自作（写真不使用＝著作権フリー）。"""
     w, h = VIDEO_SIZE
     themes = {
+        "corridor": ((25, 35, 45), "病院・院内"),
         "er": ((40, 20, 30), "救急・初療"),
         "icu": ((15, 35, 55), "集中治療"),
         "surgery": ((25, 25, 40), "手術・処置"),
+        "imaging": ((20, 35, 50), "画像検査"),
         "lab": ((20, 40, 45), "検査・画像"),
         "ward": ((25, 35, 30), "病棟・経過"),
         "consult": ((35, 30, 45), "説明・決断"),
@@ -2792,7 +2815,17 @@ def draw_medical_scene(theme: str) -> Image.Image:
     draw = ImageDraw.Draw(img)
     cx, cy = w // 2, int(h * 0.42)
 
-    if theme == "er":
+    if theme == "corridor":
+        draw.polygon(
+            [(cx - 520, cy - 260), (cx - 160, cy), (cx - 520, cy + 300)],
+            outline=(100, 135, 165),
+        )
+        draw.polygon(
+            [(cx + 520, cy - 260), (cx + 160, cy), (cx + 520, cy + 300)],
+            outline=(100, 135, 165),
+        )
+        draw.line([(cx - 160, cy), (cx + 160, cy)], fill=(130, 160, 185), width=4)
+    elif theme == "er":
         draw.rectangle([cx - 420, cy - 220, cx + 420, cy + 220], outline=(180, 60, 70), width=4)
         draw.line([(cx - 200, cy), (cx + 200, cy)], fill=(200, 70, 80), width=6)
         draw.line([(cx, cy - 160), (cx, cy + 160)], fill=(200, 70, 80), width=6)
@@ -2808,6 +2841,23 @@ def draw_medical_scene(theme: str) -> Image.Image:
         draw.ellipse([cx - 180, cy - 120, cx + 180, cy + 120], outline=(200, 200, 210), width=5)
         draw.arc([cx - 280, cy - 200, cx + 280, cy + 200], 200, 340, fill=(160, 170, 190), width=8)
         draw.line([(cx - 40, cy - 40), (cx + 120, cy + 80)], fill=(210, 210, 220), width=5)
+    elif theme == "imaging":
+        draw.rounded_rectangle(
+            [cx - 300, cy - 280, cx + 300, cy + 280],
+            radius=30,
+            outline=(110, 170, 210),
+            width=5,
+        )
+        draw.ellipse(
+            [cx - 145, cy - 220, cx + 145, cy + 180],
+            outline=(125, 185, 220),
+            width=4,
+        )
+        draw.line(
+            [(cx - 220, cy + 220), (cx + 220, cy + 220)],
+            fill=(90, 145, 185),
+            width=4,
+        )
     elif theme == "lab":
         for i in range(3):
             x0 = cx - 420 + i * 300
@@ -2860,30 +2910,82 @@ def draw_medical_scene(theme: str) -> Image.Image:
     return img.convert("RGBA")
 
 
-THEME_KEYWORDS: dict[str, list[str]] = {
-    "er": ["救急", "ER", "ショック", "心肺停止", "CPA", "挿管", "外傷", "一次評価", "トリアージ"],
-    "icu": ["ICU", "集中治療", "モニター", "人工呼吸", "昇圧", "敗血症", "鎮静", "カテコラミン"],
-    "surgery": ["手術", "オペ", "開胸", "開腹", "麻酔", "執刀", "縫合", "ドレーン"],
-    "lab": ["検査", "採血", "CT", "MRI", "レントゲン", "培養", "病理", "エコー", "画像"],
-    "ward": ["病棟", "回診", "退院", "入院", "経過", "ナース", "ベッド"],
-    "consult": ["説明", "同意", "家族", "インフォームド", "外来", "決断", "選択"],
-    "pharma": ["投与", "点滴", "抗生", "抗菌", "薬", "輸液", "ステロイド", "抗凝固"],
-    "ambulance": ["救急隊", "救急車", "現場", "ドクターカー", "搬送", "通報"],
+THEME_KEYWORDS: dict[str, list[tuple[str, int]]] = {
+    "ambulance": [
+        ("ドクターカー", 8), ("救急車", 8), ("救急隊", 8),
+        ("119番", 8), ("通報", 5), ("搬送中", 5), ("現場", 2),
+    ],
+    "er": [
+        ("救命救急", 5), ("救急外来", 5), ("初療室", 5),
+        ("トリアージ", 4), ("一次評価", 4), ("心肺停止", 4),
+        ("CPA", 4), ("蘇生", 4), ("ショック", 3), ("挿管", 3),
+        ("外傷", 3), ("救急", 2), ("ER", 3),
+    ],
+    "surgery": [
+        ("手術室", 5), ("緊急手術", 5), ("開胸", 5), ("開腹", 5),
+        ("執刀", 4), ("術野", 4), ("縫合", 4), ("麻酔", 3),
+        ("手術", 3), ("オペ", 3), ("ドレーン", 2),
+    ],
+    "imaging": [
+        ("造影CT", 5), ("CT", 4), ("MRI", 4), ("レントゲン", 4),
+        ("X線", 4), ("超音波", 4), ("エコー", 3), ("内視鏡", 3),
+        ("画像所見", 4), ("画像検査", 4), ("撮影", 2),
+    ],
+    "lab": [
+        ("血液培養", 5), ("病理検査", 5), ("検体", 4),
+        ("採血", 4), ("培養", 4), ("病理", 4), ("生検", 4),
+        ("顕微鏡", 3), ("検査室", 4), ("検査値", 3),
+    ],
+    "icu": [
+        ("集中治療室", 5), ("ICU", 5), ("人工呼吸器", 4),
+        ("人工呼吸", 4), ("バイタル", 3), ("モニター", 3),
+        ("昇圧剤", 3), ("カテコラミン", 3), ("敗血症", 3),
+        ("鎮静", 2),
+    ],
+    "pharma": [
+        ("抗菌薬", 5), ("抗生剤", 5), ("薬剤", 4), ("投薬", 4),
+        ("点滴", 3), ("投与", 3), ("輸液", 3), ("ステロイド", 3),
+        ("抗凝固", 3), ("処方", 3), ("治療開始", 2),
+    ],
+    "consult": [
+        ("病状説明", 5), ("インフォームド", 5), ("説明した", 3),
+        ("家族に", 4), ("家族へ", 4), ("同意", 4), ("面談", 4),
+        ("カンファレンス", 4), ("方針", 2), ("相談", 2),
+        ("外来", 3), ("診察", 2),
+    ],
+    "ward": [
+        ("病室", 5), ("病棟", 5), ("ベッドサイド", 5),
+        ("ナースステーション", 5), ("回診", 4), ("入院", 3),
+        ("退院", 3), ("経過観察", 3), ("看護師", 2), ("ベッド", 2),
+    ],
+    "corridor": [
+        ("病院に到着", 4), ("院内", 3), ("廊下", 5),
+        ("待合室", 4), ("受付", 4), ("病院", 1),
+    ],
 }
-THEME_CYCLE = ["er", "icu", "lab", "consult", "pharma", "surgery", "ward", "ambulance"]
+THEME_PRIORITY = list(THEME_KEYWORDS)
+THEME_CYCLE = list(THEME_TO_BG_INDICES)  # 自作背景の互換用
 
 
-def infer_theme_from_text(segment: str, index: int) -> str:
-    text = segment or ""
-    scores = {k: 0 for k in THEME_KEYWORDS}
-    for theme, words in THEME_KEYWORDS.items():
-        for word in words:
-            if word in text:
-                scores[theme] += 1
-    best = max(scores, key=lambda k: scores[k])
-    if scores[best] == 0:
-        return THEME_CYCLE[index % len(THEME_CYCLE)]
-    return best
+def infer_theme_from_text(segment: str, index: int = 0) -> str | None:
+    """文章から場面を判定する。手掛かりが無ければ None（ランダム選択しない）。"""
+    text = (segment or "").strip()
+    if not text:
+        return None
+    scores = {theme: 0 for theme in THEME_KEYWORDS}
+    for theme, entries in THEME_KEYWORDS.items():
+        for word, weight in entries:
+            count = text.lower().count(word.lower())
+            if count:
+                scores[theme] += int(weight) * count
+    best_score = max(scores.values(), default=0)
+    if best_score <= 0:
+        return None
+    # 同点なら、より具体的な場面を先に定義した優先順で選ぶ
+    for theme in THEME_PRIORITY:
+        if scores[theme] == best_score:
+            return theme
+    return None
 
 
 def split_script_for_scenes(script: str, n_scenes: int) -> list[str]:
@@ -2911,7 +3013,7 @@ def split_script_for_scenes(script: str, n_scenes: int) -> list[str]:
 
 def make_fallback_landscape(index: int) -> Image.Image:
     """ダウンロード失敗時は自作の医療イメージ（写真不使用）を使う。"""
-    theme = THEME_CYCLE[index % len(THEME_CYCLE)]
+    theme = BG_INDEX_TO_THEME.get(index % max(1, len(MEDICAL_BACKGROUND_URLS)), "ward")
     return draw_medical_scene(theme).convert("RGB")
 
 
@@ -2957,35 +3059,123 @@ def ensure_landscape_images(needed: int | list[int]) -> list[Path]:
     return [path_by_idx[i % n_urls] for i in indices]
 
 
-def plan_scene_schedule(script: str, total_duration: float) -> list[dict[str, Any]]:
-    """約1分ごとに医療背景を切り替えるスケジュール。"""
+def _background_index_for_theme(theme: str, occurrence: int) -> int:
+    """同じ物語場面に属する写真候補だけから、順番に1枚選ぶ。"""
+    choices = THEME_TO_BG_INDICES.get(theme) or THEME_TO_BG_INDICES["ward"]
+    return int(choices[max(0, occurrence) % len(choices)])
+
+
+def _theme_from_cue_context(
+    cues: list[dict[str, Any]],
+    cue_index: int,
+) -> tuple[str | None, str]:
+    """現在の字幕を優先し、手掛かりがないときだけ次の字幕も見る。"""
+    current = strip_voicevox_ruby(
+        str(cues[cue_index].get("text") or "")
+    ).strip()
+    detected = infer_theme_from_text(current, cue_index)
+    if detected:
+        return detected, current
+    # 現在の文が「その後」などだけなら、直後の1字幕を先読みする
+    if cue_index + 1 < len(cues):
+        following = strip_voicevox_ruby(
+            str(cues[cue_index + 1].get("text") or "")
+        ).strip()
+        context = " ".join(x for x in (current, following) if x)
+        return infer_theme_from_text(context, cue_index), context
+    return None, current
+
+
+def plan_scene_schedule(
+    script: str,
+    total_duration: float,
+    subtitle_cues: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    字幕の実時間と物語内容から、背景を切り替えるスケジュールを作る。
+    場面語がない箇所では直前の背景を保持し、無関係な画像をランダム表示しない。
+    """
     total_duration = max(float(total_duration), 1.0)
-    n = max(1, int((total_duration + SCENE_INTERVAL_SEC - 0.01) // SCENE_INTERVAL_SEC))
-    segments = split_script_for_scenes(script, n)
-    n_urls = max(1, len(MEDICAL_BACKGROUND_URLS))
-    schedule = []
-    prev_bg: int | None = None
-    for i in range(n):
-        start = i * SCENE_INTERVAL_SEC
-        end = min((i + 1) * SCENE_INTERVAL_SEC, total_duration)
-        dur = max(0.5, end - start)
-        seg = segments[i] if i < len(segments) else ""
-        theme = infer_theme_from_text(seg, i)
-        bg = int(THEME_TO_BG_INDEX.get(theme, i % n_urls)) % n_urls
-        if prev_bg is not None and bg == prev_bg:
-            bg = (bg + 1) % n_urls
-        prev_bg = bg
+    cues = sorted(
+        [
+            c
+            for c in (subtitle_cues or [])
+            if str(c.get("text") or "").strip()
+            and float(c.get("end", 0)) > float(c.get("start", 0))
+        ],
+        key=lambda c: float(c.get("start", 0)),
+    )
+
+    # 字幕時刻がない古い呼び出し向け。等分した文章でもランダムにはしない。
+    if not cues:
+        n = max(
+            1,
+            int((total_duration + SCENE_INTERVAL_SEC - 0.01) // SCENE_INTERVAL_SEC),
+        )
+        segments = split_script_for_scenes(script, n)
+        cues = []
+        for i, segment in enumerate(segments):
+            start = i * total_duration / n
+            end = (i + 1) * total_duration / n
+            cues.append({"start": start, "end": end, "text": segment})
+
+    first_theme, _first_context = _theme_from_cue_context(cues, 0)
+    current_theme = first_theme or "ward"
+    scene_start = 0.0
+    scene_texts: list[str] = []
+    schedule: list[dict[str, Any]] = []
+    theme_occurrences: dict[str, int] = {}
+
+    def _append_scene(end_time: float) -> None:
+        nonlocal scene_start, scene_texts
+        end_time = min(max(float(end_time), scene_start + 0.5), total_duration)
+        occurrence = theme_occurrences.get(current_theme, 0)
+        theme_occurrences[current_theme] = occurrence + 1
         schedule.append(
             {
-                "index": i,
-                "theme": theme,
-                "landscape_index": bg,
-                "duration": dur,
-                "segment": seg,
+                "index": len(schedule),
+                "theme": current_theme,
+                "landscape_index": _background_index_for_theme(
+                    current_theme, occurrence
+                ),
+                "duration": end_time - scene_start,
+                "segment": " ".join(scene_texts).strip(),
             }
         )
-    spent = sum(s["duration"] for s in schedule[:-1]) if len(schedule) > 1 else 0
+        scene_start = end_time
+        scene_texts = []
+
+    for i, cue in enumerate(cues):
+        cue_start = max(0.0, min(float(cue.get("start", 0)), total_duration))
+        cue_end = max(cue_start, min(float(cue.get("end", cue_start)), total_duration))
+        cue_text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
+        detected, _context = _theme_from_cue_context(cues, i)
+        elapsed = cue_start - scene_start
+
+        # 物語上の場面が変わったら、その字幕の開始時刻で背景を切り替える。
+        if (
+            detected
+            and detected != current_theme
+            and elapsed >= SCENE_MIN_DURATION_SEC
+        ):
+            _append_scene(cue_start)
+            current_theme = detected
+        # 同じ場面が長く続く場合は、その場面に合う別写真へ切り替える。
+        elif elapsed >= SCENE_INTERVAL_SEC:
+            _append_scene(cue_start)
+
+        if cue_text:
+            scene_texts.append(cue_text)
+
+        if cue_end >= total_duration:
+            break
+
+    if scene_start < total_duration:
+        _append_scene(total_duration)
+
+    # 浮動小数点の丸め差を最後の場面で吸収する。
     if schedule:
+        spent = sum(float(s["duration"]) for s in schedule[:-1])
         schedule[-1]["duration"] = max(0.5, total_duration - spent)
     return schedule
 
@@ -2997,13 +3187,13 @@ def create_scene_frame(
     title: str = "",
     title_img: Image.Image | None = None,
     show_title: bool = False,
-    disclaimer: str = DISCLAIMER_TEXT,
+    disclaimer: str = "",
     landscape_index: int = 0,
 ) -> Path:
     """
-    医療写真背景＋注意書き。
-    本編にはタイトル文字・VOICEVOXクレジット・場面ラベルを出さない
-    （タイトルはタイトル画像側で扱う）。
+    医療写真背景の本編フレーム。
+    本編にはタイトル文字・VOICEVOXクレジット・場面ラベル・脚注を出さない
+    （注意書きはエンディング側で扱う）。
     """
     w, h = VIDEO_SIZE
     if landscape_path is not None and Path(landscape_path).exists():
@@ -3015,16 +3205,15 @@ def create_scene_frame(
     else:
         base = make_fallback_landscape(landscape_index).convert("RGBA")
 
-    # 下部を少し暗くして注意書きを読みやすく
-    shade = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shade)
-    sd.rectangle([0, int(h * 0.82), w, h], fill=(0, 0, 0, 140))
-    if show_title:
-        sd.rectangle([0, 0, w, int(h * 0.28)], fill=(0, 0, 0, 70))
-    base = Image.alpha_composite(base, shade)
     draw = ImageDraw.Draw(base)
 
     if show_title:
+        # タイトル表示時だけ上部を少し暗くする
+        shade = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(shade)
+        sd.rectangle([0, 0, w, int(h * 0.28)], fill=(0, 0, 0, 70))
+        base = Image.alpha_composite(base, shade)
+        draw = ImageDraw.Draw(base)
         if title_img is not None:
             paste_centered(
                 base,
@@ -3055,20 +3244,8 @@ def create_scene_frame(
                 )
                 y_cursor += th + 14
 
-    # 注意書きのみ（一番下）。VOICEVOXクレジットは本編に出さない
-    margin = 36
-    disc_font = load_jp_font(22, bold=False)
-    disc = (disclaimer or DISCLAIMER_TEXT).strip()
-    disc_lines = wrap_text_to_width(disc, disc_font, int(w * 0.94), draw)
-    y_disc = h - margin
-    for line in reversed(disc_lines[-3:]):
-        bbox = draw.textbbox((0, 0), line, font=disc_font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        y_disc -= th + 4
-        x = (w - tw) // 2
-        draw.text((x + 1, y_disc + 1), line, font=disc_font, fill=(0, 0, 0))
-        draw.text((x, y_disc), line, font=disc_font, fill=(210, 215, 220))
+    # 本編には脚注（注意書き）を常時表示しない
+    _ = disclaimer
 
     path.parent.mkdir(parents=True, exist_ok=True)
     base.convert("RGB").save(path, format="PNG")
@@ -3783,8 +3960,12 @@ def run_video_export(progress, pct_box, status) -> None:
         with _wave.open(str(wav_path), "rb") as wf:
             audio_sec = wf.getnframes() / float(wf.getframerate())
 
-        schedule = plan_scene_schedule(st.session_state.final_script, audio_sec)
-        _pct(52, f"背景準備（{len(schedule)} 枚）…")
+        schedule = plan_scene_schedule(
+            voice_script,
+            audio_sec,
+            subtitle_cues=subtitle_cues,
+        )
+        _pct(52, f"物語に合う背景を準備（{len(schedule)} 場面）…")
         bg_indices = [
             int(item.get("landscape_index", item["index"])) for item in schedule
         ]
@@ -3805,7 +3986,7 @@ def run_video_export(progress, pct_box, status) -> None:
                 title="",
                 title_img=None,
                 show_title=False,
-                disclaimer=DISCLAIMER_TEXT,
+                disclaimer="",
                 landscape_index=li,
             )
             scene_clips.append((frame_path, dur))
