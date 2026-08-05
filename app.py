@@ -93,10 +93,11 @@ def get_desktop_dir() -> Path:
     return p
 
 
-def make_desktop_mp4_filename(title: str = "") -> str:
+def make_desktop_mp4_filename(title: str = "", *, draft: bool = False) -> str:
     """デスクトップ保存用のファイル名（上書きしにくいよう日時つき）。"""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{make_title_basename(title)}_{stamp}.mp4"
+    kind = "draft" if draft else "final"
+    return f"{make_title_basename(title)}_{kind}_{stamp}.mp4"
 
 
 def make_title_basename(title: str = "", fallback: str = "medical_drama") -> str:
@@ -3252,6 +3253,15 @@ def create_scene_frame(
     return path
 
 
+def create_plain_scene_frame(path: Path) -> Path:
+    """背景写真なしの単色フレーム（ドラフト確認用）。"""
+    w, h = VIDEO_SIZE
+    img = Image.new("RGB", (w, h), (12, 14, 18))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path, format="PNG")
+    return path
+
+
 def create_background_image(
     path: Path,
     title: str = "",
@@ -3808,6 +3818,7 @@ def init_state() -> None:
         "last_script_path": "",
         "last_script_name": "medical_drama.docx",
         "video_encoding": False,
+        "video_export_mode": "draft",  # draft=背景なし / final=背景あり
         "_export_job": None,
         "review_apply_log": [],
         "review_manual_log": [],
@@ -3960,38 +3971,50 @@ def run_video_export(progress, pct_box, status) -> None:
         with _wave.open(str(wav_path), "rb") as wf:
             audio_sec = wf.getnframes() / float(wf.getframerate())
 
-        schedule = plan_scene_schedule(
-            voice_script,
-            audio_sec,
-            subtitle_cues=subtitle_cues,
+        include_background = (
+            str(st.session_state.get("video_export_mode") or "draft") == "final"
         )
-        _pct(52, f"物語に合う背景を準備（{len(schedule)} 場面）…")
-        bg_indices = [
-            int(item.get("landscape_index", item["index"])) for item in schedule
-        ]
-        landscapes = ensure_landscape_images(bg_indices)
-        _pct(55, "シーン合成…")
         scene_dir = tmp_path / "scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
         scene_clips: list[tuple[Path, float]] = []
-        for item in schedule:
-            i = int(item["index"])
-            li = int(item.get("landscape_index", i))
-            dur = float(item["duration"])
-            frame_path = scene_dir / f"scene_{i:03d}.png"
-            land = landscapes[i % len(landscapes)]
-            create_scene_frame(
-                frame_path,
-                landscape_path=land,
-                title="",
-                title_img=None,
-                show_title=False,
-                disclaimer="",
-                landscape_index=li,
+
+        if include_background:
+            schedule = plan_scene_schedule(
+                voice_script,
+                audio_sec,
+                subtitle_cues=subtitle_cues,
             )
-            scene_clips.append((frame_path, dur))
-            pct = 55 + int(12 * ((i + 1) / max(len(schedule), 1)))
-            _pct(min(pct, 67), f"シーン {i+1}/{len(schedule)}")
+            _pct(52, f"物語に合う背景を準備（{len(schedule)} 場面）…")
+            bg_indices = [
+                int(item.get("landscape_index", item["index"])) for item in schedule
+            ]
+            landscapes = ensure_landscape_images(bg_indices)
+            _pct(55, "シーン合成（背景あり）…")
+            for item in schedule:
+                i = int(item["index"])
+                li = int(item.get("landscape_index", i))
+                dur = float(item["duration"])
+                frame_path = scene_dir / f"scene_{i:03d}.png"
+                land = landscapes[i % len(landscapes)]
+                create_scene_frame(
+                    frame_path,
+                    landscape_path=land,
+                    title="",
+                    title_img=None,
+                    show_title=False,
+                    disclaimer="",
+                    landscape_index=li,
+                )
+                scene_clips.append((frame_path, dur))
+                pct = 55 + int(12 * ((i + 1) / max(len(schedule), 1)))
+                _pct(min(pct, 67), f"シーン {i+1}/{len(schedule)}")
+        else:
+            # ドラフト: 背景写真を取らず、単色画面＋字幕＋音声だけ
+            _pct(52, "ドラフト用の単色背景を準備…")
+            frame_path = scene_dir / "scene_plain.png"
+            create_plain_scene_frame(frame_path)
+            scene_clips.append((frame_path, float(audio_sec)))
+            _pct(67, "ドラフト（背景なし）")
 
         _pct(70, "エンディング…")
         ending_path = tmp_path / "ending_credits.png"
@@ -4021,7 +4044,9 @@ def run_video_export(progress, pct_box, status) -> None:
         )
 
         desktop_dir = get_desktop_dir()
-        desktop_name = make_desktop_mp4_filename(video_title)
+        desktop_name = make_desktop_mp4_filename(
+            video_title, draft=not include_background
+        )
         desktop_path = desktop_dir / desktop_name
         shutil.copy2(out_path, desktop_path)
 
@@ -4031,14 +4056,15 @@ def run_video_export(progress, pct_box, status) -> None:
         # ルビ入り最終原稿 ↔ 辞書を比較し、足りないルビを追加
         _pct(99, "ルビ辞書を更新中…")
         applied = sync_script_rubies_into_dictionary(voice_script)
+        mode_label = "最終版（背景あり）" if include_background else "ドラフト（背景なし）"
         if applied:
             _pct(
                 100,
-                f"完了（辞書にルビを {len(applied)} 件追加）",
+                f"完了・{mode_label}（辞書にルビを {len(applied)} 件追加）",
             )
         else:
-            _pct(100, "完了")
-        status.success(f"完了: {desktop_path}")
+            _pct(100, f"完了・{mode_label}")
+        status.success(f"完了（{mode_label}）: {desktop_path}")
 
 
 def inject_app_theme() -> None:
@@ -4862,6 +4888,23 @@ def main() -> None:
             "エンディング文面",
             key="ending_credits_text",
             height=280,
+        )
+
+        st.write("動画の種類")
+        st.radio(
+            "背景の有無",
+            options=["draft", "final"],
+            format_func=lambda x: (
+                "ドラフト（背景なし・台本確認用）"
+                if x == "draft"
+                else "最終版（背景あり）"
+            ),
+            key="video_export_mode",
+            horizontal=False,
+        )
+        st.caption(
+            "ドラフトは黒い画面＋字幕＋音声だけです。"
+            "最終版台本が固まったら、背景ありを選んでください。"
         )
 
         if st.button("3. 動画を生成する", type="primary"):
