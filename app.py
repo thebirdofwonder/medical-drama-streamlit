@@ -2407,13 +2407,99 @@ def expand_voicevox_ruby_to_reading(text: str) -> str:
     )
 
 
-def create_subtitle_png(text: str, path: Path) -> Path:
+# 1画面に出す字幕の最大行数（これを超える文は時間でページ分割する）
+MAX_SUBTITLE_LINES = 3
+SUBTITLE_FONT_SIZE = 52
+
+
+def _subtitle_measure_tools() -> tuple[ImageDraw.ImageDraw, ImageFont.ImageFont, int]:
+    """字幕の折り返し計測用（描画オブジェクト・フォント・最大幅）。"""
+    w, _h = VIDEO_SIZE
+    img = Image.new("RGBA", (w, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = load_jp_font(SUBTITLE_FONT_SIZE, bold=True)
+    return draw, font, int(w * 0.86)
+
+
+# 字幕1行あたりの目安文字数（幅計測が効かない場合の保険）
+SUBTITLE_CHARS_PER_LINE = 30
+
+
+def expand_subtitle_cues_for_display(
+    cues: list[dict[str, Any]] | None,
+    *,
+    max_lines: int = MAX_SUBTITLE_LINES,
+) -> list[dict[str, Any]]:
+    """
+    長い字幕を画面に収まる行数ごとのページに分け、表示時間を文字数比で割る。
+    （音声タイミングは変えず、同じ区間内で前半→後半と切り替える）
+    """
+    if not cues:
+        return []
+    draw, font, max_w = _subtitle_measure_tools()
+    per_page = max(1, int(max_lines))
+    out: list[dict[str, Any]] = []
+    for cue in cues:
+        text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
+        start = float(cue.get("start", 0))
+        end = float(cue.get("end", 0))
+        if not text or end <= start:
+            continue
+        lines = wrap_text_to_width(text, font, max_w, draw)
+        # フォント幅が取れず1行のまま残る長い文は、文字数で行分割する
+        soft_limit = SUBTITLE_CHARS_PER_LINE * per_page
+        if (not lines) or (
+            len(lines) <= 1 and len(text) > soft_limit
+        ):
+            lines = []
+            for chunk in _safe_force_chunks(text, SUBTITLE_CHARS_PER_LINE):
+                chunk = chunk.strip()
+                if chunk:
+                    lines.append(chunk)
+        if not lines:
+            continue
+        pages = [
+            lines[i : i + per_page] for i in range(0, len(lines), per_page)
+        ]
+        weights = [max(1, sum(len(x) for x in page)) for page in pages]
+        total_w = float(sum(weights))
+        dur = end - start
+        t0 = start
+        for i, (page, wt) in enumerate(zip(pages, weights)):
+            if i == len(pages) - 1:
+                t1 = end
+            else:
+                t1 = t0 + dur * (wt / total_w)
+            page_cue = {
+                "start": t0,
+                "end": t1,
+                "text": "".join(page),
+                "lines": list(page),
+            }
+            if cue.get("tts"):
+                page_cue["tts"] = cue.get("tts")
+            out.append(page_cue)
+            t0 = t1
+    return out
+
+
+def create_subtitle_png(
+    text: str,
+    path: Path,
+    *,
+    lines: list[str] | None = None,
+) -> Path:
     """画面下部中央に載せる字幕PNG（透過・縁取り）。"""
     w, h = VIDEO_SIZE
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    font = load_jp_font(52, bold=True)
-    lines = wrap_text_to_width((text or "").strip(), font, int(w * 0.86), draw)[:3]
+    font = load_jp_font(SUBTITLE_FONT_SIZE, bold=True)
+    if lines is None:
+        lines = wrap_text_to_width(
+            (text or "").strip(), font, int(w * 0.86), draw
+        )
+    # 呼び出し側でページ分割済み。万一の溢れは落とさず安全側で上限だけ見る
+    lines = [ln for ln in (lines or []) if ln is not None][:MAX_SUBTITLE_LINES]
     if not lines:
         path.parent.mkdir(parents=True, exist_ok=True)
         img.save(path, format="PNG")
@@ -2627,7 +2713,7 @@ def generate_narration_wav(script: str) -> bytes:
 # 背景画像（Pillow）— YouTubeサムネ風タイトル＋VOICEVOXクレジット
 # ---------------------------------------------------------------------------
 def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
-    """macOS で使える日本語フォントを探す。"""
+    """日本語フォントを探す（macOS / Linux）。"""
     candidates = []
     if bold:
         candidates.extend(
@@ -2635,6 +2721,9 @@ def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
                 "/System/Library/Fonts/ヒラギノ角ゴシック W8.ttc",
                 "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
                 "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
             ]
         )
     candidates.extend(
@@ -2642,6 +2731,11 @@ def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
             "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
             "/Library/Fonts/Arial Unicode.ttf",
+            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         ]
     )
     for path in candidates:
@@ -3527,11 +3621,18 @@ def build_mp4(
     if subtitle_cues:
         sub_dir = subtitle_dir or (output_mp4.parent / "_subs")
         sub_dir.mkdir(parents=True, exist_ok=True)
-        for i, cue in enumerate(subtitle_cues):
+        # 長い一文は複数ページに分け、後半も字幕として出す
+        display_cues = expand_subtitle_cues_for_display(subtitle_cues)
+        for i, cue in enumerate(display_cues):
             start = float(cue.get("start", 0))
             end = float(cue.get("end", 0))
             text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
-            if not text or end <= start:
+            page_lines = cue.get("lines")
+            if isinstance(page_lines, list):
+                page_lines = [str(x) for x in page_lines if str(x).strip() or x == ""]
+            else:
+                page_lines = None
+            if not text and not page_lines:
                 continue
             if start >= duration:
                 continue
@@ -3541,7 +3642,7 @@ def build_mp4(
             if end - start < min_dur:
                 end = min(duration, start + min_dur)
             png = sub_dir / f"sub_{i:05d}.png"
-            create_subtitle_png(text, png)
+            create_subtitle_png(text, png, lines=page_lines)
             sub_clips.append(
                 ImageClip(str(png), ismask=False)
                 .set_start(start)
@@ -3704,9 +3805,9 @@ CHOICE_ACCEPT = "accept"
 CHOICE_REJECT = "reject"
 CHOICE_REVISE = "revise"
 CHOICE_LABELS = {
-    CHOICE_ACCEPT: "①承諾（そのまま反映）",
+    CHOICE_ACCEPT: "①承諾",
     CHOICE_REJECT: "②却下",
-    CHOICE_REVISE: "③別案にて修正",
+    CHOICE_REVISE: "③別案",
 }
 
 
@@ -3742,8 +3843,8 @@ def render_review_section_interactive(
     for i, item in enumerate(items):
         label = item.get("original") or "（箇所）"
         with st.expander(f"{i + 1}. {label}", expanded=(i == 0)):
-            st.write(item.get("issue") or "（なし）")
-            st.write(item.get("suggestion") or "（なし）")
+            st.caption(item.get("issue") or "（なし）")
+            st.caption(item.get("suggestion") or "（なし）")
 
             choice_key = decision_widget_key(section_key, i)
             if choice_key not in st.session_state:
@@ -3755,6 +3856,7 @@ def render_review_section_interactive(
                 format_func=lambda x: CHOICE_LABELS.get(x, x),
                 key=choice_key,
                 horizontal=True,
+                label_visibility="collapsed",
             )
 
             if st.session_state.get(choice_key) == CHOICE_ACCEPT:
@@ -3773,7 +3875,7 @@ def render_review_section_interactive(
                 st.text_area(
                     "別案",
                     key=alt_key,
-                    height=100,
+                    height=80,
                 )
 
 
@@ -4207,7 +4309,7 @@ def run_video_export(progress, pct_box, status) -> None:
 
 
 def inject_app_theme() -> None:
-    """余計な装飾を抑え、読みやすい白背景にする。"""
+    """余計な装飾を抑え、読みやすい白背景にする。選択UIは小さく横並び向き。"""
     st.markdown(
         """
 <style>
@@ -4216,6 +4318,45 @@ def inject_app_theme() -> None:
   [data-testid="stSidebar"] { background: #fafafa; }
   h1, h2, h3, h4 { font-size: 1rem !important; font-weight: 600 !important; }
   div[data-testid="stAlert"] { border: 1px solid #ccc !important; }
+
+  /* 選択ラジオ: 小さく横並び */
+  div[data-testid="stRadio"] > label { font-size: 0.85rem !important; }
+  div[data-testid="stRadio"] div[role="radiogroup"] {
+    gap: 0.35rem 0.55rem !important;
+    flex-wrap: wrap !important;
+  }
+  div[data-testid="stRadio"] div[role="radiogroup"] > label {
+    min-height: 1.6rem !important;
+    padding: 0.1rem 0.45rem !important;
+    font-size: 0.82rem !important;
+    margin-right: 0 !important;
+  }
+  div[data-testid="stRadio"] div[role="radiogroup"] p {
+    font-size: 0.82rem !important;
+  }
+
+  /* ボタン: 小さめ */
+  div[data-testid="stButton"] > button {
+    min-height: 1.85rem !important;
+    padding: 0.15rem 0.65rem !important;
+    font-size: 0.85rem !important;
+  }
+
+  /* 声優・声調・速度などコンパクト欄 */
+  div[data-testid="stSelectbox"] {
+    max-width: 210px !important;
+  }
+  div[data-testid="stSelectbox"] label,
+  div[data-testid="stSlider"] label {
+    font-size: 0.8rem !important;
+  }
+  div[data-testid="stSlider"] {
+    max-width: 240px !important;
+    padding-bottom: 0.15rem !important;
+  }
+  div[data-testid="stSlider"] [data-baseweb="slider"] {
+    margin-top: 0.1rem !important;
+  }
 </style>
         """,
         unsafe_allow_html=True,
@@ -4324,7 +4465,7 @@ def main() -> None:
             else "台本ファイルを取り込む"
         ),
         key="step1_input_mode",
-        horizontal=False,
+        horizontal=True,
         label_visibility="collapsed",
     )
 
@@ -4903,7 +5044,7 @@ def main() -> None:
                         cur_name = default_name
                     name_index = speaker_names.index(cur_name)
 
-                    col_a, col_b = st.columns(2)
+                    col_a, col_b, _spacer = st.columns([1.1, 1.1, 2.3])
                     with col_a:
                         chosen_name = st.selectbox(
                             "声優",
@@ -4971,14 +5112,16 @@ def main() -> None:
             selected_speaker_name = DEFAULT_SPEAKER_NAME
             selected_style_name = DEFAULT_STYLE_NAME
 
-        st.slider(
-            "読み上げ速度",
-            min_value=float(VOICEVOX_SPEED_MIN),
-            max_value=float(VOICEVOX_SPEED_MAX),
-            step=float(VOICEVOX_SPEED_STEP),
-            key="vvox_speed_scale",
-            format="%.1f倍",
-        )
+        speed_col, _speed_spacer = st.columns([1.4, 3.1])
+        with speed_col:
+            st.slider(
+                "速度",
+                min_value=float(VOICEVOX_SPEED_MIN),
+                max_value=float(VOICEVOX_SPEED_MAX),
+                step=float(VOICEVOX_SPEED_STEP),
+                key="vvox_speed_scale",
+                format="%.1f倍",
+            )
 
         # ----- ④ エンディング画面の確認・修正 -----
         st.write("エンディング")
@@ -5016,12 +5159,13 @@ def main() -> None:
             "背景の有無",
             options=["draft", "final"],
             format_func=lambda x: (
-                "A/B. ドラフト（背景なし・読み確認用）"
+                "ドラフト（背景なし）"
                 if x == "draft"
-                else "C. 最終版（背景あり）"
+                else "最終版（背景あり）"
             ),
             key="video_export_mode",
-            horizontal=False,
+            horizontal=True,
+            label_visibility="collapsed",
         )
         st.caption(
             "最初と読み直しのあいだはドラフト。"
