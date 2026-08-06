@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import re
 import shutil
 import struct
+import subprocess
 import tempfile
 import wave
 from datetime import datetime
@@ -1297,7 +1299,7 @@ def build_drama_script_prompt(paper_text: str) -> str:
 ③ 読み上げる台本本文以外は一切書かない。タイトル見出し、サブタイトル、シーン番号、「注釈」「解説」「制作メモ」、私への説明、前置き、後書き、Markdown記法は禁止。
 ④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
 ⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。ただし台本本文で視聴者に呼びかけない。「研修医のみなさん」「みなさん」「皆さん」などへの呼びかける表現は禁止（難易度の目安と、台詞・ナレーションの相手は別）。
-⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。ただし単位は原文の表記をそのまま使う（例: mg/dL, mEq/L, g/dL, IU/L）。単位を日本語訳や別表記に変えない。
+⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。ただし単位は原文の表記をそのまま使う（例: mg/dL, mEq/L, g/dL, IU/L）。単位を日本語訳や別表記に変えない。数字と単位のあいだにスペースを入れない（正しい例: 120mg/dL、3.5mEq/L／禁止例: 120 mg/dL、3.5 mEq/L）。
 ⑦ 薬物名はアルファベットでもカタカナでもよい（例: vancomycin / バンコマイシン）。漢字訳にはしない。
 ⑧ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
 ⑨ 登場人物のセリフには必ずカギ括弧「」を付ける。
@@ -1419,6 +1421,7 @@ def polish_drama_script_medically(script: str, api_key: str) -> str:
 - セリフの「」、列挙の読点ルールは崩さない
 - 鑑別診断の診断名を列挙するときは読点「、」で区切り、句点「。」では区切らない（文末の一句点だけ可）
 - 検査値の単位は原文表記のまま（mg/dL, mEq/L など）。単位を書き換えない
+- 検査値は「数字＋単位」をくっつけて書く（スペースなし。例: 120mg/dL。禁止: 120 mg/dL）
 - 薬物名はアルファベットでもカタカナでもよい（漢字訳にはしない）
 - 改行・改ページは原則として句読点の直後。単語・単位・薬物名の途中では切らない
 - すでに付いているルビ ｛用語｜よみ｝ は削除しない（新規には付けない）
@@ -3262,6 +3265,60 @@ def create_plain_scene_frame(path: Path) -> Path:
     return path
 
 
+def ensure_done_chime_wav() -> Path:
+    """
+    短い『ポーン』通知音のWAVを作る（または再利用する）。
+    追加ソフトは不要。単純な減衰サイン波。
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / "done_chime.wav"
+    if path.is_file() and path.stat().st_size > 2000:
+        return path
+
+    rate = 22050
+    duration = 0.85
+    n = int(rate * duration)
+    # やや高めの「ポーン」→少し下がる感じ
+    frames = bytearray()
+    for i in range(n):
+        t = i / rate
+        # 周波数を 880Hz → 660Hz へなだらかに下げる
+        freq = 880.0 - 220.0 * min(1.0, t / 0.55)
+        # 立ち上がりを少し遅らせ、後半で減衰
+        attack = min(1.0, t / 0.02)
+        decay = math.exp(-2.8 * t)
+        amp = 0.35 * attack * decay
+        sample = int(max(-32767, min(32767, amp * 32767 * math.sin(2 * math.pi * freq * t))))
+        frames += struct.pack("<h", sample)
+
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+    return path
+
+
+def play_done_chime() -> None:
+    """
+    MP4完成を知らせる『ポーン』音を鳴らす。
+    このアプリは同じMac上で動かす想定なので、macOSの afplay を使う。
+    """
+    try:
+        wav = ensure_done_chime_wav()
+    except Exception:
+        return
+    try:
+        subprocess.Popen(
+            ["afplay", str(wav)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # 音が出せなくても動画作成自体は成功扱い
+        pass
+
+
 def create_background_image(
     path: Path,
     title: str = "",
@@ -4065,6 +4122,8 @@ def run_video_export(progress, pct_box, status) -> None:
         else:
             _pct(100, f"完了・{mode_label}")
         status.success(f"完了（{mode_label}）: {desktop_path}")
+        # 完成を耳で知らせる（ポーン）
+        play_done_chime()
 
 
 def inject_app_theme() -> None:
