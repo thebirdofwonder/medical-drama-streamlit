@@ -115,6 +115,78 @@ def make_script_docx_filename(title: str = "") -> str:
     return f"{make_title_basename(title)}.docx"
 
 
+def make_desktop_script_basename(
+    title: str = "",
+    *,
+    kind: str = "plain",
+) -> str:
+    """デスクトップ保存用の台本ファイル名（拡張子なし）。kind: plain / ruby"""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    label = "plain" if kind == "plain" else "ruby"
+    return f"{make_title_basename(title)}_{label}_{stamp}"
+
+
+def save_script_to_desktop(
+    text: str,
+    title: str = "",
+    *,
+    kind: str = "plain",
+) -> tuple[Path, Path]:
+    """
+    台本をデスクトップへ .txt と .docx で保存する。
+    kind=plain … ルビなし確認用 / kind=ruby … ルビあり修正稿
+    戻り値: (txtパス, docxパス)
+    """
+    body = (text or "").strip()
+    if not body:
+        raise ValueError("保存する台本が空です。")
+    desktop = get_desktop_dir()
+    base = make_desktop_script_basename(title, kind=kind)
+    txt_path = desktop / f"{base}.txt"
+    docx_path = desktop / f"{base}.docx"
+    txt_path.write_text(body + "\n", encoding="utf-8")
+    docx_path.write_bytes(text_to_docx_bytes(body))
+    return txt_path, docx_path
+
+
+def prepare_plain_script_for_video(edited: str) -> str:
+    """
+    最初の確認用: ルビを外した平文台本にする。
+    （読み・抑揚の確認は、このあとルビあり台本で繰り返す）
+    """
+    plain = strip_voicevox_ruby(edited or "").strip()
+    return plain
+
+
+def advance_to_video_with_plain_script(edited: str) -> tuple[Path, Path]:
+    """
+    台本確定 → ルビなしのまま動画作成へ進める。
+    デスクトップにルビなし台本を保存し、パスを返す。
+    """
+    plain = prepare_plain_script_for_video(edited)
+    if not plain:
+        raise ValueError("最終台本が空です。")
+    title = str(st.session_state.get("video_title") or "").strip()
+    txt_path, docx_path = save_script_to_desktop(plain, title, kind="plain")
+    st.session_state.final_script = plain
+    st.session_state.final_script_editor = plain
+    st.session_state.raw_script = plain
+    st.session_state.script_confirmed = True
+    st.session_state.ruby_script = plain
+    st.session_state.ruby_script_baseline = plain
+    st.session_state.ruby_ready = True
+    st.session_state.ruby_skipped = True
+    st.session_state.video_export_mode = "draft"
+    st.session_state.last_plain_script_txt = str(txt_path)
+    st.session_state.last_plain_script_docx = str(docx_path)
+    # 新しい確認サイクルなので、前回の完成動画は消す
+    st.session_state.mp4_bytes = None
+    st.session_state.mp4_path = ""
+    st.session_state.last_video_export_mode = None
+    st.session_state.pop("ruby_script_editor", None)
+    st.session_state.pop("raw_script_editor_widget", None)
+    return txt_path, docx_path
+
 def load_saved_reference_text() -> str:
     """前回保存した参考文献を読み込む。"""
     try:
@@ -3876,6 +3948,11 @@ def init_state() -> None:
         "last_script_name": "medical_drama.docx",
         "video_encoding": False,
         "video_export_mode": "draft",  # draft=背景なし / final=背景あり
+        "last_video_export_mode": None,  # 直近に完成した draft / final
+        "last_plain_script_txt": "",
+        "last_plain_script_docx": "",
+        "last_ruby_script_txt": "",
+        "last_ruby_script_docx": "",
         "_export_job": None,
         "review_apply_log": [],
         "review_manual_log": [],
@@ -3955,12 +4032,12 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
     )
     _pct(2, "台本を準備中…")
-    # 直前工程で確定したルビ入り原稿を使う（ここで辞書ルビを付け直さない）
+    # 確定済み台本を使う（ルビなしでも可。ルビありならその読みで音声化）
     voice_script = canonicalize_voicevox_ruby_delimiters(
         str(st.session_state.get("ruby_script") or st.session_state.get("final_script") or "")
     ).strip()
     if not voice_script:
-        raise RuntimeError("ルビ入り原稿が空です。先にルビ準備を完了してください。")
+        raise RuntimeError("台本が空です。先に台本を確定してください。")
     ruby_count = count_voicevox_ruby(voice_script)
 
     save_reference_text(st.session_state.get("reference_text", ""))
@@ -4110,6 +4187,9 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.mp4_path = str(desktop_path)
         st.session_state.mp4_name = desktop_name
         st.session_state.mp4_bytes = None
+        st.session_state.last_video_export_mode = (
+            "final" if include_background else "draft"
+        )
         # ルビ入り最終原稿 ↔ 辞書を比較し、足りないルビを追加
         _pct(99, "ルビ辞書を更新中…")
         applied = sync_script_rubies_into_dictionary(voice_script)
@@ -4461,21 +4541,25 @@ def main() -> None:
                 height=320,
                 key="final_script_editor_widget",
             )
-            if st.button("2. 確定してルビ準備へ", type="primary", key="btn_confirm_skip"):
+            if st.button("2. 確定して動画作成へ", type="primary", key="btn_confirm_skip"):
                 edited = normalize_script_keeping_ruby(
                     (st.session_state.get("final_script_editor_widget") or "").strip()
                 )
                 if not edited:
                     st.error("最終台本が空です。")
                 else:
-                    st.session_state.final_script = edited
-                    st.session_state.final_script_editor = edited
-                    st.session_state.raw_script = edited
-                    st.session_state.script_confirmed = True
-                    st.session_state.ruby_ready = False
-                    st.session_state.ruby_script = ""
-                    st.session_state.pop("ruby_script_editor", None)
-                    st.rerun()
+                    try:
+                        txt_path, docx_path = advance_to_video_with_plain_script(
+                            edited
+                        )
+                        st.success(
+                            "ルビなし台本を確定し、デスクトップへ保存しました。\n"
+                            f"- `{txt_path.name}`\n"
+                            f"- `{docx_path.name}`"
+                        )
+                        st.rerun()
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"台本の保存に失敗しました: {e}")
 
         elif st.session_state.review:
             st.write("2. レビュー")
@@ -4537,7 +4621,7 @@ def main() -> None:
             )
 
             if st.button(
-                "2. 確定してルビ準備へ",
+                "2. 確定して動画作成へ",
                 type="primary",
                 key="btn_confirm_review",
             ):
@@ -4547,173 +4631,164 @@ def main() -> None:
                 if not edited:
                     st.error("最終台本が空です。")
                 else:
-                    st.session_state.final_script = edited
-                    st.session_state.final_script_editor = edited
-                    st.session_state.raw_script = edited
-                    st.session_state.script_confirmed = True
-                    st.session_state.ruby_ready = False
-                    st.session_state.ruby_script = ""
-                    st.session_state.pop("ruby_script_editor", None)
-                    st.rerun()
+                    try:
+                        txt_path, docx_path = advance_to_video_with_plain_script(
+                            edited
+                        )
+                        st.success(
+                            "ルビなし台本を確定し、デスクトップへ保存しました。\n"
+                            f"- `{txt_path.name}`\n"
+                            f"- `{docx_path.name}`"
+                        )
+                        st.rerun()
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"台本の保存に失敗しました: {e}")
 
-    # ----- Step 3: ルビ準備 → 動画生成 -----
+    # ----- Step 3: 動画作成（ルビなし確認 → ルビあり修正 → 最終版） -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
         render_video_title_input()
 
-        st.write("ルビ準備（動画の直前）")
-        st.caption("①辞書 → ②ルビ作成（またはルビなしで進む）→ ③修正 → 確定、のあと動画へ")
+        voice_now = str(
+            st.session_state.get("ruby_script")
+            or st.session_state.get("final_script")
+            or ""
+        ).strip()
+        n_ruby_now = count_voicevox_ruby(voice_now)
+        mode_now = str(st.session_state.get("video_export_mode") or "draft")
 
-        # ① 辞書読み込み
-        st.write("① 辞書読み込み")
-        dict_file = st.file_uploader(
-            "追加辞書（.tsv / .txt / .csv）",
-            type=["tsv", "txt", "csv"],
-            key="ruby_dict_upload",
+        st.write("作業の流れ")
+        st.markdown(
+            """
+1. **A. 最初の確認** … ルビなし台本で、ドラフトMP4（背景なし）を作る  
+2. **B. 読み直し** … 読み・抑揚を直した「ルビあり台本」を上げて、ドラフトを作り直す  
+3. **C. 仕上げ** … 読みが固まったら、最終版（背景あり）を作る  
+            """.strip()
         )
-        if dict_file is not None:
-            try:
-                raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
-                pairs = parse_ruby_dict_text(raw_dict)
-                if not pairs:
-                    st.warning("辞書から用語を読み取れませんでした。")
-                else:
-                    file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
-                    if st.session_state.get("_ruby_dict_file_id") != file_id:
-                        st.session_state.ruby_dict_custom = pairs
-                        st.session_state.ruby_dict_source_name = dict_file.name
-                        st.session_state._ruby_dict_file_id = file_id
-                        st.session_state.ruby_ready = False
-                        st.success(
-                            f"追加辞書: {dict_file.name}（{len(pairs)} 語）"
-                        )
-            except Exception as e:  # noqa: BLE001
-                st.error(f"辞書の読込失敗: {e}")
-        active_n = len(get_active_ruby_dictionary())
-        src_name = st.session_state.get("ruby_dict_source_name") or (
-            RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
-        )
-        learned_n = len(st.session_state.get("ruby_dict_learned") or [])
-        st.caption(
-            f"辞書: 標準 + {src_name}（{active_n} 語"
-            + (f"・修正反映 {learned_n} 語" if learned_n else "")
-            + "）"
-        )
-        if st.session_state.get("ruby_dict_export_ready") and RUBY_DICT_EXPORT_PATH.is_file():
-            st.download_button(
-                "ルビ辞書.txt をダウンロード",
-                data=RUBY_DICT_EXPORT_PATH.read_bytes(),
-                file_name=RUBY_DICT_EXPORT_NAME,
-                mime="text/plain",
-                key="dl_ruby_dict_pre_video",
-            )
-
-        # ② ルビ入り原稿を作成（スキップ可）
-        st.write("② ルビ入り原稿を作成")
-        col_ruby_on, col_ruby_skip = st.columns(2)
-        with col_ruby_on:
-            apply_ruby_clicked = st.button(
-                "辞書でルビを付ける",
-                type="primary",
-                key="btn_apply_dict_ruby_pre_video",
-                use_container_width=True,
-            )
-        with col_ruby_skip:
-            skip_ruby_clicked = st.button(
-                "ルビなしで進む",
-                key="btn_skip_ruby_pre_video",
-                use_container_width=True,
-            )
-
-        if apply_ruby_clicked:
-            # 既存ルビは消さず、辞書ルビを足す
-            base = normalize_script_keeping_ruby(
-                st.session_state.get("final_script") or ""
-            )
-            if not base:
-                st.error("原稿が空です。先に台本を確定してください。")
-            else:
-                with st.spinner("辞書でルビを付けています…"):
-                    ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(base)
-                st.session_state.ruby_script = ruby_script
-                st.session_state.ruby_script_baseline = ruby_script
-                st.session_state.pop("ruby_script_editor", None)
-                st.session_state.ruby_ready = False
-                st.session_state.ruby_skipped = False
-                st.rerun()
-
-        if skip_ruby_clicked:
-            # 既存ルビがあればそのまま残す
-            base = normalize_script_keeping_ruby(
-                st.session_state.get("final_script") or ""
-            )
-            if not base:
-                st.error("原稿が空です。先に台本を確定してください。")
-            else:
-                st.session_state.ruby_script = base
-                st.session_state.ruby_script_baseline = base
-                st.session_state.pop("ruby_script_editor", None)
-                st.session_state.ruby_ready = True
-                st.session_state.ruby_skipped = not bool(count_voicevox_ruby(base))
-                st.session_state.ruby_dict_last_updates = []
-                st.rerun()
-
-        # ③ ルビ入り原稿を修正（確定後も上書き可）
-        st.write("③ ルビ入り原稿を修正")
-        has_ruby_draft = bool(
-            (st.session_state.get("ruby_script") or "").strip()
-            or (st.session_state.get("ruby_script_editor") or "").strip()
-        )
-        if not has_ruby_draft:
-            st.info("②でルビを付けたあと、ここで直して確定します。")
+        if n_ruby_now:
+            st.caption(f"いまの台本: ルビあり（{n_ruby_now} 件）／動画種類の初期値: {mode_now}")
         else:
+            st.caption("いまの台本: ルビなし／最初はドラフト（背景なし）で確認します")
+
+        plain_txt = st.session_state.get("last_plain_script_txt") or ""
+        if plain_txt and Path(plain_txt).exists():
+            st.caption(f"デスクトップのルビなし台本: `{Path(plain_txt).name}`")
+
+        # 任意: アプリ内で辞書ルビを付ける（通常はデスクトップで直して上げる）
+        with st.expander("（任意）アプリ内でルビを付ける・直す", expanded=False):
+            st.caption(
+                "普段はデスクトップのルビなし台本を直し、ルビあり台本をアップロードします。"
+                "ここはアプリ内だけでルビを試すときの補助です。"
+            )
+            dict_file = st.file_uploader(
+                "追加辞書（.tsv / .txt / .csv）",
+                type=["tsv", "txt", "csv"],
+                key="ruby_dict_upload",
+            )
+            if dict_file is not None:
+                try:
+                    raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
+                    pairs = parse_ruby_dict_text(raw_dict)
+                    if not pairs:
+                        st.warning("辞書から用語を読み取れませんでした。")
+                    else:
+                        file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
+                        if st.session_state.get("_ruby_dict_file_id") != file_id:
+                            st.session_state.ruby_dict_custom = pairs
+                            st.session_state.ruby_dict_source_name = dict_file.name
+                            st.session_state._ruby_dict_file_id = file_id
+                            st.success(
+                                f"追加辞書: {dict_file.name}（{len(pairs)} 語）"
+                            )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"辞書の読込失敗: {e}")
+            active_n = len(get_active_ruby_dictionary())
+            src_name = st.session_state.get("ruby_dict_source_name") or (
+                RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
+            )
+            learned_n = len(st.session_state.get("ruby_dict_learned") or [])
+            st.caption(
+                f"辞書: 標準 + {src_name}（{active_n} 語"
+                + (f"・修正反映 {learned_n} 語" if learned_n else "")
+                + "）"
+            )
+            if st.session_state.get("ruby_dict_export_ready") and RUBY_DICT_EXPORT_PATH.is_file():
+                st.download_button(
+                    "ルビ辞書.txt をダウンロード",
+                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
+                    file_name=RUBY_DICT_EXPORT_NAME,
+                    mime="text/plain",
+                    key="dl_ruby_dict_pre_video",
+                )
+
+            col_ruby_on, col_ruby_skip = st.columns(2)
+            with col_ruby_on:
+                apply_ruby_clicked = st.button(
+                    "辞書でルビを付ける",
+                    type="secondary",
+                    key="btn_apply_dict_ruby_pre_video",
+                    use_container_width=True,
+                )
+            with col_ruby_skip:
+                skip_ruby_clicked = st.button(
+                    "ルビなしのままにする",
+                    key="btn_skip_ruby_pre_video",
+                    use_container_width=True,
+                )
+
+            if apply_ruby_clicked:
+                base = normalize_script_keeping_ruby(
+                    st.session_state.get("final_script") or ""
+                )
+                if not base:
+                    st.error("原稿が空です。先に台本を確定してください。")
+                else:
+                    with st.spinner("辞書でルビを付けています…"):
+                        ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(base)
+                    st.session_state.ruby_script = ruby_script
+                    st.session_state.ruby_script_baseline = ruby_script
+                    st.session_state.pop("ruby_script_editor", None)
+                    st.session_state.ruby_ready = True
+                    st.session_state.ruby_skipped = False
+                    st.session_state.video_export_mode = "draft"
+                    st.rerun()
+
+            if skip_ruby_clicked:
+                base = prepare_plain_script_for_video(
+                    st.session_state.get("final_script") or ""
+                )
+                if not base:
+                    st.error("原稿が空です。先に台本を確定してください。")
+                else:
+                    st.session_state.ruby_script = base
+                    st.session_state.ruby_script_baseline = base
+                    st.session_state.pop("ruby_script_editor", None)
+                    st.session_state.ruby_ready = True
+                    st.session_state.ruby_skipped = True
+                    st.session_state.ruby_dict_last_updates = []
+                    st.session_state.video_export_mode = "draft"
+                    st.rerun()
+
             if "ruby_script_editor" not in st.session_state:
                 st.session_state.ruby_script_editor = (
-                    st.session_state.get("ruby_script") or ""
+                    st.session_state.get("ruby_script")
+                    or st.session_state.get("final_script")
+                    or ""
                 )
-            elif st.session_state.get("ruby_ready") and not (
-                st.session_state.get("ruby_script_editor") or ""
-            ).strip():
-                st.session_state.ruby_script_editor = (
-                    st.session_state.get("ruby_script") or ""
-                )
-
-            if st.session_state.get("ruby_ready"):
-                n_ruby = count_voicevox_ruby(
-                    st.session_state.get("ruby_script") or ""
-                )
-                if st.session_state.get("ruby_skipped"):
-                    st.write("確定済み（ルビなしで進行）。必要なら下の欄で追記・上書きできます。")
-                else:
-                    st.write(f"確定済み（ルビ {n_ruby} 件）。下の欄で上書きできます。")
-                last_updates = st.session_state.get("ruby_dict_last_updates") or []
-                if last_updates:
-                    st.caption(
-                        "辞書に反映した修正: "
-                        + "、".join(f"{s}→{r}" for s, r in last_updates[:12])
-                        + ("…" if len(last_updates) > 12 else "")
-                    )
-
             st.text_area(
-                "ルビ入り原稿（編集・上書き可）",
-                height=320,
+                "台本（編集・上書き可）",
+                height=240,
                 key="ruby_script_editor",
             )
-            confirm_label = (
-                "上書きして確定"
-                if st.session_state.get("ruby_ready")
-                else "ルビ入り原稿を確定して動画設定へ"
-            )
             if st.button(
-                confirm_label,
-                type="primary",
+                "この内容で台本を上書き確定",
                 key="btn_confirm_ruby_script",
             ):
                 edited_ruby = normalize_script_keeping_ruby(
                     st.session_state.get("ruby_script_editor") or ""
                 )
                 if not edited_ruby:
-                    st.error("ルビ入り原稿が空です。")
+                    st.error("台本が空です。")
                 else:
                     baseline = str(
                         st.session_state.get("ruby_script_baseline")
@@ -4723,30 +4798,17 @@ def main() -> None:
                     updates = find_ruby_dict_updates(baseline, edited_ruby)
                     applied = apply_ruby_updates_to_learned_dict(updates)
                     st.session_state.ruby_script = edited_ruby
-                    # ruby_script_editor は text_area の key なので、ここでは書き換えない
                     st.session_state.ruby_ready = True
-                    st.session_state.ruby_skipped = False
+                    st.session_state.ruby_skipped = not bool(
+                        count_voicevox_ruby(edited_ruby)
+                    )
                     st.session_state.ruby_dict_last_updates = applied
+                    st.session_state.video_export_mode = "draft"
                     st.rerun()
 
-            if RUBY_DICT_EXPORT_PATH.is_file():
-                st.download_button(
-                    "ルビ辞書.txt をダウンロード",
-                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
-                    file_name=RUBY_DICT_EXPORT_NAME,
-                    mime="text/plain",
-                    key="dl_ruby_dict_after_confirm",
-                )
-            if st.session_state.get("ruby_ready") and st.button(
-                "ルビ準備をやり直す",
-                key="btn_reset_ruby_ready",
-            ):
-                st.session_state.ruby_ready = False
-                st.session_state.ruby_skipped = False
-                st.rerun()
-
-        if not st.session_state.get("ruby_ready"):
-            st.caption("①②③が終わるまで、動画生成には進めません。")
+        # 台本が空なら止める（ルビの有無は問わない）
+        if not voice_now:
+            st.warning("台本が空です。Step 2 で台本を確定してください。")
             st.stop()
 
         st.write("参考文献")
@@ -4954,19 +5016,24 @@ def main() -> None:
             "背景の有無",
             options=["draft", "final"],
             format_func=lambda x: (
-                "ドラフト（背景なし・台本確認用）"
+                "A/B. ドラフト（背景なし・読み確認用）"
                 if x == "draft"
-                else "最終版（背景あり）"
+                else "C. 最終版（背景あり）"
             ),
             key="video_export_mode",
             horizontal=False,
         )
         st.caption(
-            "ドラフトは黒い画面＋字幕＋音声だけです。"
-            "最終版台本が固まったら、背景ありを選んでください。"
+            "最初と読み直しのあいだはドラフト。"
+            "読み・抑揚が固まったら最終版（背景あり）を選んでください。"
         )
 
-        if st.button("3. 動画を生成する", type="primary"):
+        gen_label = (
+            "3. ドラフトMP4を作成する（背景なし）"
+            if str(st.session_state.get("video_export_mode") or "draft") == "draft"
+            else "3. 最終版MP4を作成する（背景あり）"
+        )
+        if st.button(gen_label, type="primary"):
             # 次の描画で作業専用画面にし、他ボタンを出さない
             st.session_state.video_encoding = True
             st.session_state._export_job = "pending"
@@ -4978,7 +5045,25 @@ def main() -> None:
         mp4_path = st.session_state.get("mp4_path") or ""
         if mp4_path and Path(mp4_path).exists():
             size_mb = Path(mp4_path).stat().st_size / (1024 * 1024)
+            used_script = str(
+                st.session_state.get("ruby_script")
+                or st.session_state.get("final_script")
+                or ""
+            )
+            used_ruby_n = count_voicevox_ruby(used_script)
+            last_mode = str(
+                st.session_state.get("last_video_export_mode")
+                or st.session_state.get("video_export_mode")
+                or "draft"
+            )
+            script_kind = "ルビあり" if used_ruby_n else "ルビなし"
+            mode_kind = (
+                "最終版（背景あり）"
+                if last_mode == "final"
+                else "ドラフト（背景なし）"
+            )
             st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
+            st.caption(f"今回の台本: {script_kind}／動画: {mode_kind}")
             # 大きいMP4を毎回メモリに載せると落ちやすいので上限を設ける
             if size_mb < 180:
                 st.download_button(
@@ -5038,53 +5123,132 @@ def main() -> None:
                     key="dl_ruby_dict_after_video",
                 )
 
-            # 次の原稿 → もう一度 MP4 を作るループ
-            st.write("次の動画")
-            next_script = st.file_uploader(
-                "次の原稿（.txt / .docx）",
-                type=["txt", "docx"],
-                key="next_loop_script_upload",
+            # B: ルビあり台本を上げてドラフト再作成 / C: 最終版
+            st.write("読み直し・仕上げ")
+            st.caption(
+                "MP4を聞いて読み・抑揚を直した「ルビあり台本」を上げ、"
+                "ドラフトを作り直します。固まったら最終版へ。"
             )
-            if st.button(
-                "この原稿で次の動画を作る",
-                type="primary",
-                key="btn_next_video_loop",
-            ):
-                if next_script is None:
-                    st.error("原稿ファイル（.txt または .docx）を選んでください。")
-                else:
+            ruby_upload = st.file_uploader(
+                "ルビあり台本（.txt / .docx）",
+                type=["txt", "docx"],
+                key="ruby_loop_script_upload",
+            )
+            if ruby_upload is not None:
+                file_id = f"{ruby_upload.name}-{ruby_upload.size}"
+                if st.session_state.get("_ruby_loop_file_id") != file_id:
                     try:
-                        loaded = load_text_from_upload(next_script).strip()
+                        loaded = load_text_from_upload(ruby_upload).strip()
                         script = normalize_script_keeping_ruby(loaded)
                         if not script:
-                            st.error("原稿が空でした。")
+                            st.error("台本が空でした。")
                         else:
-                            commit_loaded_script(
-                                script,
-                                f"loop-{next_script.name}-{len(script)}",
+                            title = str(
+                                st.session_state.get("video_title") or ""
+                            ).strip()
+                            txt_p, docx_p = save_script_to_desktop(
+                                script, title, kind="ruby"
                             )
-                            # レビューを飛ばしてルビ準備へ（ループ用）
-                            st.session_state.review_done = True
-                            st.session_state.skip_review = True
-                            st.session_state.script_confirmed = True
-                            st.session_state.ruby_ready = False
-                            st.session_state.ruby_skipped = False
-                            # 既存ルビがあればルビ原稿としても保持
                             st.session_state.ruby_script = script
                             st.session_state.ruby_script_baseline = script
+                            st.session_state.ruby_ready = True
+                            st.session_state.ruby_skipped = not bool(
+                                count_voicevox_ruby(script)
+                            )
+                            st.session_state.final_script = (
+                                strip_voicevox_ruby(script).strip() or script
+                            )
                             st.session_state.pop("ruby_script_editor", None)
-                            st.session_state.mp4_bytes = None
-                            st.session_state.mp4_path = ""
-                            st.session_state.final_script = script
-                            st.session_state.final_script_editor = script
-                            st.session_state.pop("final_script_editor_widget", None)
+                            st.session_state.video_export_mode = "draft"
+                            st.session_state.last_ruby_script_txt = str(txt_p)
+                            st.session_state.last_ruby_script_docx = str(docx_p)
+                            st.session_state._ruby_loop_file_id = file_id
                             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                             (OUTPUT_DIR / "last_script.txt").write_text(
                                 script, encoding="utf-8"
                             )
+                            st.success(
+                                "ルビあり台本を取り込み、デスクトップへ保存しました。"
+                                f"\n- `{txt_p.name}`\n- `{docx_p.name}`\n"
+                                "下の「ドラフトMP4を再作成」を押してください。"
+                            )
                             st.rerun()
                     except Exception as e:  # noqa: BLE001
-                        st.error(f"原稿の取り込みに失敗しました: {e}")
+                        st.error(f"ルビあり台本の取り込みに失敗しました: {e}")
+            ruby_saved = st.session_state.get("last_ruby_script_txt") or ""
+            if ruby_saved and Path(ruby_saved).exists():
+                st.caption(
+                    f"デスクトップのルビあり台本: `{Path(ruby_saved).name}`"
+                )
+
+            col_redraft, col_final = st.columns(2)
+            with col_redraft:
+                if st.button(
+                    "ドラフトMP4を再作成（背景なし）",
+                    type="primary",
+                    key="btn_recreate_draft_mp4",
+                    use_container_width=True,
+                ):
+                    st.session_state.video_export_mode = "draft"
+                    st.session_state.video_encoding = True
+                    st.session_state._export_job = "pending"
+                    st.session_state.ruby_dict_post_video_updates = []
+                    st.session_state.export_progress_pct = 0
+                    st.session_state.export_progress_msg = ""
+                    st.rerun()
+            with col_final:
+                if st.button(
+                    "最終版MP4を作成（背景あり）",
+                    type="secondary",
+                    key="btn_create_final_mp4",
+                    use_container_width=True,
+                ):
+                    st.session_state.video_export_mode = "final"
+                    st.session_state.video_encoding = True
+                    st.session_state._export_job = "pending"
+                    st.session_state.ruby_dict_post_video_updates = []
+                    st.session_state.export_progress_pct = 0
+                    st.session_state.export_progress_msg = ""
+                    st.rerun()
+
+            # 別作品用の次原稿（レビューからやり直し）
+            with st.expander("別の原稿で新しい動画を始める", expanded=False):
+                next_script = st.file_uploader(
+                    "次の原稿（.txt / .docx）",
+                    type=["txt", "docx"],
+                    key="next_loop_script_upload",
+                )
+                if st.button(
+                    "この原稿で最初から作り直す",
+                    key="btn_next_video_loop",
+                ):
+                    if next_script is None:
+                        st.error("原稿ファイル（.txt または .docx）を選んでください。")
+                    else:
+                        try:
+                            loaded = load_text_from_upload(next_script).strip()
+                            script = normalize_script_keeping_ruby(loaded)
+                            if not script:
+                                st.error("原稿が空でした。")
+                            else:
+                                commit_loaded_script(
+                                    script,
+                                    f"loop-{next_script.name}-{len(script)}",
+                                )
+                                st.session_state.review_done = True
+                                st.session_state.skip_review = True
+                                # ルビなし確定と同じ流れへ
+                                advance_to_video_with_plain_script(script)
+                                st.session_state.mp4_bytes = None
+                                st.session_state.mp4_path = ""
+                                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                                (OUTPUT_DIR / "last_script.txt").write_text(
+                                    st.session_state.final_script,
+                                    encoding="utf-8",
+                                )
+                                st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"原稿の取り込みに失敗しました: {e}")
         elif st.session_state.mp4_bytes:
             st.download_button(
                 label="MP4をダウンロード",
