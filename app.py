@@ -1791,28 +1791,62 @@ def update_export_progress(
     pct: int,
     message: str = "",
 ) -> None:
-    """進捗バーと％数字を同時に更新する（画面中央付近で大きく表示）。"""
+    """進捗バーと％数字を同時に更新する（作成中画面で大きく表示）。"""
     n = max(0, min(100, int(pct)))
     msg = (message or "").strip()
     bar_text = f"{n}%"
     if msg:
         bar_text = f"{n}%  {msg}"
-    # Streamlit 1.50+: バー上にも％を出す
-    try:
-        progress.progress(n, text=bar_text)
-    except TypeError:
-        progress.progress(n / 100.0 if n <= 100 else 1.0)
+
+    # Streamlit 標準バー（対応バージョンなら text 付き）
+    if progress is not None:
+        try:
+            progress.progress(n, text=bar_text)
+        except TypeError:
+            try:
+                progress.progress(n / 100.0)
+            except Exception:
+                progress.progress(min(max(n / 100.0, 0.0), 1.0))
+
+    # 大きく見やすい自前バー（標準バーが細い環境でも進捗が分かる）
+    safe_msg = msg.replace("<", "&lt;").replace(">", "&gt;")
     pct_box.markdown(
-        f'<div style="font-size:2.4rem;font-weight:700;line-height:1.2;'
-        f'margin:0.4rem 0 0.2rem 0;color:#111;">進捗 {n}%</div>',
+        f"""
+<div style="margin:0.6rem 0 0.35rem 0;">
+  <div style="font-size:1.8rem;font-weight:700;color:#111;line-height:1.2;">
+    進捗 {n}%
+  </div>
+  <div style="margin-top:0.55rem;background:#e5e7eb;border-radius:999px;height:22px;overflow:hidden;border:1px solid #d1d5db;">
+    <div style="width:{n}%;height:100%;background:linear-gradient(90deg,#2563eb,#38bdf8);transition:width 0.2s ease;"></div>
+  </div>
+  <div style="margin-top:0.4rem;font-size:1rem;color:#333;">
+    {safe_msg if safe_msg else "処理中…"}
+  </div>
+</div>
+        """.strip(),
         unsafe_allow_html=True,
     )
-    if msg:
-        status.info(f"{n}% — {msg}")
-    else:
-        status.info(f"{n}%")
+    if status is not None:
+        if msg:
+            status.info(f"{n}% — {msg}")
+        else:
+            status.info(f"{n}%")
     st.session_state.export_progress_pct = n
     st.session_state.export_progress_msg = msg
+
+
+def make_export_progress_widgets():
+    """MP4作成画面用の進捗ウィジェットを作る。"""
+    st.markdown("### MP4作成の進捗")
+    st.caption("完了するまでこのページを閉じないでください。")
+    try:
+        progress = st.progress(0, text="0%  準備中…")
+    except TypeError:
+        progress = st.progress(0)
+    pct_box = st.empty()
+    status = st.empty()
+    update_export_progress(progress, pct_box, status, 0, "準備中…")
+    return progress, pct_box, status
 
 
 def heuristic_review(script: str) -> dict[str, Any]:
@@ -4422,11 +4456,6 @@ def main() -> None:
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
         st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
-        st.markdown(
-            '<div style="font-size:1.2rem;margin-bottom:0.5rem;">'
-            "作業の進捗（パーセント）</div>",
-            unsafe_allow_html=True,
-        )
         if st.button("中止して通常画面に戻る", key="btn_cancel_video_encoding"):
             st.session_state.video_encoding = False
             st.session_state._export_job = None
@@ -4438,20 +4467,24 @@ def main() -> None:
             job = "running"
         # Stop などで中断されたあと：自動再開せず、再開／中止を選ばせる
         if job == "running":
+            # 中断時も、直前までの進捗バーを見せる
+            last_pct = int(st.session_state.get("export_progress_pct") or 0)
+            last_msg = str(st.session_state.get("export_progress_msg") or "中断されました")
+            progress, pct_box, status = make_export_progress_widgets()
+            update_export_progress(progress, pct_box, status, last_pct, last_msg)
             st.error("前回の作成が中断されたか、作成モードのまま残っています。")
             if st.button("最初から再開する", type="primary", key="btn_restart_export"):
                 st.session_state._export_job = "pending"
+                st.session_state.export_progress_pct = 0
+                st.session_state.export_progress_msg = "準備中…"
                 st.rerun()
             st.stop()
 
-        # pending → 書き出し開始
+        # pending → 書き出し開始（進捗バーを先に出してから処理）
         st.session_state._export_job = "running"
         st.session_state.export_progress_pct = 0
         st.session_state.export_progress_msg = "準備中…"
-        progress = st.progress(0, text="0%  準備中…")
-        pct_box = st.empty()
-        status = st.empty()
-        update_export_progress(progress, pct_box, status, 0, "準備中…")
+        progress, pct_box, status = make_export_progress_widgets()
         try:
             run_video_export(progress, pct_box, status)
         except Exception as e:  # noqa: BLE001
