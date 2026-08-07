@@ -183,8 +183,9 @@ def advance_to_video_with_plain_script(edited: str) -> tuple[Path, Path]:
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
     st.session_state.last_video_export_mode = None
-    st.session_state.pop("ruby_script_editor", None)
-    st.session_state.pop("raw_script_editor_widget", None)
+    queue_widget_clear("ruby_script_editor")
+    queue_widget_value("raw_script_editor_widget", plain)
+    queue_widget_value("final_script_editor_widget", plain)
     return txt_path, docx_path
 
 def load_saved_reference_text() -> str:
@@ -365,6 +366,47 @@ def normalize_script_keeping_ruby(text: str) -> str:
     return script
 
 
+_PENDING_WIDGET_SET = "_pending_widget__"
+_PENDING_WIDGET_DEL = "_pending_widget_delete__"
+
+
+def queue_widget_value(key: str, value: Any) -> None:
+    """
+    ウィジェット用 session_state を、次の描画の最初で入れるよう予約する。
+    （表示中のキーへ直接代入すると Streamlit がエラーにする）
+    """
+    st.session_state.pop(f"{_PENDING_WIDGET_DEL}{key}", None)
+    st.session_state[f"{_PENDING_WIDGET_SET}{key}"] = value
+
+
+def queue_widget_clear(key: str) -> None:
+    """ウィジェット用キーを次の描画の最初で消し、初期化し直せるようにする。"""
+    st.session_state.pop(f"{_PENDING_WIDGET_SET}{key}", None)
+    st.session_state[f"{_PENDING_WIDGET_DEL}{key}"] = True
+
+
+def apply_pending_widget_values() -> None:
+    """ウィジェット生成より前に、予約済みの値反映／削除を行う。"""
+    delete_keys = [
+        k
+        for k in list(st.session_state.keys())
+        if str(k).startswith(_PENDING_WIDGET_DEL)
+    ]
+    for pk in delete_keys:
+        widget_key = str(pk)[len(_PENDING_WIDGET_DEL) :]
+        st.session_state.pop(pk, None)
+        st.session_state.pop(widget_key, None)
+
+    set_keys = [
+        k
+        for k in list(st.session_state.keys())
+        if str(k).startswith(_PENDING_WIDGET_SET)
+    ]
+    for pk in set_keys:
+        widget_key = str(pk)[len(_PENDING_WIDGET_SET) :]
+        st.session_state[widget_key] = st.session_state.pop(pk)
+
+
 def commit_loaded_script(text: str, source_id: str) -> None:
     """
     読み込んだ台本をセッションに入れ、以降の工程を最初からにする。
@@ -375,7 +417,9 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.raw_script = script
     st.session_state.final_script = script
     st.session_state.final_script_editor = script
-    st.session_state.final_script_editor_widget = script
+    # 表示中ウィジェットへは直接書かず、次回描画で反映する
+    queue_widget_value("final_script_editor_widget", script)
+    queue_widget_value("raw_script_editor_widget", script)
     st.session_state.review = None
     st.session_state.review_done = False
     st.session_state.skip_review = False
@@ -384,8 +428,7 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.ruby_script = ""
     st.session_state.ruby_script_baseline = ""
     st.session_state.ruby_skipped = False
-    st.session_state.pop("ruby_script_editor", None)
-    st.session_state.pop("raw_script_editor_widget", None)
+    queue_widget_clear("ruby_script_editor")
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
     st.session_state.review_apply_log = []
@@ -4371,6 +4414,8 @@ def main() -> None:
     )
     inject_app_theme()
     init_state()
+    # ウィジェット生成前に、台本などの予約反映を済ませる
+    apply_pending_widget_values()
 
     # MP4作成中は他UIを出さず、誤操作を防ぐ
     # Stop／再読み込みで中断されたあとも通常画面に戻れるようにする
@@ -4601,7 +4646,7 @@ def main() -> None:
                 st.session_state.final_script = edited_raw
                 st.session_state.final_script_editor = edited_raw
                 # 表示中の最終台本ウィジェットは触らず、次回初期化用だけ更新
-                st.session_state.pop("final_script_editor_widget", None)
+                queue_widget_clear("final_script_editor_widget")
                 st.success("台本を上書きしました（既存ルビは残しています）。")
                 st.rerun()
 
@@ -4646,7 +4691,7 @@ def main() -> None:
                 st.session_state.last_error = ""
                 st.session_state.final_script = kept
                 st.session_state.final_script_editor = kept
-                st.session_state.pop("final_script_editor_widget", None)
+                queue_widget_clear("final_script_editor_widget")
             except Exception as e:  # noqa: BLE001
                 st.session_state.last_error = str(e)
                 st.error(f"レビューに失敗しました: {e}")
@@ -4666,7 +4711,7 @@ def main() -> None:
         st.session_state.last_error = ""
         st.session_state.final_script = kept
         st.session_state.final_script_editor = kept
-        st.session_state.pop("final_script_editor_widget", None)
+        queue_widget_clear("final_script_editor_widget")
         st.success("レビューをスキップしました（既存ルビは残しています）")
 
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
@@ -4731,7 +4776,7 @@ def main() -> None:
                 st.session_state.final_script = new_text
                 st.session_state.final_script_editor = new_text
                 # 表示中の入力欄キーは触らず、消してから再表示する
-                st.session_state.pop("final_script_editor_widget", None)
+                queue_widget_clear("final_script_editor_widget")
                 st.session_state.review_apply_log = applied
                 st.session_state.review_manual_log = manual
                 if applied:
@@ -4888,7 +4933,7 @@ def main() -> None:
                         ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(base)
                     st.session_state.ruby_script = ruby_script
                     st.session_state.ruby_script_baseline = ruby_script
-                    st.session_state.pop("ruby_script_editor", None)
+                    queue_widget_clear("ruby_script_editor")
                     st.session_state.ruby_ready = True
                     st.session_state.ruby_skipped = False
                     st.session_state.video_export_mode = "draft"
@@ -4903,7 +4948,7 @@ def main() -> None:
                 else:
                     st.session_state.ruby_script = base
                     st.session_state.ruby_script_baseline = base
-                    st.session_state.pop("ruby_script_editor", None)
+                    queue_widget_clear("ruby_script_editor")
                     st.session_state.ruby_ready = True
                     st.session_state.ruby_skipped = True
                     st.session_state.ruby_dict_last_updates = []
@@ -5302,7 +5347,7 @@ def main() -> None:
                             st.session_state.final_script = (
                                 strip_voicevox_ruby(script).strip() or script
                             )
-                            st.session_state.pop("ruby_script_editor", None)
+                            queue_widget_clear("ruby_script_editor")
                             st.session_state.video_export_mode = "draft"
                             st.session_state.last_ruby_script_txt = str(txt_p)
                             st.session_state.last_ruby_script_docx = str(docx_p)
