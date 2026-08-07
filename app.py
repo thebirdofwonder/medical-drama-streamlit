@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import re
 import shutil
 import struct
+import subprocess
 import tempfile
 import wave
 from datetime import datetime
@@ -112,6 +114,79 @@ def make_script_docx_filename(title: str = "") -> str:
     """台本 Word 用ファイル名（動画タイトルと同一）。"""
     return f"{make_title_basename(title)}.docx"
 
+
+def make_desktop_script_basename(
+    title: str = "",
+    *,
+    kind: str = "plain",
+) -> str:
+    """デスクトップ保存用の台本ファイル名（拡張子なし）。kind: plain / ruby"""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    label = "plain" if kind == "plain" else "ruby"
+    return f"{make_title_basename(title)}_{label}_{stamp}"
+
+
+def save_script_to_desktop(
+    text: str,
+    title: str = "",
+    *,
+    kind: str = "plain",
+) -> tuple[Path, Path]:
+    """
+    台本をデスクトップへ .txt と .docx で保存する。
+    kind=plain … ルビなし確認用 / kind=ruby … ルビあり修正稿
+    戻り値: (txtパス, docxパス)
+    """
+    body = (text or "").strip()
+    if not body:
+        raise ValueError("保存する台本が空です。")
+    desktop = get_desktop_dir()
+    base = make_desktop_script_basename(title, kind=kind)
+    txt_path = desktop / f"{base}.txt"
+    docx_path = desktop / f"{base}.docx"
+    txt_path.write_text(body + "\n", encoding="utf-8")
+    docx_path.write_bytes(text_to_docx_bytes(body))
+    return txt_path, docx_path
+
+
+def prepare_plain_script_for_video(edited: str) -> str:
+    """
+    最初の確認用: ルビを外した平文台本にする。
+    （読み・抑揚の確認は、このあとルビあり台本で繰り返す）
+    """
+    plain = strip_voicevox_ruby(edited or "").strip()
+    return plain
+
+
+def advance_to_video_with_plain_script(edited: str) -> tuple[Path, Path]:
+    """
+    台本確定 → ルビなしのまま動画作成へ進める。
+    デスクトップにルビなし台本を保存し、パスを返す。
+    """
+    plain = prepare_plain_script_for_video(edited)
+    if not plain:
+        raise ValueError("最終台本が空です。")
+    title = str(st.session_state.get("video_title") or "").strip()
+    txt_path, docx_path = save_script_to_desktop(plain, title, kind="plain")
+    st.session_state.final_script = plain
+    st.session_state.final_script_editor = plain
+    st.session_state.raw_script = plain
+    st.session_state.script_confirmed = True
+    st.session_state.ruby_script = plain
+    st.session_state.ruby_script_baseline = plain
+    st.session_state.ruby_ready = True
+    st.session_state.ruby_skipped = True
+    st.session_state.video_export_mode = "draft"
+    st.session_state.last_plain_script_txt = str(txt_path)
+    st.session_state.last_plain_script_docx = str(docx_path)
+    # 新しい確認サイクルなので、前回の完成動画は消す
+    st.session_state.mp4_bytes = None
+    st.session_state.mp4_path = ""
+    st.session_state.last_video_export_mode = None
+    queue_widget_clear("ruby_script_editor")
+    queue_widget_value("raw_script_editor_widget", plain)
+    queue_widget_value("final_script_editor_widget", plain)
+    return txt_path, docx_path
 
 def load_saved_reference_text() -> str:
     """前回保存した参考文献を読み込む。"""
@@ -291,6 +366,47 @@ def normalize_script_keeping_ruby(text: str) -> str:
     return script
 
 
+_PENDING_WIDGET_SET = "_pending_widget__"
+_PENDING_WIDGET_DEL = "_pending_widget_delete__"
+
+
+def queue_widget_value(key: str, value: Any) -> None:
+    """
+    ウィジェット用 session_state を、次の描画の最初で入れるよう予約する。
+    （表示中のキーへ直接代入すると Streamlit がエラーにする）
+    """
+    st.session_state.pop(f"{_PENDING_WIDGET_DEL}{key}", None)
+    st.session_state[f"{_PENDING_WIDGET_SET}{key}"] = value
+
+
+def queue_widget_clear(key: str) -> None:
+    """ウィジェット用キーを次の描画の最初で消し、初期化し直せるようにする。"""
+    st.session_state.pop(f"{_PENDING_WIDGET_SET}{key}", None)
+    st.session_state[f"{_PENDING_WIDGET_DEL}{key}"] = True
+
+
+def apply_pending_widget_values() -> None:
+    """ウィジェット生成より前に、予約済みの値反映／削除を行う。"""
+    delete_keys = [
+        k
+        for k in list(st.session_state.keys())
+        if str(k).startswith(_PENDING_WIDGET_DEL)
+    ]
+    for pk in delete_keys:
+        widget_key = str(pk)[len(_PENDING_WIDGET_DEL) :]
+        st.session_state.pop(pk, None)
+        st.session_state.pop(widget_key, None)
+
+    set_keys = [
+        k
+        for k in list(st.session_state.keys())
+        if str(k).startswith(_PENDING_WIDGET_SET)
+    ]
+    for pk in set_keys:
+        widget_key = str(pk)[len(_PENDING_WIDGET_SET) :]
+        st.session_state[widget_key] = st.session_state.pop(pk)
+
+
 def commit_loaded_script(text: str, source_id: str) -> None:
     """
     読み込んだ台本をセッションに入れ、以降の工程を最初からにする。
@@ -301,7 +417,9 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.raw_script = script
     st.session_state.final_script = script
     st.session_state.final_script_editor = script
-    st.session_state.final_script_editor_widget = script
+    # 表示中ウィジェットへは直接書かず、次回描画で反映する
+    queue_widget_value("final_script_editor_widget", script)
+    queue_widget_value("raw_script_editor_widget", script)
     st.session_state.review = None
     st.session_state.review_done = False
     st.session_state.skip_review = False
@@ -310,8 +428,7 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.ruby_script = ""
     st.session_state.ruby_script_baseline = ""
     st.session_state.ruby_skipped = False
-    st.session_state.pop("ruby_script_editor", None)
-    st.session_state.pop("raw_script_editor_widget", None)
+    queue_widget_clear("ruby_script_editor")
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
     st.session_state.review_apply_log = []
@@ -1297,7 +1414,7 @@ def build_drama_script_prompt(paper_text: str) -> str:
 ③ 読み上げる台本本文以外は一切書かない。タイトル見出し、サブタイトル、シーン番号、「注釈」「解説」「制作メモ」、私への説明、前置き、後書き、Markdown記法は禁止。
 ④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
 ⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。ただし台本本文で視聴者に呼びかけない。「研修医のみなさん」「みなさん」「皆さん」などへの呼びかける表現は禁止（難易度の目安と、台詞・ナレーションの相手は別）。
-⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。ただし単位は原文の表記をそのまま使う（例: mg/dL, mEq/L, g/dL, IU/L）。単位を日本語訳や別表記に変えない。
+⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。ただし単位は原文の表記をそのまま使う（例: mg/dL, mEq/L, g/dL, IU/L）。単位を日本語訳や別表記に変えない。数字と単位のあいだにスペースを入れない（正しい例: 120mg/dL、3.5mEq/L／禁止例: 120 mg/dL、3.5 mEq/L）。
 ⑦ 薬物名はアルファベットでもカタカナでもよい（例: vancomycin / バンコマイシン）。漢字訳にはしない。
 ⑧ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
 ⑨ 登場人物のセリフには必ずカギ括弧「」を付ける。
@@ -1419,6 +1536,7 @@ def polish_drama_script_medically(script: str, api_key: str) -> str:
 - セリフの「」、列挙の読点ルールは崩さない
 - 鑑別診断の診断名を列挙するときは読点「、」で区切り、句点「。」では区切らない（文末の一句点だけ可）
 - 検査値の単位は原文表記のまま（mg/dL, mEq/L など）。単位を書き換えない
+- 検査値は「数字＋単位」をくっつけて書く（スペースなし。例: 120mg/dL。禁止: 120 mg/dL）
 - 薬物名はアルファベットでもカタカナでもよい（漢字訳にはしない）
 - 改行・改ページは原則として句読点の直後。単語・単位・薬物名の途中では切らない
 - すでに付いているルビ ｛用語｜よみ｝ は削除しない（新規には付けない）
@@ -1673,28 +1791,62 @@ def update_export_progress(
     pct: int,
     message: str = "",
 ) -> None:
-    """進捗バーと％数字を同時に更新する（画面中央付近で大きく表示）。"""
+    """進捗バーと％数字を同時に更新する（作成中画面で大きく表示）。"""
     n = max(0, min(100, int(pct)))
     msg = (message or "").strip()
     bar_text = f"{n}%"
     if msg:
         bar_text = f"{n}%  {msg}"
-    # Streamlit 1.50+: バー上にも％を出す
-    try:
-        progress.progress(n, text=bar_text)
-    except TypeError:
-        progress.progress(n / 100.0 if n <= 100 else 1.0)
+
+    # Streamlit 標準バー（対応バージョンなら text 付き）
+    if progress is not None:
+        try:
+            progress.progress(n, text=bar_text)
+        except TypeError:
+            try:
+                progress.progress(n / 100.0)
+            except Exception:
+                progress.progress(min(max(n / 100.0, 0.0), 1.0))
+
+    # 大きく見やすい自前バー（標準バーが細い環境でも進捗が分かる）
+    safe_msg = msg.replace("<", "&lt;").replace(">", "&gt;")
     pct_box.markdown(
-        f'<div style="font-size:2.4rem;font-weight:700;line-height:1.2;'
-        f'margin:0.4rem 0 0.2rem 0;color:#111;">進捗 {n}%</div>',
+        f"""
+<div style="margin:0.6rem 0 0.35rem 0;">
+  <div style="font-size:1.8rem;font-weight:700;color:#111;line-height:1.2;">
+    進捗 {n}%
+  </div>
+  <div style="margin-top:0.55rem;background:#e5e7eb;border-radius:999px;height:22px;overflow:hidden;border:1px solid #d1d5db;">
+    <div style="width:{n}%;height:100%;background:linear-gradient(90deg,#2563eb,#38bdf8);transition:width 0.2s ease;"></div>
+  </div>
+  <div style="margin-top:0.4rem;font-size:1rem;color:#333;">
+    {safe_msg if safe_msg else "処理中…"}
+  </div>
+</div>
+        """.strip(),
         unsafe_allow_html=True,
     )
-    if msg:
-        status.info(f"{n}% — {msg}")
-    else:
-        status.info(f"{n}%")
+    if status is not None:
+        if msg:
+            status.info(f"{n}% — {msg}")
+        else:
+            status.info(f"{n}%")
     st.session_state.export_progress_pct = n
     st.session_state.export_progress_msg = msg
+
+
+def make_export_progress_widgets():
+    """MP4作成画面用の進捗ウィジェットを作る。"""
+    st.markdown("### MP4作成の進捗")
+    st.caption("完了するまでこのページを閉じないでください。")
+    try:
+        progress = st.progress(0, text="0%  準備中…")
+    except TypeError:
+        progress = st.progress(0)
+    pct_box = st.empty()
+    status = st.empty()
+    update_export_progress(progress, pct_box, status, 0, "準備中…")
+    return progress, pct_box, status
 
 
 def heuristic_review(script: str) -> dict[str, Any]:
@@ -2332,13 +2484,99 @@ def expand_voicevox_ruby_to_reading(text: str) -> str:
     )
 
 
-def create_subtitle_png(text: str, path: Path) -> Path:
+# 1画面に出す字幕の最大行数（これを超える文は時間でページ分割する）
+MAX_SUBTITLE_LINES = 3
+SUBTITLE_FONT_SIZE = 52
+
+
+def _subtitle_measure_tools() -> tuple[ImageDraw.ImageDraw, ImageFont.ImageFont, int]:
+    """字幕の折り返し計測用（描画オブジェクト・フォント・最大幅）。"""
+    w, _h = VIDEO_SIZE
+    img = Image.new("RGBA", (w, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = load_jp_font(SUBTITLE_FONT_SIZE, bold=True)
+    return draw, font, int(w * 0.86)
+
+
+# 字幕1行あたりの目安文字数（幅計測が効かない場合の保険）
+SUBTITLE_CHARS_PER_LINE = 30
+
+
+def expand_subtitle_cues_for_display(
+    cues: list[dict[str, Any]] | None,
+    *,
+    max_lines: int = MAX_SUBTITLE_LINES,
+) -> list[dict[str, Any]]:
+    """
+    長い字幕を画面に収まる行数ごとのページに分け、表示時間を文字数比で割る。
+    （音声タイミングは変えず、同じ区間内で前半→後半と切り替える）
+    """
+    if not cues:
+        return []
+    draw, font, max_w = _subtitle_measure_tools()
+    per_page = max(1, int(max_lines))
+    out: list[dict[str, Any]] = []
+    for cue in cues:
+        text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
+        start = float(cue.get("start", 0))
+        end = float(cue.get("end", 0))
+        if not text or end <= start:
+            continue
+        lines = wrap_text_to_width(text, font, max_w, draw)
+        # フォント幅が取れず1行のまま残る長い文は、文字数で行分割する
+        soft_limit = SUBTITLE_CHARS_PER_LINE * per_page
+        if (not lines) or (
+            len(lines) <= 1 and len(text) > soft_limit
+        ):
+            lines = []
+            for chunk in _safe_force_chunks(text, SUBTITLE_CHARS_PER_LINE):
+                chunk = chunk.strip()
+                if chunk:
+                    lines.append(chunk)
+        if not lines:
+            continue
+        pages = [
+            lines[i : i + per_page] for i in range(0, len(lines), per_page)
+        ]
+        weights = [max(1, sum(len(x) for x in page)) for page in pages]
+        total_w = float(sum(weights))
+        dur = end - start
+        t0 = start
+        for i, (page, wt) in enumerate(zip(pages, weights)):
+            if i == len(pages) - 1:
+                t1 = end
+            else:
+                t1 = t0 + dur * (wt / total_w)
+            page_cue = {
+                "start": t0,
+                "end": t1,
+                "text": "".join(page),
+                "lines": list(page),
+            }
+            if cue.get("tts"):
+                page_cue["tts"] = cue.get("tts")
+            out.append(page_cue)
+            t0 = t1
+    return out
+
+
+def create_subtitle_png(
+    text: str,
+    path: Path,
+    *,
+    lines: list[str] | None = None,
+) -> Path:
     """画面下部中央に載せる字幕PNG（透過・縁取り）。"""
     w, h = VIDEO_SIZE
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    font = load_jp_font(52, bold=True)
-    lines = wrap_text_to_width((text or "").strip(), font, int(w * 0.86), draw)[:3]
+    font = load_jp_font(SUBTITLE_FONT_SIZE, bold=True)
+    if lines is None:
+        lines = wrap_text_to_width(
+            (text or "").strip(), font, int(w * 0.86), draw
+        )
+    # 呼び出し側でページ分割済み。万一の溢れは落とさず安全側で上限だけ見る
+    lines = [ln for ln in (lines or []) if ln is not None][:MAX_SUBTITLE_LINES]
     if not lines:
         path.parent.mkdir(parents=True, exist_ok=True)
         img.save(path, format="PNG")
@@ -2552,7 +2790,7 @@ def generate_narration_wav(script: str) -> bytes:
 # 背景画像（Pillow）— YouTubeサムネ風タイトル＋VOICEVOXクレジット
 # ---------------------------------------------------------------------------
 def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
-    """macOS で使える日本語フォントを探す。"""
+    """日本語フォントを探す（macOS / Linux）。"""
     candidates = []
     if bold:
         candidates.extend(
@@ -2560,6 +2798,9 @@ def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
                 "/System/Library/Fonts/ヒラギノ角ゴシック W8.ttc",
                 "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
                 "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
             ]
         )
     candidates.extend(
@@ -2567,6 +2808,11 @@ def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
             "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
             "/Library/Fonts/Arial Unicode.ttf",
+            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         ]
     )
     for path in candidates:
@@ -3262,6 +3508,60 @@ def create_plain_scene_frame(path: Path) -> Path:
     return path
 
 
+def ensure_done_chime_wav() -> Path:
+    """
+    短い『ポーン』通知音のWAVを作る（または再利用する）。
+    追加ソフトは不要。単純な減衰サイン波。
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / "done_chime.wav"
+    if path.is_file() and path.stat().st_size > 2000:
+        return path
+
+    rate = 22050
+    duration = 0.85
+    n = int(rate * duration)
+    # やや高めの「ポーン」→少し下がる感じ
+    frames = bytearray()
+    for i in range(n):
+        t = i / rate
+        # 周波数を 880Hz → 660Hz へなだらかに下げる
+        freq = 880.0 - 220.0 * min(1.0, t / 0.55)
+        # 立ち上がりを少し遅らせ、後半で減衰
+        attack = min(1.0, t / 0.02)
+        decay = math.exp(-2.8 * t)
+        amp = 0.35 * attack * decay
+        sample = int(max(-32767, min(32767, amp * 32767 * math.sin(2 * math.pi * freq * t))))
+        frames += struct.pack("<h", sample)
+
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+    return path
+
+
+def play_done_chime() -> None:
+    """
+    MP4完成を知らせる『ポーン』音を鳴らす。
+    このアプリは同じMac上で動かす想定なので、macOSの afplay を使う。
+    """
+    try:
+        wav = ensure_done_chime_wav()
+    except Exception:
+        return
+    try:
+        subprocess.Popen(
+            ["afplay", str(wav)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # 音が出せなくても動画作成自体は成功扱い
+        pass
+
+
 def create_background_image(
     path: Path,
     title: str = "",
@@ -3398,11 +3698,18 @@ def build_mp4(
     if subtitle_cues:
         sub_dir = subtitle_dir or (output_mp4.parent / "_subs")
         sub_dir.mkdir(parents=True, exist_ok=True)
-        for i, cue in enumerate(subtitle_cues):
+        # 長い一文は複数ページに分け、後半も字幕として出す
+        display_cues = expand_subtitle_cues_for_display(subtitle_cues)
+        for i, cue in enumerate(display_cues):
             start = float(cue.get("start", 0))
             end = float(cue.get("end", 0))
             text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
-            if not text or end <= start:
+            page_lines = cue.get("lines")
+            if isinstance(page_lines, list):
+                page_lines = [str(x) for x in page_lines if str(x).strip() or x == ""]
+            else:
+                page_lines = None
+            if not text and not page_lines:
                 continue
             if start >= duration:
                 continue
@@ -3412,7 +3719,7 @@ def build_mp4(
             if end - start < min_dur:
                 end = min(duration, start + min_dur)
             png = sub_dir / f"sub_{i:05d}.png"
-            create_subtitle_png(text, png)
+            create_subtitle_png(text, png, lines=page_lines)
             sub_clips.append(
                 ImageClip(str(png), ismask=False)
                 .set_start(start)
@@ -3575,9 +3882,9 @@ CHOICE_ACCEPT = "accept"
 CHOICE_REJECT = "reject"
 CHOICE_REVISE = "revise"
 CHOICE_LABELS = {
-    CHOICE_ACCEPT: "①承諾（そのまま反映）",
+    CHOICE_ACCEPT: "①承諾",
     CHOICE_REJECT: "②却下",
-    CHOICE_REVISE: "③別案にて修正",
+    CHOICE_REVISE: "③別案",
 }
 
 
@@ -3613,8 +3920,8 @@ def render_review_section_interactive(
     for i, item in enumerate(items):
         label = item.get("original") or "（箇所）"
         with st.expander(f"{i + 1}. {label}", expanded=(i == 0)):
-            st.write(item.get("issue") or "（なし）")
-            st.write(item.get("suggestion") or "（なし）")
+            st.caption(item.get("issue") or "（なし）")
+            st.caption(item.get("suggestion") or "（なし）")
 
             choice_key = decision_widget_key(section_key, i)
             if choice_key not in st.session_state:
@@ -3626,6 +3933,7 @@ def render_review_section_interactive(
                 format_func=lambda x: CHOICE_LABELS.get(x, x),
                 key=choice_key,
                 horizontal=True,
+                label_visibility="collapsed",
             )
 
             if st.session_state.get(choice_key) == CHOICE_ACCEPT:
@@ -3644,7 +3952,7 @@ def render_review_section_interactive(
                 st.text_area(
                     "別案",
                     key=alt_key,
-                    height=100,
+                    height=80,
                 )
 
 
@@ -3819,6 +4127,11 @@ def init_state() -> None:
         "last_script_name": "medical_drama.docx",
         "video_encoding": False,
         "video_export_mode": "draft",  # draft=背景なし / final=背景あり
+        "last_video_export_mode": None,  # 直近に完成した draft / final
+        "last_plain_script_txt": "",
+        "last_plain_script_docx": "",
+        "last_ruby_script_txt": "",
+        "last_ruby_script_docx": "",
         "_export_job": None,
         "review_apply_log": [],
         "review_manual_log": [],
@@ -3898,12 +4211,12 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
     )
     _pct(2, "台本を準備中…")
-    # 直前工程で確定したルビ入り原稿を使う（ここで辞書ルビを付け直さない）
+    # 確定済み台本を使う（ルビなしでも可。ルビありならその読みで音声化）
     voice_script = canonicalize_voicevox_ruby_delimiters(
         str(st.session_state.get("ruby_script") or st.session_state.get("final_script") or "")
     ).strip()
     if not voice_script:
-        raise RuntimeError("ルビ入り原稿が空です。先にルビ準備を完了してください。")
+        raise RuntimeError("台本が空です。先に台本を確定してください。")
     ruby_count = count_voicevox_ruby(voice_script)
 
     save_reference_text(st.session_state.get("reference_text", ""))
@@ -4053,6 +4366,9 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.mp4_path = str(desktop_path)
         st.session_state.mp4_name = desktop_name
         st.session_state.mp4_bytes = None
+        st.session_state.last_video_export_mode = (
+            "final" if include_background else "draft"
+        )
         # ルビ入り最終原稿 ↔ 辞書を比較し、足りないルビを追加
         _pct(99, "ルビ辞書を更新中…")
         applied = sync_script_rubies_into_dictionary(voice_script)
@@ -4065,10 +4381,12 @@ def run_video_export(progress, pct_box, status) -> None:
         else:
             _pct(100, f"完了・{mode_label}")
         status.success(f"完了（{mode_label}）: {desktop_path}")
+        # 完成を耳で知らせる（ポーン）
+        play_done_chime()
 
 
 def inject_app_theme() -> None:
-    """余計な装飾を抑え、読みやすい白背景にする。"""
+    """余計な装飾を抑え、読みやすい白背景にする。選択UIは小さく横並び向き。"""
     st.markdown(
         """
 <style>
@@ -4077,6 +4395,45 @@ def inject_app_theme() -> None:
   [data-testid="stSidebar"] { background: #fafafa; }
   h1, h2, h3, h4 { font-size: 1rem !important; font-weight: 600 !important; }
   div[data-testid="stAlert"] { border: 1px solid #ccc !important; }
+
+  /* 選択ラジオ: 小さく横並び */
+  div[data-testid="stRadio"] > label { font-size: 0.85rem !important; }
+  div[data-testid="stRadio"] div[role="radiogroup"] {
+    gap: 0.35rem 0.55rem !important;
+    flex-wrap: wrap !important;
+  }
+  div[data-testid="stRadio"] div[role="radiogroup"] > label {
+    min-height: 1.6rem !important;
+    padding: 0.1rem 0.45rem !important;
+    font-size: 0.82rem !important;
+    margin-right: 0 !important;
+  }
+  div[data-testid="stRadio"] div[role="radiogroup"] p {
+    font-size: 0.82rem !important;
+  }
+
+  /* ボタン: 小さめ */
+  div[data-testid="stButton"] > button {
+    min-height: 1.85rem !important;
+    padding: 0.15rem 0.65rem !important;
+    font-size: 0.85rem !important;
+  }
+
+  /* 声優・声調・速度などコンパクト欄 */
+  div[data-testid="stSelectbox"] {
+    max-width: 210px !important;
+  }
+  div[data-testid="stSelectbox"] label,
+  div[data-testid="stSlider"] label {
+    font-size: 0.8rem !important;
+  }
+  div[data-testid="stSlider"] {
+    max-width: 240px !important;
+    padding-bottom: 0.15rem !important;
+  }
+  div[data-testid="stSlider"] [data-baseweb="slider"] {
+    margin-top: 0.1rem !important;
+  }
 </style>
         """,
         unsafe_allow_html=True,
@@ -4091,17 +4448,14 @@ def main() -> None:
     )
     inject_app_theme()
     init_state()
+    # ウィジェット生成前に、台本などの予約反映を済ませる
+    apply_pending_widget_values()
 
     # MP4作成中は他UIを出さず、誤操作を防ぐ
     # Stop／再読み込みで中断されたあとも通常画面に戻れるようにする
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
         st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
-        st.markdown(
-            '<div style="font-size:1.2rem;margin-bottom:0.5rem;">'
-            "作業の進捗（パーセント）</div>",
-            unsafe_allow_html=True,
-        )
         if st.button("中止して通常画面に戻る", key="btn_cancel_video_encoding"):
             st.session_state.video_encoding = False
             st.session_state._export_job = None
@@ -4113,20 +4467,24 @@ def main() -> None:
             job = "running"
         # Stop などで中断されたあと：自動再開せず、再開／中止を選ばせる
         if job == "running":
+            # 中断時も、直前までの進捗バーを見せる
+            last_pct = int(st.session_state.get("export_progress_pct") or 0)
+            last_msg = str(st.session_state.get("export_progress_msg") or "中断されました")
+            progress, pct_box, status = make_export_progress_widgets()
+            update_export_progress(progress, pct_box, status, last_pct, last_msg)
             st.error("前回の作成が中断されたか、作成モードのまま残っています。")
             if st.button("最初から再開する", type="primary", key="btn_restart_export"):
                 st.session_state._export_job = "pending"
+                st.session_state.export_progress_pct = 0
+                st.session_state.export_progress_msg = "準備中…"
                 st.rerun()
             st.stop()
 
-        # pending → 書き出し開始
+        # pending → 書き出し開始（進捗バーを先に出してから処理）
         st.session_state._export_job = "running"
         st.session_state.export_progress_pct = 0
         st.session_state.export_progress_msg = "準備中…"
-        progress = st.progress(0, text="0%  準備中…")
-        pct_box = st.empty()
-        status = st.empty()
-        update_export_progress(progress, pct_box, status, 0, "準備中…")
+        progress, pct_box, status = make_export_progress_widgets()
         try:
             run_video_export(progress, pct_box, status)
         except Exception as e:  # noqa: BLE001
@@ -4185,7 +4543,7 @@ def main() -> None:
             else "台本ファイルを取り込む"
         ),
         key="step1_input_mode",
-        horizontal=False,
+        horizontal=True,
         label_visibility="collapsed",
     )
 
@@ -4321,7 +4679,7 @@ def main() -> None:
                 st.session_state.final_script = edited_raw
                 st.session_state.final_script_editor = edited_raw
                 # 表示中の最終台本ウィジェットは触らず、次回初期化用だけ更新
-                st.session_state.pop("final_script_editor_widget", None)
+                queue_widget_clear("final_script_editor_widget")
                 st.success("台本を上書きしました（既存ルビは残しています）。")
                 st.rerun()
 
@@ -4366,7 +4724,7 @@ def main() -> None:
                 st.session_state.last_error = ""
                 st.session_state.final_script = kept
                 st.session_state.final_script_editor = kept
-                st.session_state.pop("final_script_editor_widget", None)
+                queue_widget_clear("final_script_editor_widget")
             except Exception as e:  # noqa: BLE001
                 st.session_state.last_error = str(e)
                 st.error(f"レビューに失敗しました: {e}")
@@ -4386,7 +4744,7 @@ def main() -> None:
         st.session_state.last_error = ""
         st.session_state.final_script = kept
         st.session_state.final_script_editor = kept
-        st.session_state.pop("final_script_editor_widget", None)
+        queue_widget_clear("final_script_editor_widget")
         st.success("レビューをスキップしました（既存ルビは残しています）")
 
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
@@ -4402,21 +4760,25 @@ def main() -> None:
                 height=320,
                 key="final_script_editor_widget",
             )
-            if st.button("2. 確定してルビ準備へ", type="primary", key="btn_confirm_skip"):
+            if st.button("2. 確定して動画作成へ", type="primary", key="btn_confirm_skip"):
                 edited = normalize_script_keeping_ruby(
                     (st.session_state.get("final_script_editor_widget") or "").strip()
                 )
                 if not edited:
                     st.error("最終台本が空です。")
                 else:
-                    st.session_state.final_script = edited
-                    st.session_state.final_script_editor = edited
-                    st.session_state.raw_script = edited
-                    st.session_state.script_confirmed = True
-                    st.session_state.ruby_ready = False
-                    st.session_state.ruby_script = ""
-                    st.session_state.pop("ruby_script_editor", None)
-                    st.rerun()
+                    try:
+                        txt_path, docx_path = advance_to_video_with_plain_script(
+                            edited
+                        )
+                        st.success(
+                            "ルビなし台本を確定し、デスクトップへ保存しました。\n"
+                            f"- `{txt_path.name}`\n"
+                            f"- `{docx_path.name}`"
+                        )
+                        st.rerun()
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"台本の保存に失敗しました: {e}")
 
         elif st.session_state.review:
             st.write("2. レビュー")
@@ -4447,7 +4809,7 @@ def main() -> None:
                 st.session_state.final_script = new_text
                 st.session_state.final_script_editor = new_text
                 # 表示中の入力欄キーは触らず、消してから再表示する
-                st.session_state.pop("final_script_editor_widget", None)
+                queue_widget_clear("final_script_editor_widget")
                 st.session_state.review_apply_log = applied
                 st.session_state.review_manual_log = manual
                 if applied:
@@ -4478,7 +4840,7 @@ def main() -> None:
             )
 
             if st.button(
-                "2. 確定してルビ準備へ",
+                "2. 確定して動画作成へ",
                 type="primary",
                 key="btn_confirm_review",
             ):
@@ -4488,173 +4850,164 @@ def main() -> None:
                 if not edited:
                     st.error("最終台本が空です。")
                 else:
-                    st.session_state.final_script = edited
-                    st.session_state.final_script_editor = edited
-                    st.session_state.raw_script = edited
-                    st.session_state.script_confirmed = True
-                    st.session_state.ruby_ready = False
-                    st.session_state.ruby_script = ""
-                    st.session_state.pop("ruby_script_editor", None)
-                    st.rerun()
+                    try:
+                        txt_path, docx_path = advance_to_video_with_plain_script(
+                            edited
+                        )
+                        st.success(
+                            "ルビなし台本を確定し、デスクトップへ保存しました。\n"
+                            f"- `{txt_path.name}`\n"
+                            f"- `{docx_path.name}`"
+                        )
+                        st.rerun()
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"台本の保存に失敗しました: {e}")
 
-    # ----- Step 3: ルビ準備 → 動画生成 -----
+    # ----- Step 3: 動画作成（ルビなし確認 → ルビあり修正 → 最終版） -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
         render_video_title_input()
 
-        st.write("ルビ準備（動画の直前）")
-        st.caption("①辞書 → ②ルビ作成（またはルビなしで進む）→ ③修正 → 確定、のあと動画へ")
+        voice_now = str(
+            st.session_state.get("ruby_script")
+            or st.session_state.get("final_script")
+            or ""
+        ).strip()
+        n_ruby_now = count_voicevox_ruby(voice_now)
+        mode_now = str(st.session_state.get("video_export_mode") or "draft")
 
-        # ① 辞書読み込み
-        st.write("① 辞書読み込み")
-        dict_file = st.file_uploader(
-            "追加辞書（.tsv / .txt / .csv）",
-            type=["tsv", "txt", "csv"],
-            key="ruby_dict_upload",
+        st.write("作業の流れ")
+        st.markdown(
+            """
+1. **A. 最初の確認** … ルビなし台本で、ドラフトMP4（背景なし）を作る  
+2. **B. 読み直し** … 読み・抑揚を直した「ルビあり台本」を上げて、ドラフトを作り直す  
+3. **C. 仕上げ** … 読みが固まったら、最終版（背景あり）を作る  
+            """.strip()
         )
-        if dict_file is not None:
-            try:
-                raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
-                pairs = parse_ruby_dict_text(raw_dict)
-                if not pairs:
-                    st.warning("辞書から用語を読み取れませんでした。")
-                else:
-                    file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
-                    if st.session_state.get("_ruby_dict_file_id") != file_id:
-                        st.session_state.ruby_dict_custom = pairs
-                        st.session_state.ruby_dict_source_name = dict_file.name
-                        st.session_state._ruby_dict_file_id = file_id
-                        st.session_state.ruby_ready = False
-                        st.success(
-                            f"追加辞書: {dict_file.name}（{len(pairs)} 語）"
-                        )
-            except Exception as e:  # noqa: BLE001
-                st.error(f"辞書の読込失敗: {e}")
-        active_n = len(get_active_ruby_dictionary())
-        src_name = st.session_state.get("ruby_dict_source_name") or (
-            RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
-        )
-        learned_n = len(st.session_state.get("ruby_dict_learned") or [])
-        st.caption(
-            f"辞書: 標準 + {src_name}（{active_n} 語"
-            + (f"・修正反映 {learned_n} 語" if learned_n else "")
-            + "）"
-        )
-        if st.session_state.get("ruby_dict_export_ready") and RUBY_DICT_EXPORT_PATH.is_file():
-            st.download_button(
-                "ルビ辞書.txt をダウンロード",
-                data=RUBY_DICT_EXPORT_PATH.read_bytes(),
-                file_name=RUBY_DICT_EXPORT_NAME,
-                mime="text/plain",
-                key="dl_ruby_dict_pre_video",
-            )
-
-        # ② ルビ入り原稿を作成（スキップ可）
-        st.write("② ルビ入り原稿を作成")
-        col_ruby_on, col_ruby_skip = st.columns(2)
-        with col_ruby_on:
-            apply_ruby_clicked = st.button(
-                "辞書でルビを付ける",
-                type="primary",
-                key="btn_apply_dict_ruby_pre_video",
-                use_container_width=True,
-            )
-        with col_ruby_skip:
-            skip_ruby_clicked = st.button(
-                "ルビなしで進む",
-                key="btn_skip_ruby_pre_video",
-                use_container_width=True,
-            )
-
-        if apply_ruby_clicked:
-            # 既存ルビは消さず、辞書ルビを足す
-            base = normalize_script_keeping_ruby(
-                st.session_state.get("final_script") or ""
-            )
-            if not base:
-                st.error("原稿が空です。先に台本を確定してください。")
-            else:
-                with st.spinner("辞書でルビを付けています…"):
-                    ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(base)
-                st.session_state.ruby_script = ruby_script
-                st.session_state.ruby_script_baseline = ruby_script
-                st.session_state.pop("ruby_script_editor", None)
-                st.session_state.ruby_ready = False
-                st.session_state.ruby_skipped = False
-                st.rerun()
-
-        if skip_ruby_clicked:
-            # 既存ルビがあればそのまま残す
-            base = normalize_script_keeping_ruby(
-                st.session_state.get("final_script") or ""
-            )
-            if not base:
-                st.error("原稿が空です。先に台本を確定してください。")
-            else:
-                st.session_state.ruby_script = base
-                st.session_state.ruby_script_baseline = base
-                st.session_state.pop("ruby_script_editor", None)
-                st.session_state.ruby_ready = True
-                st.session_state.ruby_skipped = not bool(count_voicevox_ruby(base))
-                st.session_state.ruby_dict_last_updates = []
-                st.rerun()
-
-        # ③ ルビ入り原稿を修正（確定後も上書き可）
-        st.write("③ ルビ入り原稿を修正")
-        has_ruby_draft = bool(
-            (st.session_state.get("ruby_script") or "").strip()
-            or (st.session_state.get("ruby_script_editor") or "").strip()
-        )
-        if not has_ruby_draft:
-            st.info("②でルビを付けたあと、ここで直して確定します。")
+        if n_ruby_now:
+            st.caption(f"いまの台本: ルビあり（{n_ruby_now} 件）／動画種類の初期値: {mode_now}")
         else:
+            st.caption("いまの台本: ルビなし／最初はドラフト（背景なし）で確認します")
+
+        plain_txt = st.session_state.get("last_plain_script_txt") or ""
+        if plain_txt and Path(plain_txt).exists():
+            st.caption(f"デスクトップのルビなし台本: `{Path(plain_txt).name}`")
+
+        # 任意: アプリ内で辞書ルビを付ける（通常はデスクトップで直して上げる）
+        with st.expander("（任意）アプリ内でルビを付ける・直す", expanded=False):
+            st.caption(
+                "普段はデスクトップのルビなし台本を直し、ルビあり台本をアップロードします。"
+                "ここはアプリ内だけでルビを試すときの補助です。"
+            )
+            dict_file = st.file_uploader(
+                "追加辞書（.tsv / .txt / .csv）",
+                type=["tsv", "txt", "csv"],
+                key="ruby_dict_upload",
+            )
+            if dict_file is not None:
+                try:
+                    raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
+                    pairs = parse_ruby_dict_text(raw_dict)
+                    if not pairs:
+                        st.warning("辞書から用語を読み取れませんでした。")
+                    else:
+                        file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
+                        if st.session_state.get("_ruby_dict_file_id") != file_id:
+                            st.session_state.ruby_dict_custom = pairs
+                            st.session_state.ruby_dict_source_name = dict_file.name
+                            st.session_state._ruby_dict_file_id = file_id
+                            st.success(
+                                f"追加辞書: {dict_file.name}（{len(pairs)} 語）"
+                            )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"辞書の読込失敗: {e}")
+            active_n = len(get_active_ruby_dictionary())
+            src_name = st.session_state.get("ruby_dict_source_name") or (
+                RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
+            )
+            learned_n = len(st.session_state.get("ruby_dict_learned") or [])
+            st.caption(
+                f"辞書: 標準 + {src_name}（{active_n} 語"
+                + (f"・修正反映 {learned_n} 語" if learned_n else "")
+                + "）"
+            )
+            if st.session_state.get("ruby_dict_export_ready") and RUBY_DICT_EXPORT_PATH.is_file():
+                st.download_button(
+                    "ルビ辞書.txt をダウンロード",
+                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
+                    file_name=RUBY_DICT_EXPORT_NAME,
+                    mime="text/plain",
+                    key="dl_ruby_dict_pre_video",
+                )
+
+            col_ruby_on, col_ruby_skip = st.columns(2)
+            with col_ruby_on:
+                apply_ruby_clicked = st.button(
+                    "辞書でルビを付ける",
+                    type="secondary",
+                    key="btn_apply_dict_ruby_pre_video",
+                    use_container_width=True,
+                )
+            with col_ruby_skip:
+                skip_ruby_clicked = st.button(
+                    "ルビなしのままにする",
+                    key="btn_skip_ruby_pre_video",
+                    use_container_width=True,
+                )
+
+            if apply_ruby_clicked:
+                base = normalize_script_keeping_ruby(
+                    st.session_state.get("final_script") or ""
+                )
+                if not base:
+                    st.error("原稿が空です。先に台本を確定してください。")
+                else:
+                    with st.spinner("辞書でルビを付けています…"):
+                        ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(base)
+                    st.session_state.ruby_script = ruby_script
+                    st.session_state.ruby_script_baseline = ruby_script
+                    queue_widget_clear("ruby_script_editor")
+                    st.session_state.ruby_ready = True
+                    st.session_state.ruby_skipped = False
+                    st.session_state.video_export_mode = "draft"
+                    st.rerun()
+
+            if skip_ruby_clicked:
+                base = prepare_plain_script_for_video(
+                    st.session_state.get("final_script") or ""
+                )
+                if not base:
+                    st.error("原稿が空です。先に台本を確定してください。")
+                else:
+                    st.session_state.ruby_script = base
+                    st.session_state.ruby_script_baseline = base
+                    queue_widget_clear("ruby_script_editor")
+                    st.session_state.ruby_ready = True
+                    st.session_state.ruby_skipped = True
+                    st.session_state.ruby_dict_last_updates = []
+                    st.session_state.video_export_mode = "draft"
+                    st.rerun()
+
             if "ruby_script_editor" not in st.session_state:
                 st.session_state.ruby_script_editor = (
-                    st.session_state.get("ruby_script") or ""
+                    st.session_state.get("ruby_script")
+                    or st.session_state.get("final_script")
+                    or ""
                 )
-            elif st.session_state.get("ruby_ready") and not (
-                st.session_state.get("ruby_script_editor") or ""
-            ).strip():
-                st.session_state.ruby_script_editor = (
-                    st.session_state.get("ruby_script") or ""
-                )
-
-            if st.session_state.get("ruby_ready"):
-                n_ruby = count_voicevox_ruby(
-                    st.session_state.get("ruby_script") or ""
-                )
-                if st.session_state.get("ruby_skipped"):
-                    st.write("確定済み（ルビなしで進行）。必要なら下の欄で追記・上書きできます。")
-                else:
-                    st.write(f"確定済み（ルビ {n_ruby} 件）。下の欄で上書きできます。")
-                last_updates = st.session_state.get("ruby_dict_last_updates") or []
-                if last_updates:
-                    st.caption(
-                        "辞書に反映した修正: "
-                        + "、".join(f"{s}→{r}" for s, r in last_updates[:12])
-                        + ("…" if len(last_updates) > 12 else "")
-                    )
-
             st.text_area(
-                "ルビ入り原稿（編集・上書き可）",
-                height=320,
+                "台本（編集・上書き可）",
+                height=240,
                 key="ruby_script_editor",
             )
-            confirm_label = (
-                "上書きして確定"
-                if st.session_state.get("ruby_ready")
-                else "ルビ入り原稿を確定して動画設定へ"
-            )
             if st.button(
-                confirm_label,
-                type="primary",
+                "この内容で台本を上書き確定",
                 key="btn_confirm_ruby_script",
             ):
                 edited_ruby = normalize_script_keeping_ruby(
                     st.session_state.get("ruby_script_editor") or ""
                 )
                 if not edited_ruby:
-                    st.error("ルビ入り原稿が空です。")
+                    st.error("台本が空です。")
                 else:
                     baseline = str(
                         st.session_state.get("ruby_script_baseline")
@@ -4664,30 +5017,17 @@ def main() -> None:
                     updates = find_ruby_dict_updates(baseline, edited_ruby)
                     applied = apply_ruby_updates_to_learned_dict(updates)
                     st.session_state.ruby_script = edited_ruby
-                    # ruby_script_editor は text_area の key なので、ここでは書き換えない
                     st.session_state.ruby_ready = True
-                    st.session_state.ruby_skipped = False
+                    st.session_state.ruby_skipped = not bool(
+                        count_voicevox_ruby(edited_ruby)
+                    )
                     st.session_state.ruby_dict_last_updates = applied
+                    st.session_state.video_export_mode = "draft"
                     st.rerun()
 
-            if RUBY_DICT_EXPORT_PATH.is_file():
-                st.download_button(
-                    "ルビ辞書.txt をダウンロード",
-                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
-                    file_name=RUBY_DICT_EXPORT_NAME,
-                    mime="text/plain",
-                    key="dl_ruby_dict_after_confirm",
-                )
-            if st.session_state.get("ruby_ready") and st.button(
-                "ルビ準備をやり直す",
-                key="btn_reset_ruby_ready",
-            ):
-                st.session_state.ruby_ready = False
-                st.session_state.ruby_skipped = False
-                st.rerun()
-
-        if not st.session_state.get("ruby_ready"):
-            st.caption("①②③が終わるまで、動画生成には進めません。")
+        # 台本が空なら止める（ルビの有無は問わない）
+        if not voice_now:
+            st.warning("台本が空です。Step 2 で台本を確定してください。")
             st.stop()
 
         st.write("参考文献")
@@ -4782,7 +5122,7 @@ def main() -> None:
                         cur_name = default_name
                     name_index = speaker_names.index(cur_name)
 
-                    col_a, col_b = st.columns(2)
+                    col_a, col_b, _spacer = st.columns([1.1, 1.1, 2.3])
                     with col_a:
                         chosen_name = st.selectbox(
                             "声優",
@@ -4850,14 +5190,16 @@ def main() -> None:
             selected_speaker_name = DEFAULT_SPEAKER_NAME
             selected_style_name = DEFAULT_STYLE_NAME
 
-        st.slider(
-            "読み上げ速度",
-            min_value=float(VOICEVOX_SPEED_MIN),
-            max_value=float(VOICEVOX_SPEED_MAX),
-            step=float(VOICEVOX_SPEED_STEP),
-            key="vvox_speed_scale",
-            format="%.1f倍",
-        )
+        speed_col, _speed_spacer = st.columns([1.4, 3.1])
+        with speed_col:
+            st.slider(
+                "速度",
+                min_value=float(VOICEVOX_SPEED_MIN),
+                max_value=float(VOICEVOX_SPEED_MAX),
+                step=float(VOICEVOX_SPEED_STEP),
+                key="vvox_speed_scale",
+                format="%.1f倍",
+            )
 
         # ----- ④ エンディング画面の確認・修正 -----
         st.write("エンディング")
@@ -4895,19 +5237,25 @@ def main() -> None:
             "背景の有無",
             options=["draft", "final"],
             format_func=lambda x: (
-                "ドラフト（背景なし・台本確認用）"
+                "ドラフト（背景なし）"
                 if x == "draft"
                 else "最終版（背景あり）"
             ),
             key="video_export_mode",
-            horizontal=False,
+            horizontal=True,
+            label_visibility="collapsed",
         )
         st.caption(
-            "ドラフトは黒い画面＋字幕＋音声だけです。"
-            "最終版台本が固まったら、背景ありを選んでください。"
+            "最初と読み直しのあいだはドラフト。"
+            "読み・抑揚が固まったら最終版（背景あり）を選んでください。"
         )
 
-        if st.button("3. 動画を生成する", type="primary"):
+        gen_label = (
+            "3. ドラフトMP4を作成する（背景なし）"
+            if str(st.session_state.get("video_export_mode") or "draft") == "draft"
+            else "3. 最終版MP4を作成する（背景あり）"
+        )
+        if st.button(gen_label, type="primary"):
             # 次の描画で作業専用画面にし、他ボタンを出さない
             st.session_state.video_encoding = True
             st.session_state._export_job = "pending"
@@ -4919,7 +5267,25 @@ def main() -> None:
         mp4_path = st.session_state.get("mp4_path") or ""
         if mp4_path and Path(mp4_path).exists():
             size_mb = Path(mp4_path).stat().st_size / (1024 * 1024)
+            used_script = str(
+                st.session_state.get("ruby_script")
+                or st.session_state.get("final_script")
+                or ""
+            )
+            used_ruby_n = count_voicevox_ruby(used_script)
+            last_mode = str(
+                st.session_state.get("last_video_export_mode")
+                or st.session_state.get("video_export_mode")
+                or "draft"
+            )
+            script_kind = "ルビあり" if used_ruby_n else "ルビなし"
+            mode_kind = (
+                "最終版（背景あり）"
+                if last_mode == "final"
+                else "ドラフト（背景なし）"
+            )
             st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
+            st.caption(f"今回の台本: {script_kind}／動画: {mode_kind}")
             # 大きいMP4を毎回メモリに載せると落ちやすいので上限を設ける
             if size_mb < 180:
                 st.download_button(
@@ -4979,53 +5345,132 @@ def main() -> None:
                     key="dl_ruby_dict_after_video",
                 )
 
-            # 次の原稿 → もう一度 MP4 を作るループ
-            st.write("次の動画")
-            next_script = st.file_uploader(
-                "次の原稿（.txt / .docx）",
-                type=["txt", "docx"],
-                key="next_loop_script_upload",
+            # B: ルビあり台本を上げてドラフト再作成 / C: 最終版
+            st.write("読み直し・仕上げ")
+            st.caption(
+                "MP4を聞いて読み・抑揚を直した「ルビあり台本」を上げ、"
+                "ドラフトを作り直します。固まったら最終版へ。"
             )
-            if st.button(
-                "この原稿で次の動画を作る",
-                type="primary",
-                key="btn_next_video_loop",
-            ):
-                if next_script is None:
-                    st.error("原稿ファイル（.txt または .docx）を選んでください。")
-                else:
+            ruby_upload = st.file_uploader(
+                "ルビあり台本（.txt / .docx）",
+                type=["txt", "docx"],
+                key="ruby_loop_script_upload",
+            )
+            if ruby_upload is not None:
+                file_id = f"{ruby_upload.name}-{ruby_upload.size}"
+                if st.session_state.get("_ruby_loop_file_id") != file_id:
                     try:
-                        loaded = load_text_from_upload(next_script).strip()
+                        loaded = load_text_from_upload(ruby_upload).strip()
                         script = normalize_script_keeping_ruby(loaded)
                         if not script:
-                            st.error("原稿が空でした。")
+                            st.error("台本が空でした。")
                         else:
-                            commit_loaded_script(
-                                script,
-                                f"loop-{next_script.name}-{len(script)}",
+                            title = str(
+                                st.session_state.get("video_title") or ""
+                            ).strip()
+                            txt_p, docx_p = save_script_to_desktop(
+                                script, title, kind="ruby"
                             )
-                            # レビューを飛ばしてルビ準備へ（ループ用）
-                            st.session_state.review_done = True
-                            st.session_state.skip_review = True
-                            st.session_state.script_confirmed = True
-                            st.session_state.ruby_ready = False
-                            st.session_state.ruby_skipped = False
-                            # 既存ルビがあればルビ原稿としても保持
                             st.session_state.ruby_script = script
                             st.session_state.ruby_script_baseline = script
-                            st.session_state.pop("ruby_script_editor", None)
-                            st.session_state.mp4_bytes = None
-                            st.session_state.mp4_path = ""
-                            st.session_state.final_script = script
-                            st.session_state.final_script_editor = script
-                            st.session_state.pop("final_script_editor_widget", None)
+                            st.session_state.ruby_ready = True
+                            st.session_state.ruby_skipped = not bool(
+                                count_voicevox_ruby(script)
+                            )
+                            st.session_state.final_script = (
+                                strip_voicevox_ruby(script).strip() or script
+                            )
+                            queue_widget_clear("ruby_script_editor")
+                            st.session_state.video_export_mode = "draft"
+                            st.session_state.last_ruby_script_txt = str(txt_p)
+                            st.session_state.last_ruby_script_docx = str(docx_p)
+                            st.session_state._ruby_loop_file_id = file_id
                             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                             (OUTPUT_DIR / "last_script.txt").write_text(
                                 script, encoding="utf-8"
                             )
+                            st.success(
+                                "ルビあり台本を取り込み、デスクトップへ保存しました。"
+                                f"\n- `{txt_p.name}`\n- `{docx_p.name}`\n"
+                                "下の「ドラフトMP4を再作成」を押してください。"
+                            )
                             st.rerun()
                     except Exception as e:  # noqa: BLE001
-                        st.error(f"原稿の取り込みに失敗しました: {e}")
+                        st.error(f"ルビあり台本の取り込みに失敗しました: {e}")
+            ruby_saved = st.session_state.get("last_ruby_script_txt") or ""
+            if ruby_saved and Path(ruby_saved).exists():
+                st.caption(
+                    f"デスクトップのルビあり台本: `{Path(ruby_saved).name}`"
+                )
+
+            col_redraft, col_final = st.columns(2)
+            with col_redraft:
+                if st.button(
+                    "ドラフトMP4を再作成（背景なし）",
+                    type="primary",
+                    key="btn_recreate_draft_mp4",
+                    use_container_width=True,
+                ):
+                    st.session_state.video_export_mode = "draft"
+                    st.session_state.video_encoding = True
+                    st.session_state._export_job = "pending"
+                    st.session_state.ruby_dict_post_video_updates = []
+                    st.session_state.export_progress_pct = 0
+                    st.session_state.export_progress_msg = ""
+                    st.rerun()
+            with col_final:
+                if st.button(
+                    "最終版MP4を作成（背景あり）",
+                    type="secondary",
+                    key="btn_create_final_mp4",
+                    use_container_width=True,
+                ):
+                    st.session_state.video_export_mode = "final"
+                    st.session_state.video_encoding = True
+                    st.session_state._export_job = "pending"
+                    st.session_state.ruby_dict_post_video_updates = []
+                    st.session_state.export_progress_pct = 0
+                    st.session_state.export_progress_msg = ""
+                    st.rerun()
+
+            # 別作品用の次原稿（レビューからやり直し）
+            with st.expander("別の原稿で新しい動画を始める", expanded=False):
+                next_script = st.file_uploader(
+                    "次の原稿（.txt / .docx）",
+                    type=["txt", "docx"],
+                    key="next_loop_script_upload",
+                )
+                if st.button(
+                    "この原稿で最初から作り直す",
+                    key="btn_next_video_loop",
+                ):
+                    if next_script is None:
+                        st.error("原稿ファイル（.txt または .docx）を選んでください。")
+                    else:
+                        try:
+                            loaded = load_text_from_upload(next_script).strip()
+                            script = normalize_script_keeping_ruby(loaded)
+                            if not script:
+                                st.error("原稿が空でした。")
+                            else:
+                                commit_loaded_script(
+                                    script,
+                                    f"loop-{next_script.name}-{len(script)}",
+                                )
+                                st.session_state.review_done = True
+                                st.session_state.skip_review = True
+                                # ルビなし確定と同じ流れへ
+                                advance_to_video_with_plain_script(script)
+                                st.session_state.mp4_bytes = None
+                                st.session_state.mp4_path = ""
+                                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                                (OUTPUT_DIR / "last_script.txt").write_text(
+                                    st.session_state.final_script,
+                                    encoding="utf-8",
+                                )
+                                st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"原稿の取り込みに失敗しました: {e}")
         elif st.session_state.mp4_bytes:
             st.download_button(
                 label="MP4をダウンロード",
