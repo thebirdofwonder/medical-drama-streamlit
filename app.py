@@ -184,8 +184,9 @@ def advance_to_video_with_plain_script(edited: str) -> tuple[Path, Path]:
     st.session_state.mp4_path = ""
     st.session_state.last_video_export_mode = None
     queue_widget_clear("ruby_script_editor")
-    queue_widget_value("raw_script_editor_widget", plain)
-    queue_widget_value("final_script_editor_widget", plain)
+    # 入力欄は消して次回、final_script / raw_script から作り直す
+    queue_widget_clear("raw_script_editor_widget")
+    queue_widget_clear("final_script_editor_widget")
     return txt_path, docx_path
 
 def load_saved_reference_text() -> str:
@@ -409,6 +410,45 @@ def apply_pending_widget_values() -> None:
         st.session_state[widget_key] = st.session_state.pop(pk)
 
 
+def run_deferred_script_actions() -> None:
+    """
+    ボタン押下と同じ描画内でウィジェットを触ると衝突するため、
+    次の描画の最初（入力欄を作る前）で原稿取り込みを実行する。
+    """
+    payload = st.session_state.pop("_deferred_reload_script", None)
+    if not payload or not isinstance(payload, dict):
+        return
+    script = normalize_script_keeping_ruby(str(payload.get("text") or ""))
+    source_id = str(payload.get("source_id") or f"deferred-{len(script)}")
+    if not script:
+        st.session_state["_script_import_notice"] = "原稿が空でした。"
+        return
+    commit_loaded_script(script, source_id)
+    if payload.get("advance_plain"):
+        st.session_state.review_done = True
+        st.session_state.skip_review = True
+        try:
+            txt_path, docx_path = advance_to_video_with_plain_script(script)
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            (OUTPUT_DIR / "last_script.txt").write_text(
+                st.session_state.final_script,
+                encoding="utf-8",
+            )
+            st.session_state["_script_import_notice"] = (
+                "新しい原稿を取り込み、動画作成の準備をしました。\n"
+                f"- `{txt_path.name}`\n"
+                f"- `{docx_path.name}`"
+            )
+        except Exception as e:  # noqa: BLE001
+            st.session_state["_script_import_notice"] = (
+                f"原稿の取り込みに失敗しました: {e}"
+            )
+    else:
+        st.session_state["_script_import_notice"] = (
+            f"原稿を取り込みました（約 {len(script):,} 字）"
+        )
+
+
 def commit_loaded_script(text: str, source_id: str) -> None:
     """
     読み込んだ台本をセッションに入れ、以降の工程を最初からにする。
@@ -419,9 +459,9 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.raw_script = script
     st.session_state.final_script = script
     st.session_state.final_script_editor = script
-    # 表示中ウィジェットへは直接書かず、次回描画で反映する
-    queue_widget_value("final_script_editor_widget", script)
-    queue_widget_value("raw_script_editor_widget", script)
+    # 表示中ウィジェットへは直接書かず、次回描画で消してから初期化し直す
+    queue_widget_clear("final_script_editor_widget")
+    queue_widget_clear("raw_script_editor_widget")
     st.session_state.review = None
     st.session_state.review_done = False
     st.session_state.skip_review = False
@@ -433,9 +473,12 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     queue_widget_clear("ruby_script_editor")
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
+    st.session_state.pop("_mp4_cache_key", None)
+    st.session_state.pop("_mp4_cache_bytes", None)
     st.session_state.review_apply_log = []
     st.session_state.review_manual_log = []
     st.session_state._script_file_id = source_id
+    st.session_state._ruby_loop_file_id = None
 
 
 # ---------------------------------------------------------------------------
@@ -4426,8 +4469,11 @@ def main() -> None:
     )
     inject_app_theme()
     init_state()
-    # ウィジェット生成前に、台本などの予約反映を済ませる
+    # ウィジェット生成前に、予約アクション → 入力欄の値反映 の順で済ませる
+    run_deferred_script_actions()
     apply_pending_widget_values()
+
+    import_notice = st.session_state.pop("_script_import_notice", None)
 
     # MP4作成中は他UIを出さず、誤操作を防ぐ
     # Stop／再読み込みで中断されたあとも通常画面に戻れるようにする
@@ -4486,6 +4532,11 @@ def main() -> None:
         st.rerun()
 
     st.write("医学ドラマ動画メーカー")
+    if import_notice:
+        if str(import_notice).startswith("原稿の取り込みに失敗"):
+            st.error(import_notice)
+        else:
+            st.success(import_notice)
 
     with st.sidebar:
         st.write("設定")
@@ -4748,7 +4799,8 @@ def main() -> None:
         st.success("レビューをスキップしました（既存ルビは残しています）")
 
     # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
-    if st.session_state.review_done:
+    # 動画作成へ進んだあとは最終台本欄を出さない（別原稿取り込み時の衝突防止）
+    if st.session_state.review_done and not st.session_state.script_confirmed:
         if st.session_state.get("skip_review"):
             st.write("2. 原稿を確定")
             if "final_script_editor_widget" not in st.session_state:
@@ -5458,21 +5510,15 @@ def main() -> None:
                             if not script:
                                 st.error("原稿が空でした。")
                             else:
-                                commit_loaded_script(
-                                    script,
-                                    f"loop-{next_script.name}-{len(script)}",
-                                )
-                                st.session_state.review_done = True
-                                st.session_state.skip_review = True
-                                # ルビなし確定と同じ流れへ
-                                advance_to_video_with_plain_script(script)
-                                st.session_state.mp4_bytes = None
-                                st.session_state.mp4_path = ""
-                                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                                (OUTPUT_DIR / "last_script.txt").write_text(
-                                    st.session_state.final_script,
-                                    encoding="utf-8",
-                                )
+                                # 同じ描画内で入力欄キーを触らない。
+                                # 次の描画の最初で取り込み＋動画準備を行う。
+                                st.session_state["_deferred_reload_script"] = {
+                                    "text": script,
+                                    "source_id": (
+                                        f"loop-{next_script.name}-{len(script)}"
+                                    ),
+                                    "advance_plain": True,
+                                }
                                 st.rerun()
                         except Exception as e:  # noqa: BLE001
                             st.error(f"原稿の取り込みに失敗しました: {e}")
