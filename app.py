@@ -287,6 +287,8 @@ CLAUDE_MODEL_CANDIDATES = [
 REVIEW_SCRIPT_MAX_CHARS = 12000
 # 論文PDF→台本化：論文本文の送付上限・VOICEVOX 1倍速 10〜12分目安
 PAPER_TEXT_MAX_CHARS = 100000
+# Claude 1回あたりの待ち上限（秒）。長すぎると画面が止まったように見える
+CLAUDE_HTTP_TIMEOUT_SEC = 120
 # 日本語ナレーション目安 約300〜330字/分 × 10〜12分（VOICEVOX 1.0倍速）
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
@@ -1439,6 +1441,7 @@ def _claude_messages_text(
     prompt: str,
     *,
     max_tokens: int = 16000,
+    timeout_sec: int | None = None,
 ) -> tuple[str, str]:
     """Claude Messages API を呼び、返答テキストと使用モデル名を返す。"""
     url = "https://api.anthropic.com/v1/messages"
@@ -1447,6 +1450,7 @@ def _claude_messages_text(
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+    timeout = int(timeout_sec or CLAUDE_HTTP_TIMEOUT_SEC)
     last_error = ""
     for model in CLAUDE_MODEL_CANDIDATES:
         body = {
@@ -1456,7 +1460,7 @@ def _claude_messages_text(
         }
         try:
             resp = http_session_direct().post(
-                url, headers=headers, json=body, timeout=300
+                url, headers=headers, json=body, timeout=timeout
             )
         except requests.exceptions.ProxyError as e:
             raise RuntimeError(
@@ -1552,7 +1556,7 @@ def polish_drama_script_medically(script: str, api_key: str) -> str:
 def generate_drama_script_from_paper(paper_text: str, api_key: str) -> str:
     """
     医学論文テキストから、VOICEVOX 1倍速で約10〜12分のナレーション台本を作る。
-    生成後に医学的な自己校正パスを1回行う。
+    （安定化のため、医学校正の2回目APIは呼ばない）
     """
     paper = (paper_text or "").strip()
     if not paper:
@@ -1562,21 +1566,16 @@ def generate_drama_script_from_paper(paper_text: str, api_key: str) -> str:
             "論文から台本を作るには ANTHROPIC_API_KEY（Claude用の鍵）が必要です。"
             "画面上部でキーを入力・保存してください。"
         )
+    # 安定化: 医学校正の2回目APIは行わない（待ち時間が倍になり画面が止まったように見える）
     draft, model_used = _claude_messages_text(
         api_key,
         build_drama_script_prompt(paper),
         max_tokens=16000,
+        timeout_sec=CLAUDE_HTTP_TIMEOUT_SEC,
     )
     draft = _strip_script_wrappers(draft)
     if not draft:
         raise RuntimeError("台本が空でした。もう一度お試しください。")
-    try:
-        polished = polish_drama_script_medically(draft, api_key)
-        if polished.strip():
-            draft = polished
-    except Exception:
-        # 校正に失敗しても下書きは返す
-        pass
     _ = model_used
     return draft.strip()
 
@@ -2037,6 +2036,19 @@ def fetch_voicevox_speakers() -> list[dict[str, Any]]:
     if not isinstance(data, list) or not data:
         raise RuntimeError("VOICEVOXに利用可能な声優がありません。")
     return data
+
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def check_voicevox_cached() -> tuple[bool, str]:
+    """VOICEVOX接続確認（30秒キャッシュ。毎回待つとUIが重い）。"""
+    return check_voicevox()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_voicevox_speakers_cached() -> list[dict[str, Any]]:
+    """声優一覧（60秒キャッシュ）。"""
+    return fetch_voicevox_speakers()
 
 
 def talk_styles_for_speaker(speaker: dict[str, Any]) -> list[dict[str, Any]]:
@@ -4433,15 +4445,22 @@ def main() -> None:
             st.rerun()
 
         job = st.session_state.get("_export_job")
-        # pending / running 以外（古い状態・不明）は自動再開せず中断扱いにする
-        if job not in ("pending", "running"):
-            job = "running"
-        # Stop などで中断されたあと：自動再開せず、再開／中止を選ばせる
-        if job == "running":
+        # pending 以外（running・None・古い状態）は自動再開せず、再開／中止を選ばせる
+        # ※ running に強制変換すると「作成中のまま戻れない」状態が続きやすい
+        if job != "pending":
             st.error("前回の作成が中断されたか、作成モードのまま残っています。")
-            if st.button("最初から再開する", type="primary", key="btn_restart_export"):
-                st.session_state._export_job = "pending"
-                st.rerun()
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button(
+                    "最初から再開する", type="primary", key="btn_restart_export"
+                ):
+                    st.session_state._export_job = "pending"
+                    st.rerun()
+            with col_b:
+                if st.button("通常画面に戻る", key="btn_exit_export_stuck"):
+                    st.session_state.video_encoding = False
+                    st.session_state._export_job = None
+                    st.rerun()
             st.stop()
 
         # pending → 書き出し開始
@@ -4470,7 +4489,18 @@ def main() -> None:
 
     with st.sidebar:
         st.write("設定")
-        ok, ver = check_voicevox()
+        if st.button("画面をリセット", key="btn_sidebar_reset_ui"):
+            st.session_state.video_encoding = False
+            st.session_state._export_job = None
+            st.session_state.pop("_mp4_cache_key", None)
+            st.session_state.pop("_mp4_cache_bytes", None)
+            try:
+                check_voicevox_cached.clear()
+                fetch_voicevox_speakers_cached.clear()
+            except Exception:
+                pass
+            st.rerun()
+        ok, ver = check_voicevox_cached()
         if ok:
             st.caption(f"VOICEVOX OK（{ver}）")
         else:
@@ -4520,6 +4550,9 @@ def main() -> None:
             type=["pdf"],
             key="paper_pdf_upload",
         )
+        pdf_notice = st.session_state.pop("_pdf_import_notice", None)
+        if pdf_notice:
+            st.success(pdf_notice)
         if st.button(
             "PDFから台本を作成",
             type="primary",
@@ -4537,7 +4570,8 @@ def main() -> None:
                         raw = paper_pdf.getvalue()
                         paper_text = extract_text_from_pdf_bytes(raw)
                     with st.spinner(
-                        "台本を作成中です（数分かかることがあります）…"
+                        "台本を作成中です（1〜3分かかることがあります。"
+                        "止まったように見えても待ってください）…"
                     ):
                         script = generate_drama_script_from_paper(paper_text, api_key)
                     if not script.strip():
@@ -4553,11 +4587,9 @@ def main() -> None:
                         (OUTPUT_DIR / "last_script.txt").write_text(
                             script, encoding="utf-8"
                         )
-                        # 論文から Vancouver 方式の参考文献を作り、エンディングへ反映
-                        with st.spinner("参考文献を作成中…"):
-                            citation = extract_vancouver_citation_from_paper(
-                                paper_text, api_key
-                            )
+                        # 安定化: 台本作成直後の Claude 再呼び出しはしない
+                        # （参考文献は PDF 先頭から簡易抽出。必要なら後で手直し）
+                        citation = _heuristic_vancouver_from_paper(paper_text)
                         if citation:
                             apply_paper_reference_to_session(citation)
                         else:
@@ -4566,10 +4598,11 @@ def main() -> None:
                             )
                         n_ruby = count_voicevox_ruby(script)
                         ruby_note = f"・ルビ {n_ruby} 件" if n_ruby else ""
-                        st.success(
+                        st.session_state["_pdf_import_notice"] = (
                             f"取り込み完了: {paper_pdf.name}"
                             f"（約 {len(script):,} 字{ruby_note}）"
                         )
+                        st.rerun()
                 except Exception as e:  # noqa: BLE001
                     st.error(f"台本作成に失敗しました: {e}")
 
@@ -5068,11 +5101,11 @@ def main() -> None:
             st.session_state.get("vvox_style_name", DEFAULT_STYLE_NAME)
         )
         try:
-            ok_vv, _ver = check_voicevox()
+            ok_vv, _ver = check_voicevox_cached()
             if not ok_vv:
                 st.warning("VOICEVOXに接続できません。起動して再読み込みしてください。")
             else:
-                speakers = fetch_voicevox_speakers()
+                speakers = fetch_voicevox_speakers_cached()
                 speaker_names = [
                     str(s.get("name") or "").strip()
                     for s in speakers
@@ -5253,11 +5286,16 @@ def main() -> None:
             )
             st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
             st.caption(f"今回の台本: {script_kind}／動画: {mode_kind}")
-            # 大きいMP4を毎回メモリに載せると落ちやすいので上限を設ける
+            # 大きいMP4を毎回ディスクから読むと落ちやすい → 1回だけメモリに載せる
             if size_mb < 180:
+                mp4_stat = Path(mp4_path).stat()
+                cache_key = (mp4_path, mp4_stat.st_mtime_ns, mp4_stat.st_size)
+                if st.session_state.get("_mp4_cache_key") != cache_key:
+                    st.session_state._mp4_cache_bytes = Path(mp4_path).read_bytes()
+                    st.session_state._mp4_cache_key = cache_key
                 st.download_button(
                     label="MP4をダウンロード",
-                    data=Path(mp4_path).read_bytes(),
+                    data=st.session_state._mp4_cache_bytes,
                     file_name=st.session_state.mp4_name,
                     mime="video/mp4",
                     type="primary",
