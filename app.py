@@ -14,6 +14,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import uuid
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -71,11 +72,13 @@ BGM_CANDIDATE_URLS = [
 ]
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
-# ルビ辞書ファイル（用語とよみの対照表）
+# ルビ辞書ファイル（用語とよみの対照表）→ VOICEVOX ユーザー辞書へ渡す
 RUBY_DICT_PATH = WORK_DIR / "data" / "medical_ruby_dict.tsv"
-# 修正反映後のダウンロード用辞書
-RUBY_DICT_EXPORT_NAME = "ルビ辞書.txt"
+# デスクトップ／ダウンロード用の読み方辞書ファイル名
+RUBY_DICT_EXPORT_NAME = "VOICEVOX読み方辞書.txt"
 RUBY_DICT_EXPORT_PATH = OUTPUT_DIR / RUBY_DICT_EXPORT_NAME
+# VOICEVOX user_dict 用の安定UUID名前空間（同じ用語は毎回同じID）
+VOICEVOX_USER_DICT_NS = uuid.UUID("6f1c9a2e-8b47-4d3f-9c10-2a7e5b8d4f31")
 
 # 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
 MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
@@ -292,7 +295,7 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左下で確認できる修正版番号（古い画面のままだと取り込みが失敗しやすい）
-APP_BUILD = "fix-widget-20260809c"
+APP_BUILD = "vvox-dict-20260809d"
 
 
 # ---------------------------------------------------------------------------
@@ -991,9 +994,9 @@ def load_ruby_dict_from_path(path: Path | None = None) -> list[tuple[str, str]]:
 
 def get_active_ruby_dictionary() -> list[tuple[str, str]]:
     """
-    使うルビ辞書を返す。
-    優先: 編集で学習した語 → 画面で読み込んだ辞書 → 標準辞書 → 組み込み
-    同じ用語は先勝ち。
+    VOICEVOX に渡す読み方辞書を返す。
+    優先: 画面で手動アップロードした辞書 → 標準辞書ファイル → 組み込み
+    （自動学習・自動更新はしない。同じ用語は先勝ち）
     """
     merged: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -1007,21 +1010,158 @@ def get_active_ruby_dictionary() -> list[tuple[str, str]]:
             seen.add(surface)
             merged.append((surface, reading))
 
-    learned = None
     custom = None
     try:
-        learned = st.session_state.get("ruby_dict_learned")
         custom = st.session_state.get("ruby_dict_custom")
     except Exception:
-        learned = None
         custom = None
-    if isinstance(learned, list) and learned:
-        _add([(str(a), str(b)) for a, b in learned])
     if isinstance(custom, list) and custom:
         _add([(str(a), str(b)) for a, b in custom])
     _add(load_ruby_dict_from_path(RUBY_DICT_PATH))
     _add(DEFAULT_RUBY_DICT)
     return merged
+
+
+def save_ruby_dict_to_desktop(
+    pairs: list[tuple[str, str]] | None = None,
+) -> Path:
+    """読み方辞書をデスクトップへ保存する（手動編集用）。"""
+    data = pairs if pairs is not None else get_active_ruby_dictionary()
+    text = format_ruby_dict_text(data)
+    desktop = get_desktop_dir()
+    path = desktop / RUBY_DICT_EXPORT_NAME
+    path.write_text(text, encoding="utf-8")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    RUBY_DICT_EXPORT_PATH.write_text(text, encoding="utf-8")
+    try:
+        st.session_state.ruby_dict_export_ready = True
+        st.session_state.last_ruby_dict_desktop = str(path)
+    except Exception:
+        pass
+    return path
+
+
+def hiragana_to_katakana(text: str) -> str:
+    """ひらがなをカタカナへ（VOICEVOX発音用）。"""
+    out: list[str] = []
+    for ch in text or "":
+        code = ord(ch)
+        if 0x3041 <= code <= 0x3096:
+            out.append(chr(code + 0x60))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def reading_to_voicevox_pronunciation(reading: str) -> str:
+    """
+    辞書のよみを VOICEVOX 用カタカナ発音へ変換する。
+    無効な文字が残る場合は空文字（その語はスキップ）。
+    """
+    t = hiragana_to_katakana(normalize_voicevox_reading(reading))
+    t = (
+        t.replace("・", "")
+        .replace(" ", "")
+        .replace("　", "")
+        .replace("-", "ー")
+        .replace("ｰ", "ー")
+    )
+    if not t or not re.fullmatch(r"[ァ-ヴー]+", t):
+        return ""
+    return t
+
+
+def count_katakana_mora(pronunciation: str) -> int:
+    """カタカナ発音のモーラ数（簡易）。"""
+    small = set("ァィゥェォャュョヮ")
+    n = 0
+    for ch in pronunciation or "":
+        if ch in small:
+            continue
+        if ch == "ッ":
+            n += 1
+            continue
+        if "ァ" <= ch <= "ヶ" or ch == "ー" or ch == "ヴ":
+            n += 1
+    return max(1, n)
+
+
+def build_voicevox_user_dict_payload(
+    pairs: list[tuple[str, str]],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """
+    TSV辞書 → VOICEVOX /import_user_dict 用JSON。
+    戻り値: (payload, スキップした用語の一覧)
+    """
+    payload: dict[str, dict[str, Any]] = {}
+    skipped: list[str] = []
+    for surface, reading in pairs:
+        surface = (surface or "").strip()
+        if not surface or "," in surface or '"' in surface:
+            if surface:
+                skipped.append(surface)
+            continue
+        pron = reading_to_voicevox_pronunciation(reading)
+        if not pron:
+            skipped.append(surface)
+            continue
+        mora = count_katakana_mora(pron)
+        # アクセントは語末（尾高）を既定にする
+        accent = mora
+        word_uuid = str(uuid.uuid5(VOICEVOX_USER_DICT_NS, surface))
+        payload[word_uuid] = {
+            "surface": surface,
+            "priority": 9,
+            "context_id": 1348,
+            "part_of_speech": "名詞",
+            "part_of_speech_detail_1": "固有名詞",
+            "part_of_speech_detail_2": "一般",
+            "part_of_speech_detail_3": "*",
+            "inflectional_type": "*",
+            "inflectional_form": "*",
+            "stem": "*",
+            "yomi": pron,
+            "pronunciation": pron,
+            "accent_type": accent,
+            "mora_count": mora,
+            "accent_associative_rule": "*",
+        }
+    return payload, skipped
+
+
+def push_ruby_dict_to_voicevox(
+    pairs: list[tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    """
+    読み方辞書を VOICEVOX のユーザー辞書へ読み込ませる。
+    MP4作成のたびに呼ぶ。
+    """
+    data = pairs if pairs is not None else get_active_ruby_dictionary()
+    payload, skipped = build_voicevox_user_dict_payload(data)
+    if not payload:
+        raise RuntimeError(
+            "VOICEVOXへ送れる読み方辞書が空です。"
+            "カタカナ／ひらがなのよみがある辞書をアップロードしてください。"
+        )
+    try:
+        resp = http_session_direct().post(
+            f"{VOICEVOX_URL}/import_user_dict",
+            params={"override": "true"},
+            json=payload,
+            timeout=120,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"VOICEVOX辞書の読み込みに失敗しました: {e}") from e
+    if resp.status_code not in (200, 204):
+        raise RuntimeError(
+            "VOICEVOX辞書の読み込みに失敗しました: "
+            f"HTTP {resp.status_code} / {(resp.text or '')[:300]}"
+        )
+    return {
+        "imported": len(payload),
+        "skipped": skipped,
+        "source_pairs": len(data),
+    }
 
 
 def extract_ruby_pairs_from_script(script: str) -> list[tuple[str, str]]:
@@ -2124,24 +2264,9 @@ def run_script_review(script: str) -> dict[str, Any]:
         result = heuristic_review(review_text)
     result["review_truncated"] = truncated
 
-    # 辞書ルビを優先し、そのあと AI 提案ルビ（同じ用語は辞書が勝つ）
-    dict_ann = collect_dictionary_ruby_annotations(script)
-    ai_ann: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for item in result.get("ruby_annotations") or []:
-        surface = str(item.get("surface") or "").strip()
-        if not surface or surface in seen:
-            continue
-        seen.add(surface)
-        ai_ann.append(
-            {
-                "surface": surface,
-                "reading": normalize_voicevox_reading(str(item.get("reading") or "")),
-            }
-        )
-    merged = merge_ruby_annotations(dict_ann, ai_ann)
-    result["ruby_annotations"] = merged
-    result["script_with_ruby"] = apply_voicevox_ruby(script, merged, fullwidth=True)
+    # 台本へルビを埋め込む工程は使わない（読みは VOICEVOX ユーザー辞書へ渡す）
+    result["ruby_annotations"] = []
+    result["script_with_ruby"] = script
     return result
 
 
@@ -2777,11 +2902,10 @@ def generate_narration_wav_to_file(
             if progress_callback:
                 progress_callback(i, len(chunks))
             part = part_dir / f"part_{i:05d}.wav"
-            # VOICEVOXへはよみがなのみ、字幕には表記のみ（同じ区間の実時間を共有）
-            tts_text = expand_voicevox_ruby_to_reading(chunk).strip()
+            # 表記のまま送る（読み分けは VOICEVOX ユーザー辞書に任せる）
+            # 万一ルビ記号が残っていても表記だけにする
             display = strip_voicevox_ruby(chunk).strip()
-            if not tts_text:
-                tts_text = display
+            tts_text = display
             if not tts_text:
                 # 空区間はスキップ（無音も字幕も入れない）
                 continue
@@ -4329,15 +4453,24 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
     )
     _pct(2, "台本を準備中…")
-    # 確定済み台本を使う（ルビなしでも可。ルビありならその読みで音声化）
-    voice_script = canonicalize_voicevox_ruby_delimiters(
+    # 台本は平文のまま（読みは VOICEVOX ユーザー辞書へ渡す）
+    voice_script = strip_voicevox_ruby(
         str(st.session_state.get("ruby_script") or st.session_state.get("final_script") or "")
     ).strip()
     if not voice_script:
         raise RuntimeError("台本が空です。先に台本を確定してください。")
-    ruby_count = count_voicevox_ruby(voice_script)
 
     save_reference_text(st.session_state.get("reference_text", ""))
+
+    _pct(3, "読み方辞書を VOICEVOX へ読み込み中…")
+    dict_pairs = get_active_ruby_dictionary()
+    dict_info = push_ruby_dict_to_voicevox(dict_pairs)
+    try:
+        desktop_dict = save_ruby_dict_to_desktop(dict_pairs)
+        st.session_state.last_ruby_dict_desktop = str(desktop_dict)
+    except Exception:
+        desktop_dict = None
+    st.session_state.last_voicevox_dict_import = dict_info
 
     video_title = str(st.session_state.get("video_title") or "").strip()
     script_docx_name = make_script_docx_filename(video_title)
@@ -4347,21 +4480,19 @@ def run_video_export(progress, pct_box, status) -> None:
     script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
     # 旧固定名も残す（互換）
     (OUTPUT_DIR / "last_script.docx").write_bytes(script_docx_path.read_bytes())
-    tts_script = expand_voicevox_ruby_to_reading(voice_script)
-    sub_script = strip_voicevox_ruby(voice_script)
-    (OUTPUT_DIR / "last_script_tts.txt").write_text(tts_script, encoding="utf-8")
+    (OUTPUT_DIR / "last_script_tts.txt").write_text(voice_script, encoding="utf-8")
     (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
-        sub_script, encoding="utf-8"
+        voice_script, encoding="utf-8"
     )
     st.session_state.last_script_path = str(script_docx_path)
     st.session_state.last_script_name = script_docx_name
 
     with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
         tmp_path = Path(tmp)
-        ruby_msg = f"ルビ{ruby_count}件"
+        dict_msg = f"辞書{dict_info.get('imported', 0)}語"
         _pct(
             5,
-            f"音声生成中（{speaker_name} / {style_name}・{ruby_msg}・"
+            f"音声生成中（{speaker_name} / {style_name}・{dict_msg}・"
             f"{speed_scale:.1f}倍）…",
         )
         wav_path = tmp_path / "narration.wav"
@@ -4487,18 +4618,14 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.last_video_export_mode = (
             "final" if include_background else "draft"
         )
-        # ルビ入り最終原稿 ↔ 辞書を比較し、足りないルビを追加
-        _pct(99, "ルビ辞書を更新中…")
-        applied = sync_script_rubies_into_dictionary(voice_script)
+        # 辞書の自動アップデートは行わない（手動アップロード方式）
         mode_label = "最終版（背景あり）" if include_background else "ドラフト（背景なし）"
-        if applied:
-            _pct(
-                100,
-                f"完了・{mode_label}（辞書にルビを {len(applied)} 件追加）",
-            )
-        else:
-            _pct(100, f"完了・{mode_label}")
-        status.success(f"完了（{mode_label}）: {desktop_path}")
+        dict_n = int((st.session_state.get("last_voicevox_dict_import") or {}).get("imported") or 0)
+        _pct(100, f"完了・{mode_label}（VOICEVOX辞書 {dict_n} 語）")
+        extra = ""
+        if desktop_dict is not None:
+            extra = f"\n読み方辞書: `{desktop_dict}`"
+        status.success(f"完了（{mode_label}）: {desktop_path}{extra}")
         # 完成を耳で知らせる（ポーン）
         play_done_chime()
 
@@ -4999,169 +5126,108 @@ def main() -> None:
                     except Exception as e:  # noqa: BLE001
                         st.error(f"台本の保存に失敗しました: {e}")
 
-    # ----- Step 3: 動画作成（ルビなし確認 → ルビあり修正 → 最終版） -----
+    # ----- Step 3: 動画作成（読み方辞書は MP4 直前に VOICEVOX へ渡す） -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
         render_video_title_input()
 
-        voice_now = str(
-            st.session_state.get("ruby_script")
-            or st.session_state.get("final_script")
-            or ""
+        voice_now = strip_voicevox_ruby(
+            str(
+                st.session_state.get("ruby_script")
+                or st.session_state.get("final_script")
+                or ""
+            )
         ).strip()
-        n_ruby_now = count_voicevox_ruby(voice_now)
+        # 台本は平文で扱う（埋め込みルビ工程は使わない）
+        st.session_state.ruby_script = voice_now
+        st.session_state.ruby_ready = bool(voice_now)
         mode_now = str(st.session_state.get("video_export_mode") or "draft")
 
         st.write("作業の流れ")
         st.markdown(
             """
-1. **A. 最初の確認** … ルビなし台本で、ドラフトMP4（背景なし）を作る  
-2. **B. 読み直し** … 読み・抑揚を直した「ルビあり台本」を上げて、ドラフトを作り直す  
+1. **A. 最初の確認** … 台本でドラフトMP4（背景なし）を作る  
+2. **B. 読み方** … 読みがおかしい語は、読み方辞書を手直ししてアップロードする  
 3. **C. 仕上げ** … 読みが固まったら、最終版（背景あり）を作る  
             """.strip()
         )
-        if n_ruby_now:
-            st.caption(f"いまの台本: ルビあり（{n_ruby_now} 件）／動画種類の初期値: {mode_now}")
-        else:
-            st.caption("いまの台本: ルビなし／最初はドラフト（背景なし）で確認します")
+        st.caption(f"いまの台本: 平文／動画種類の初期値: {mode_now}")
 
         plain_txt = st.session_state.get("last_plain_script_txt") or ""
         if plain_txt and Path(plain_txt).exists():
-            st.caption(f"デスクトップのルビなし台本: `{Path(plain_txt).name}`")
+            st.caption(f"デスクトップの台本: `{Path(plain_txt).name}`")
 
-        # 任意: アプリ内で辞書ルビを付ける（通常はデスクトップで直して上げる）
-        with st.expander("（任意）アプリ内でルビを付ける・直す", expanded=False):
-            st.caption(
-                "普段はデスクトップのルビなし台本を直し、ルビあり台本をアップロードします。"
-                "ここはアプリ内だけでルビを試すときの補助です。"
-            )
-            dict_file = st.file_uploader(
-                "追加辞書（.tsv / .txt / .csv）",
-                type=["tsv", "txt", "csv"],
-                key="ruby_dict_upload",
-            )
-            if dict_file is not None:
-                try:
-                    raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
-                    pairs = parse_ruby_dict_text(raw_dict)
-                    if not pairs:
-                        st.warning("辞書から用語を読み取れませんでした。")
-                    else:
-                        file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
-                        if st.session_state.get("_ruby_dict_file_id") != file_id:
-                            st.session_state.ruby_dict_custom = pairs
-                            st.session_state.ruby_dict_source_name = dict_file.name
-                            st.session_state._ruby_dict_file_id = file_id
+        # MP4作成直前: 読み方辞書を手動アップロード（自動更新なし）
+        st.write("VOICEVOX 読み方辞書")
+        st.caption(
+            "MP4を作る直前に、手元で直した辞書をアップロードしてください。"
+            "未指定のときは標準辞書を使います。"
+            "辞書は台本には埋め込まず、VOICEVOX 本体へ毎回読み込みます。"
+        )
+        dict_file = st.file_uploader(
+            "読み方辞書（.tsv / .txt / .csv）",
+            type=["tsv", "txt", "csv"],
+            key="ruby_dict_upload_before_mp4",
+        )
+        if dict_file is not None:
+            try:
+                raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
+                pairs = parse_ruby_dict_text(raw_dict)
+                if not pairs:
+                    st.warning("辞書から用語を読み取れませんでした。")
+                else:
+                    file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
+                    if st.session_state.get("_ruby_dict_file_id") != file_id:
+                        st.session_state.ruby_dict_custom = pairs
+                        st.session_state.ruby_dict_source_name = dict_file.name
+                        st.session_state._ruby_dict_file_id = file_id
+                        try:
+                            desk = save_ruby_dict_to_desktop(pairs)
                             st.success(
-                                f"追加辞書: {dict_file.name}（{len(pairs)} 語）"
+                                f"辞書を取り込みました: {dict_file.name}"
+                                f"（{len(pairs)} 語）\nデスクトップへ保存: `{desk}`"
                             )
+                        except Exception as e:  # noqa: BLE001
+                            st.success(
+                                f"辞書を取り込みました: {dict_file.name}"
+                                f"（{len(pairs)} 語）"
+                            )
+                            st.warning(f"デスクトップ保存に失敗: {e}")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"辞書の読込失敗: {e}")
+
+        active_n = len(get_active_ruby_dictionary())
+        src_name = st.session_state.get("ruby_dict_source_name") or (
+            RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
+        )
+        st.caption(f"今回使う辞書: {src_name}（{active_n} 語）")
+        col_dict_desk, col_dict_dl = st.columns(2)
+        with col_dict_desk:
+            if st.button(
+                "辞書をデスクトップへ保存",
+                key="btn_save_ruby_dict_desktop",
+                use_container_width=True,
+            ):
+                try:
+                    desk = save_ruby_dict_to_desktop()
+                    st.success(f"保存しました: `{desk}`")
                 except Exception as e:  # noqa: BLE001
-                    st.error(f"辞書の読込失敗: {e}")
-            active_n = len(get_active_ruby_dictionary())
-            src_name = st.session_state.get("ruby_dict_source_name") or (
-                RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
-            )
-            learned_n = len(st.session_state.get("ruby_dict_learned") or [])
-            st.caption(
-                f"辞書: 標準 + {src_name}（{active_n} 語"
-                + (f"・修正反映 {learned_n} 語" if learned_n else "")
-                + "）"
-            )
-            if st.session_state.get("ruby_dict_export_ready") and RUBY_DICT_EXPORT_PATH.is_file():
+                    st.error(f"保存に失敗しました: {e}")
+        with col_dict_dl:
+            try:
+                export_text = format_ruby_dict_text(get_active_ruby_dictionary())
                 st.download_button(
-                    "ルビ辞書.txt をダウンロード",
-                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
+                    "辞書をダウンロード",
+                    data=export_text.encode("utf-8"),
                     file_name=RUBY_DICT_EXPORT_NAME,
                     mime="text/plain",
                     key="dl_ruby_dict_pre_video",
-                )
-
-            col_ruby_on, col_ruby_skip = st.columns(2)
-            with col_ruby_on:
-                apply_ruby_clicked = st.button(
-                    "辞書でルビを付ける",
-                    type="secondary",
-                    key="btn_apply_dict_ruby_pre_video",
                     use_container_width=True,
                 )
-            with col_ruby_skip:
-                skip_ruby_clicked = st.button(
-                    "ルビなしのままにする",
-                    key="btn_skip_ruby_pre_video",
-                    use_container_width=True,
-                )
+            except Exception as e:  # noqa: BLE001
+                st.caption(f"ダウンロード準備失敗: {e}")
 
-            if apply_ruby_clicked:
-                base = normalize_script_keeping_ruby(
-                    st.session_state.get("final_script") or ""
-                )
-                if not base:
-                    st.error("原稿が空です。先に台本を確定してください。")
-                else:
-                    with st.spinner("辞書でルビを付けています…"):
-                        ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(base)
-                    st.session_state.ruby_script = ruby_script
-                    st.session_state.ruby_script_baseline = ruby_script
-                    bump_editor_rev()
-                    st.session_state.ruby_ready = True
-                    st.session_state.ruby_skipped = False
-                    st.session_state.video_export_mode = "draft"
-                    st.rerun()
-
-            if skip_ruby_clicked:
-                base = prepare_plain_script_for_video(
-                    st.session_state.get("final_script") or ""
-                )
-                if not base:
-                    st.error("原稿が空です。先に台本を確定してください。")
-                else:
-                    st.session_state.ruby_script = base
-                    st.session_state.ruby_script_baseline = base
-                    bump_editor_rev()
-                    st.session_state.ruby_ready = True
-                    st.session_state.ruby_skipped = True
-                    st.session_state.ruby_dict_last_updates = []
-                    st.session_state.video_export_mode = "draft"
-                    st.rerun()
-
-            ruby_key = ensure_editor_value(
-                "ruby_script_editor",
-                st.session_state.get("ruby_script")
-                or st.session_state.get("final_script")
-                or "",
-            )
-            st.text_area(
-                "台本（編集・上書き可）",
-                height=240,
-                key=ruby_key,
-            )
-            if st.button(
-                "この内容で台本を上書き確定",
-                key="btn_confirm_ruby_script",
-            ):
-                edited_ruby = normalize_script_keeping_ruby(
-                    read_editor_value("ruby_script_editor")
-                )
-                if not edited_ruby:
-                    st.error("台本が空です。")
-                else:
-                    baseline = str(
-                        st.session_state.get("ruby_script_baseline")
-                        or st.session_state.get("ruby_script")
-                        or ""
-                    )
-                    updates = find_ruby_dict_updates(baseline, edited_ruby)
-                    applied = apply_ruby_updates_to_learned_dict(updates)
-                    st.session_state.ruby_script = edited_ruby
-                    st.session_state.ruby_ready = True
-                    st.session_state.ruby_skipped = not bool(
-                        count_voicevox_ruby(edited_ruby)
-                    )
-                    st.session_state.ruby_dict_last_updates = applied
-                    st.session_state.video_export_mode = "draft"
-                    st.rerun()
-
-        # 台本が空なら止める（ルビの有無は問わない）
+        # 台本が空なら止める
         if not voice_now:
             st.warning("台本が空です。Step 2 で台本を確定してください。")
             st.stop()
@@ -5403,25 +5469,23 @@ def main() -> None:
         mp4_path = st.session_state.get("mp4_path") or ""
         if mp4_path and Path(mp4_path).exists():
             size_mb = Path(mp4_path).stat().st_size / (1024 * 1024)
-            used_script = str(
-                st.session_state.get("ruby_script")
-                or st.session_state.get("final_script")
-                or ""
-            )
-            used_ruby_n = count_voicevox_ruby(used_script)
             last_mode = str(
                 st.session_state.get("last_video_export_mode")
                 or st.session_state.get("video_export_mode")
                 or "draft"
             )
-            script_kind = "ルビあり" if used_ruby_n else "ルビなし"
             mode_kind = (
                 "最終版（背景あり）"
                 if last_mode == "final"
                 else "ドラフト（背景なし）"
             )
+            dict_info = st.session_state.get("last_voicevox_dict_import") or {}
+            dict_n = int(dict_info.get("imported") or 0)
             st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
-            st.caption(f"今回の台本: {script_kind}／動画: {mode_kind}")
+            st.caption(f"今回の動画: {mode_kind}／VOICEVOX辞書 {dict_n} 語")
+            desk_dict = st.session_state.get("last_ruby_dict_desktop") or ""
+            if desk_dict:
+                st.caption(f"読み方辞書（デスクトップ）: `{desk_dict}`")
             # 大きいMP4を毎回ディスクから読むと落ちやすい → 1回だけメモリに載せる
             if size_mb < 180:
                 mp4_stat = Path(mp4_path).stat()
@@ -5460,49 +5524,31 @@ def main() -> None:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-            # 動画作成後: ルビ入り最終原稿と辞書の差分を反映済み
-            post_ruby = st.session_state.get("ruby_dict_post_video_updates") or []
-            st.write("ルビ辞書（動画作成後）")
-            if post_ruby:
-                st.success(
-                    f"ルビ入り最終原稿にあって辞書になかったルビを "
-                    f"{len(post_ruby)} 件、辞書へ追加しました。"
-                )
-                preview = "、".join(f"{s}（{r}）" for s, r in post_ruby[:15])
-                if len(post_ruby) > 15:
-                    preview += "…"
-                st.caption(preview)
-            else:
-                st.caption(
-                    "今回、辞書に足りないルビはありませんでした"
-                    "（原稿のルビはすべて辞書にありました）。"
-                )
+            # 読み直し: 台本や辞書を手直ししてから作り直す（自動更新なし）
+            st.write("読み直し・仕上げ")
+            st.caption(
+                "読みがおかしいときは、上の読み方辞書を直してアップロードし直すか、"
+                "修正した台本を上げてからドラフトを作り直してください。"
+            )
             if RUBY_DICT_EXPORT_PATH.is_file():
                 st.download_button(
-                    label="ルビ辞書.txt をダウンロード",
+                    label="読み方辞書をダウンロード",
                     data=RUBY_DICT_EXPORT_PATH.read_bytes(),
                     file_name=RUBY_DICT_EXPORT_NAME,
                     mime="text/plain",
                     key="dl_ruby_dict_after_video",
                 )
-
-            # B: ルビあり台本を上げてドラフト再作成 / C: 最終版
-            st.write("読み直し・仕上げ")
-            st.caption(
-                "MP4を聞いて読み・抑揚を直した「ルビあり台本」を上げ、"
-                "ドラフトを作り直します。固まったら最終版へ。"
-            )
-            ruby_upload = st.file_uploader(
-                "ルビあり台本（.txt / .docx）",
+            script_reupload = st.file_uploader(
+                "修正した台本（.txt / .docx）",
                 type=["txt", "docx"],
                 key="ruby_loop_script_upload",
             )
-            if ruby_upload is not None:
-                file_id = f"{ruby_upload.name}-{ruby_upload.size}"
+            if script_reupload is not None:
+                file_id = f"{script_reupload.name}-{script_reupload.size}"
                 if st.session_state.get("_ruby_loop_file_id") != file_id:
                     try:
-                        loaded = load_text_from_upload(ruby_upload).strip()
-                        script = normalize_script_keeping_ruby(loaded)
+                        loaded = load_text_from_upload(script_reupload).strip()
+                        script = strip_voicevox_ruby(loaded).strip()
                         if not script:
                             st.error("台本が空でした。")
                         else:
@@ -5510,39 +5556,31 @@ def main() -> None:
                                 st.session_state.get("video_title") or ""
                             ).strip()
                             txt_p, docx_p = save_script_to_desktop(
-                                script, title, kind="ruby"
+                                script, title, kind="plain"
                             )
                             st.session_state.ruby_script = script
                             st.session_state.ruby_script_baseline = script
                             st.session_state.ruby_ready = True
-                            st.session_state.ruby_skipped = not bool(
-                                count_voicevox_ruby(script)
-                            )
-                            st.session_state.final_script = (
-                                strip_voicevox_ruby(script).strip() or script
-                            )
+                            st.session_state.ruby_skipped = True
+                            st.session_state.final_script = script
                             bump_editor_rev()
                             st.session_state.video_export_mode = "draft"
-                            st.session_state.last_ruby_script_txt = str(txt_p)
-                            st.session_state.last_ruby_script_docx = str(docx_p)
+                            st.session_state.last_plain_script_txt = str(txt_p)
+                            st.session_state.last_plain_script_docx = str(docx_p)
                             st.session_state._ruby_loop_file_id = file_id
                             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                             (OUTPUT_DIR / "last_script.txt").write_text(
                                 script, encoding="utf-8"
                             )
                             st.success(
-                                "ルビあり台本を取り込み、デスクトップへ保存しました。"
+                                "修正台本を取り込み、デスクトップへ保存しました。"
                                 f"\n- `{txt_p.name}`\n- `{docx_p.name}`\n"
-                                "下の「ドラフトMP4を再作成」を押してください。"
+                                "必要なら読み方辞書も上げ直し、"
+                                "「ドラフトMP4を再作成」を押してください。"
                             )
                             st.rerun()
                     except Exception as e:  # noqa: BLE001
-                        st.error(f"ルビあり台本の取り込みに失敗しました: {e}")
-            ruby_saved = st.session_state.get("last_ruby_script_txt") or ""
-            if ruby_saved and Path(ruby_saved).exists():
-                st.caption(
-                    f"デスクトップのルビあり台本: `{Path(ruby_saved).name}`"
-                )
+                        st.error(f"台本の取り込みに失敗しました: {e}")
 
             col_redraft, col_final = st.columns(2)
             with col_redraft:
