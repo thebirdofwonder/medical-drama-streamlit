@@ -4497,7 +4497,9 @@ def inject_app_theme() -> None:
   [data-testid="stAppViewContainer"] { background: #fff; color: #111; }
   [data-testid="stHeader"] { background: #fff; }
   [data-testid="stSidebar"] { background: #fafafa; }
-  h1, h2, h3, h4 { font-size: 1rem !important; font-weight: 600 !important; }
+  /* 見出しは読める大きさにする（以前は小さすぎて「動いてない」ように見えた） */
+  h1 { font-size: 1.6rem !important; font-weight: 700 !important; }
+  h2, h3, h4 { font-size: 1.15rem !important; font-weight: 600 !important; }
   div[data-testid="stAlert"] { border: 1px solid #ccc !important; }
 
   /* 選択ラジオ: 小さく横並び */
@@ -4611,12 +4613,18 @@ def main() -> None:
             st.exception(e)
             st.stop()
 
-    st.write("医学ドラマ動画メーカー")
+    st.title("医学ドラマ動画メーカー")
+    st.success("接続OK：この画面が出ていればアプリは動いています。")
+    st.caption(
+        "動画を作るときは、このパソコンで VOICEVOX を起動してください。"
+    )
 
     with st.sidebar:
         st.write("設定")
         if st.button("画面をリセット", key="btn_sidebar_reset_ui"):
             clear_export_ui_state()
+            st.session_state.video_encoding = False
+            st.session_state._export_job = None
             st.rerun()
         ok, ver = check_voicevox()
         if ok:
