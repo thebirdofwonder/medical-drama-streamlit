@@ -12,11 +12,31 @@ echo "========================================"
 echo " 医学ドラマ動画メーカー を起動します"
 echo "========================================"
 echo ""
-echo "すでに同じアプリが動いている場合は、"
-echo "先にそのターミナルで Ctrl+C を押して止めてください。"
+
+# すでに動いている古いアプリを止める（反応しないとき用）
+echo "古いアプリが残っていれば止めます…"
+if command -v lsof >/dev/null 2>&1; then
+  lsof -ti:8501 2>/dev/null | while read -r pid; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+fi
+pkill -f "streamlit run app.py" 2>/dev/null || true
+pkill -f "python3 -m streamlit run app.py" 2>/dev/null || true
+sleep 1
+
 echo ""
-echo "起動後、ブラウザで次を開いてください:"
-echo "  http://localhost:8501"
+echo "起動後、ブラウザで次を開きます:"
+echo "  http://localhost:8501/?reset=1"
+echo ""
+echo "止めるときは、この窓で Ctrl+C を押してください。"
 echo ""
 
-python3 -m streamlit run app.py
+# 少し待ってからブラウザを開く（macOS）
+if command -v open >/dev/null 2>&1; then
+  (sleep 3 && open "http://localhost:8501/?reset=1") &
+fi
+
+python3 -m streamlit run app.py \
+  --server.port 8501 \
+  --server.address localhost \
+  --browser.gatherUsageStats false
