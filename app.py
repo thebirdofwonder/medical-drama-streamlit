@@ -1800,62 +1800,18 @@ def update_export_progress(
     pct: int,
     message: str = "",
 ) -> None:
-    """進捗バーと％数字を同時に更新する（作成中画面で大きく表示）。"""
+    """互換用（進捗バーは使わない。文言だけ残す）。"""
     n = max(0, min(100, int(pct)))
     msg = (message or "").strip()
-    bar_text = f"{n}%"
-    if msg:
-        bar_text = f"{n}%  {msg}"
-
-    # Streamlit 標準バー（対応バージョンなら text 付き）
-    if progress is not None:
-        try:
-            progress.progress(n, text=bar_text)
-        except TypeError:
-            try:
-                progress.progress(n / 100.0)
-            except Exception:
-                progress.progress(min(max(n / 100.0, 0.0), 1.0))
-
-    # 大きく見やすい自前バー（標準バーが細い環境でも進捗が分かる）
-    safe_msg = msg.replace("<", "&lt;").replace(">", "&gt;")
-    pct_box.markdown(
-        f"""
-<div style="margin:0.6rem 0 0.35rem 0;">
-  <div style="font-size:1.8rem;font-weight:700;color:#111;line-height:1.2;">
-    進捗 {n}%
-  </div>
-  <div style="margin-top:0.55rem;background:#e5e7eb;border-radius:999px;height:22px;overflow:hidden;border:1px solid #d1d5db;">
-    <div style="width:{n}%;height:100%;background:linear-gradient(90deg,#2563eb,#38bdf8);transition:width 0.2s ease;"></div>
-  </div>
-  <div style="margin-top:0.4rem;font-size:1rem;color:#333;">
-    {safe_msg if safe_msg else "処理中…"}
-  </div>
-</div>
-        """.strip(),
-        unsafe_allow_html=True,
-    )
-    if status is not None:
-        if msg:
-            status.info(f"{n}% — {msg}")
-        else:
-            status.info(f"{n}%")
     st.session_state.export_progress_pct = n
     st.session_state.export_progress_msg = msg
+    if status is not None and msg:
+        status.write(msg)
 
 
 def make_export_progress_widgets():
-    """MP4作成画面用の進捗ウィジェットを作る。"""
-    st.markdown("### MP4作成の進捗")
-    st.caption("完了するまでこのページを閉じないでください。")
-    try:
-        progress = st.progress(0, text="0%  準備中…")
-    except TypeError:
-        progress = st.progress(0)
-    pct_box = st.empty()
-    status = st.empty()
-    update_export_progress(progress, pct_box, status, 0, "準備中…")
-    return progress, pct_box, status
+    """互換用。進捗バーは作らない。"""
+    return None, st.empty(), st.empty()
 
 
 def heuristic_review(script: str) -> dict[str, Any]:
@@ -4519,18 +4475,10 @@ def clear_export_ui_state() -> None:
     st.session_state._export_job = None
 
 
-def run_video_export(progress, pct_box, status) -> None:
-    """
-    互換用: 同じプロセス内で同期実行する。
-    通常の画面操作では裏スレッド版を使う。
-    """
+def run_video_export(progress=None, pct_box=None, status=None) -> None:
+    """互換用: 同期で MP4 を作る（進捗バーなし）。"""
     job = collect_export_job_from_session()
-
-    def _cb(n: int, msg: str) -> None:
-        update_export_progress(progress, pct_box, status, n, msg)
-        write_export_status(state="running", pct=n, msg=msg, error="")
-
-    result = run_video_export_job(job, progress_cb=_cb)
+    result = run_video_export_job(job, progress_cb=None)
     apply_export_result_to_session(result)
     if status is not None:
         status.success(
@@ -4611,105 +4559,57 @@ def main() -> None:
     try:
         if str(st.query_params.get("reset", "")) in ("1", "true", "yes"):
             clear_export_ui_state()
-            write_export_status(state="idle", pct=0, msg="", error="")
             st.query_params.clear()
             st.rerun()
     except Exception:
         pass
 
-    # MP4作成中画面（裏スレッドで作成し、ここは進捗表示だけ＝ボタンが反応する）
+    # MP4作成（シンプル同期。進捗バーなし）
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
-        st.info("動画を作成しています。進捗バーが動いていれば正常です。")
-        col_back, col_retry = st.columns(2)
-        with col_back:
-            if st.button("通常画面に戻る", key="btn_cancel_video_encoding"):
-                clear_export_ui_state()
-                st.rerun()
-        with col_retry:
-            if st.button("最初から作り直す", key="btn_restart_export"):
-                if is_export_thread_running():
-                    st.warning("いまの作成が終わるまで待つか、通常画面に戻ってください。")
-                else:
-                    st.session_state._export_job = "pending"
-                    st.session_state.export_progress_pct = 0
-                    st.session_state.export_progress_msg = "準備中…"
-                    write_export_status(state="idle", pct=0, msg="準備中…", error="")
-                    st.rerun()
-
-        job = st.session_state.get("_export_job")
-        status_data = read_export_status()
-        state = str(status_data.get("state") or "")
-
-        # 開始前: VOICEVOX確認 → 裏スレッド起動
-        if job == "pending" and not is_export_thread_running() and state not in (
-            "running",
-            "starting",
-            "done",
-        ):
-            ok_vv, ver = check_voicevox()
-            if not ok_vv:
-                clear_export_ui_state()
-                st.error(
-                    "VOICEVOX が起動していないため、動画を作れません。"
-                    " VOICEVOX を起動してから、もう一度お試しください。"
-                )
-                st.caption(f"詳細: {ver}")
-                st.stop()
-            job_data = collect_export_job_from_session()
-            if not str(job_data.get("voice_script") or "").strip():
-                clear_export_ui_state()
-                st.error("台本が空です。先に台本を確定してください。")
-                st.stop()
-            started, why = start_export_thread(job_data)
-            if not started:
-                st.warning(why)
-            st.session_state._export_job = "running"
+        if st.button("通常画面に戻る", key="btn_cancel_video_encoding"):
+            clear_export_ui_state()
             st.rerun()
 
-        progress, pct_box, status = make_export_progress_widgets()
+        job = st.session_state.get("_export_job")
+        # 古い「作成中」の残りは自動で外す
+        if job != "pending":
+            clear_export_ui_state()
+            st.rerun()
 
-        @st.fragment(run_every=1.0)
-        def _export_progress_fragment() -> None:
-            data = read_export_status()
-            cur_state = str(data.get("state") or "")
-            pct = int(data.get("pct") or 0)
-            msg = str(data.get("msg") or "処理中…")
-            update_export_progress(progress, pct_box, status, pct, msg)
+        ok_vv, ver = check_voicevox()
+        if not ok_vv:
+            clear_export_ui_state()
+            st.error(
+                "VOICEVOX が起動していないため、動画を作れません。"
+                " VOICEVOX を起動してから、もう一度お試しください。"
+            )
+            st.caption(f"詳細: {ver}")
+            st.stop()
 
-            if cur_state == "done":
-                result = data.get("result") or {}
-                if isinstance(result, dict) and result:
-                    apply_export_result_to_session(result)
-                clear_export_ui_state()
-                st.rerun()
+        job_data = collect_export_job_from_session()
+        if not str(job_data.get("voice_script") or "").strip():
+            clear_export_ui_state()
+            st.error("台本が空です。先に台本を確定してください。")
+            st.stop()
 
-            if cur_state == "error":
-                st.error(
-                    "動画生成に失敗しました: "
-                    + str(data.get("error") or "不明なエラー")
-                )
-                detail = str(data.get("detail") or "").strip()
-                if detail:
-                    with st.expander("詳細", expanded=False):
-                        st.code(detail)
-                if st.button("閉じる", type="primary", key="btn_close_export_error"):
-                    clear_export_ui_state()
-                    write_export_status(state="idle", pct=0, msg="", error="")
-                    st.rerun()
-                return
-
-            if not (
-                is_export_thread_running() or cur_state in ("running", "starting")
-            ):
-                st.warning(
-                    "作成処理が見つかりません。通常画面に戻るか、作り直してください。"
-                )
-            else:
-                st.caption("進捗は約1秒ごとに自動更新されます。ボタンも押せます。")
-
-        _export_progress_fragment()
-        st.stop()
+        st.session_state._export_job = "running"
+        status = st.empty()
+        status.write("動画を作成しています。しばらくお待ちください…")
+        try:
+            with st.spinner("動画を作成しています…"):
+                result = run_video_export_job(job_data, progress_cb=None)
+            apply_export_result_to_session(result)
+            clear_export_ui_state()
+            st.success(str(result.get("message") or "完成しました"))
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            clear_export_ui_state()
+            st.session_state.mp4_path = ""
+            st.session_state.mp4_bytes = None
+            st.error(f"動画生成に失敗しました: {e}")
+            st.exception(e)
+            st.stop()
 
     st.write("医学ドラマ動画メーカー")
 
@@ -4717,7 +4617,6 @@ def main() -> None:
         st.write("設定")
         if st.button("画面をリセット", key="btn_sidebar_reset_ui"):
             clear_export_ui_state()
-            write_export_status(state="idle", pct=0, msg="", error="")
             st.rerun()
         ok, ver = check_voicevox()
         if ok:
