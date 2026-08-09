@@ -14,9 +14,6 @@ import shutil
 import struct
 import subprocess
 import tempfile
-import threading
-import time
-import traceback
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -74,17 +71,11 @@ BGM_CANDIDATE_URLS = [
 ]
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
-# MP4作成の進捗（裏処理と画面の橋渡し。GitHubには上がらない）
-EXPORT_STATUS_PATH = OUTPUT_DIR / "export_status.json"
 # ルビ辞書ファイル（用語とよみの対照表）
 RUBY_DICT_PATH = WORK_DIR / "data" / "medical_ruby_dict.tsv"
 # 修正反映後のダウンロード用辞書
 RUBY_DICT_EXPORT_NAME = "ルビ辞書.txt"
 RUBY_DICT_EXPORT_PATH = OUTPUT_DIR / RUBY_DICT_EXPORT_NAME
-
-# 動画作成スレッド（Streamlit 再実行後もプロセス内で共有）
-_export_thread_lock = threading.Lock()
-_export_thread: threading.Thread | None = None
 
 # 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
 MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
@@ -1800,18 +1791,28 @@ def update_export_progress(
     pct: int,
     message: str = "",
 ) -> None:
-    """互換用（進捗バーは使わない。文言だけ残す）。"""
+    """進捗バーと％数字を同時に更新する（画面中央付近で大きく表示）。"""
     n = max(0, min(100, int(pct)))
     msg = (message or "").strip()
+    bar_text = f"{n}%"
+    if msg:
+        bar_text = f"{n}%  {msg}"
+    # Streamlit 1.50+: バー上にも％を出す
+    try:
+        progress.progress(n, text=bar_text)
+    except TypeError:
+        progress.progress(n / 100.0 if n <= 100 else 1.0)
+    pct_box.markdown(
+        f'<div style="font-size:2.4rem;font-weight:700;line-height:1.2;'
+        f'margin:0.4rem 0 0.2rem 0;color:#111;">進捗 {n}%</div>',
+        unsafe_allow_html=True,
+    )
+    if msg:
+        status.info(f"{n}% — {msg}")
+    else:
+        status.info(f"{n}%")
     st.session_state.export_progress_pct = n
     st.session_state.export_progress_msg = msg
-    if status is not None and msg:
-        status.write(msg)
-
-
-def make_export_progress_widgets():
-    """互換用。進捗バーは作らない。"""
-    return None, st.empty(), st.empty()
 
 
 def heuristic_review(script: str) -> dict[str, Any]:
@@ -4137,146 +4138,62 @@ def init_state() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 動画書き出し（裏スレッド対応）
+# Streamlit メイン
 # ---------------------------------------------------------------------------
-def write_export_status(**kwargs: Any) -> None:
-    """MP4作成の進捗をファイルへ書く（画面側が読み取る）。"""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    data: dict[str, Any] = {}
-    if EXPORT_STATUS_PATH.is_file():
-        try:
-            loaded = json.loads(EXPORT_STATUS_PATH.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception:
-            data = {}
-    data.update(kwargs)
-    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    EXPORT_STATUS_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+# ---------------------------------------------------------------------------
+# 動画書き出し
+# ---------------------------------------------------------------------------
+def run_video_export(progress, pct_box, status) -> None:
+    """
+    音声・背景・字幕・エンディングをまとめて MP4 にする。
+    progress / pct_box / status は Streamlit の表示用オブジェクト。
+    """
+    def _pct(n: int, msg: str = "") -> None:
+        update_export_progress(progress, pct_box, status, n, msg)
 
+    ok, ver = check_voicevox()
+    if not ok:
+        raise RuntimeError(
+            "VOICEVOX に接続できません。アプリを起動してから再実行してください。"
+            f"（詳細: {ver}）"
+        )
 
-def read_export_status() -> dict[str, Any]:
-    """MP4作成の進捗ファイルを読む。"""
-    if not EXPORT_STATUS_PATH.is_file():
-        return {}
-    try:
-        data = json.loads(EXPORT_STATUS_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def is_export_thread_running() -> bool:
-    """裏の動画作成スレッドが動いているか。"""
-    t = _export_thread
-    return bool(t is not None and t.is_alive())
-
-
-def collect_export_job_from_session() -> dict[str, Any]:
-    """画面の設定を、裏処理用の辞書にコピーする。"""
+    style_id = int(st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID))
     speaker_name = str(
         st.session_state.get("vvox_speaker_name", DEFAULT_SPEAKER_NAME)
     )
+    style_name = str(st.session_state.get("vvox_style_name", DEFAULT_STYLE_NAME))
     ending_body = (st.session_state.get("ending_credits_text") or "").strip()
     if not ending_body:
         ending_body = build_ending_credits_text(
             st.session_state.get("reference_text", ""),
             speaker_name,
         )
-    voice_script = canonicalize_voicevox_ruby_delimiters(
-        str(
-            st.session_state.get("ruby_script")
-            or st.session_state.get("final_script")
-            or ""
-        )
-    ).strip()
-    return {
-        "voice_script": voice_script,
-        "style_id": int(st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID)),
-        "speaker_name": speaker_name,
-        "style_name": str(
-            st.session_state.get("vvox_style_name", DEFAULT_STYLE_NAME)
-        ),
-        "ending_body": ending_body,
-        "reference_text": str(st.session_state.get("reference_text") or ""),
-        "speed_scale": clamp_voicevox_speed(
-            st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
-        ),
-        "video_title": str(st.session_state.get("video_title") or "").strip(),
-        "video_export_mode": str(
-            st.session_state.get("video_export_mode") or "draft"
-        ),
-    }
-
-
-def apply_export_result_to_session(result: dict[str, Any]) -> None:
-    """完了結果を画面の状態へ反映する。"""
-    st.session_state.mp4_path = str(result.get("mp4_path") or "")
-    st.session_state.mp4_name = str(result.get("mp4_name") or "medical_drama.mp4")
-    st.session_state.mp4_bytes = None
-    st.session_state.last_video_export_mode = result.get("last_video_export_mode")
-    st.session_state.last_script_path = str(result.get("last_script_path") or "")
-    st.session_state.last_script_name = str(
-        result.get("last_script_name") or "medical_drama.docx"
-    )
-    st.session_state.ruby_dict_post_video_updates = list(
-        result.get("ruby_dict_post_video_updates") or []
-    )
-    st.session_state.export_progress_pct = 100
-    st.session_state.export_progress_msg = str(result.get("message") or "完了")
-
-
-def run_video_export_job(
-    job: dict[str, Any],
-    progress_cb: Callable[[int, str], None] | None = None,
-) -> dict[str, Any]:
-    """
-    音声・背景・字幕・エンディングをまとめて MP4 にする（裏スレッド可）。
-    Streamlit のウィジェットは使わない。
-    """
-    def _pct(n: int, msg: str = "") -> None:
-        if progress_cb is not None:
-            progress_cb(n, msg)
-
-    ok, ver = check_voicevox()
-    if not ok:
-        raise RuntimeError(
-            "VOICEVOX に接続できません。先に VOICEVOX を起動してください。"
-            f"（詳細: {ver}）"
-        )
-
-    voice_script = str(job.get("voice_script") or "").strip()
-    if not voice_script:
-        raise RuntimeError("台本が空です。先に台本を確定してください。")
-
-    style_id = int(job.get("style_id", DEFAULT_SPEAKER_ID))
-    speaker_name = str(job.get("speaker_name") or DEFAULT_SPEAKER_NAME)
-    style_name = str(job.get("style_name") or DEFAULT_STYLE_NAME)
-    ending_body = str(job.get("ending_body") or "").strip()
-    if not ending_body:
-        ending_body = build_ending_credits_text(
-            str(job.get("reference_text") or ""),
-            speaker_name,
-        )
-    speed_scale = clamp_voicevox_speed(
-        job.get("speed_scale", VOICEVOX_SPEED_SCALE)
-    )
-    video_title = str(job.get("video_title") or "").strip()
-    include_background = str(job.get("video_export_mode") or "draft") == "final"
+        st.session_state.ending_credits_text = ending_body
+        st.session_state._ending_auto_text = ending_body
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    speed_scale = clamp_voicevox_speed(
+        st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
+    )
     _pct(2, "台本を準備中…")
+    # 確定済み台本を使う（ルビなしでも可。ルビありならその読みで音声化）
+    voice_script = canonicalize_voicevox_ruby_delimiters(
+        str(st.session_state.get("ruby_script") or st.session_state.get("final_script") or "")
+    ).strip()
+    if not voice_script:
+        raise RuntimeError("台本が空です。先に台本を確定してください。")
     ruby_count = count_voicevox_ruby(voice_script)
-    save_reference_text(str(job.get("reference_text") or ""))
 
+    save_reference_text(st.session_state.get("reference_text", ""))
+
+    video_title = str(st.session_state.get("video_title") or "").strip()
     script_docx_name = make_script_docx_filename(video_title)
     script_path = OUTPUT_DIR / "last_script.txt"
     script_path.write_text(voice_script, encoding="utf-8")
     script_docx_path = OUTPUT_DIR / script_docx_name
     script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
+    # 旧固定名も残す（互換）
     (OUTPUT_DIR / "last_script.docx").write_bytes(script_docx_path.read_bytes())
     tts_script = expand_voicevox_ruby_to_reading(voice_script)
     sub_script = strip_voicevox_ruby(voice_script)
@@ -4284,6 +4201,8 @@ def run_video_export_job(
     (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
         sub_script, encoding="utf-8"
     )
+    st.session_state.last_script_path = str(script_docx_path)
+    st.session_state.last_script_name = script_docx_name
 
     with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
         tmp_path = Path(tmp)
@@ -4311,6 +4230,7 @@ def run_video_export_job(
             speaker=style_id,
             speed_scale=speed_scale,
         )
+        # 同期確認は無音を足す前（朗読と字幕の対応を検査）
         sync_issues = validate_audio_subtitle_sync(wav_path, subtitle_cues)
         if sync_issues:
             raise RuntimeError(
@@ -4318,6 +4238,7 @@ def run_video_export_job(
                 + "\n".join(f"- {m}" for m in sync_issues)
             )
 
+        # 冒頭に無音を入れ、字幕も同じ秒数だけ後ろへずらす
         intro_silence = float(INTRO_SILENCE_SEC)
         if intro_silence > 0:
             _pct(51, f"冒頭に {intro_silence:.0f} 秒の無音を追加…")
@@ -4329,6 +4250,9 @@ def run_video_export_job(
         with _wave.open(str(wav_path), "rb") as wf:
             audio_sec = wf.getnframes() / float(wf.getframerate())
 
+        include_background = (
+            str(st.session_state.get("video_export_mode") or "draft") == "final"
+        )
         scene_dir = tmp_path / "scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
         scene_clips: list[tuple[Path, float]] = []
@@ -4364,6 +4288,7 @@ def run_video_export_job(
                 pct = 55 + int(12 * ((i + 1) / max(len(schedule), 1)))
                 _pct(min(pct, 67), f"シーン {i+1}/{len(schedule)}")
         else:
+            # ドラフト: 背景写真を取らず、単色画面＋字幕＋音声だけ
             _pct(52, "ドラフト用の単色背景を準備…")
             frame_path = scene_dir / "scene_plain.png"
             create_plain_scene_frame(frame_path)
@@ -4381,6 +4306,7 @@ def run_video_export_job(
         _pct(75, "MP4 エンコード中…")
 
         def _encode_prog(frac: float) -> None:
+            # 75%〜99% をエンコード進捗に割り当て
             pct = 75 + int(24 * max(0.0, min(1.0, float(frac))))
             _pct(min(pct, 99), f"MP4 エンコード中… {int(frac * 100)}%")
 
@@ -4403,92 +4329,28 @@ def run_video_export_job(
         desktop_path = desktop_dir / desktop_name
         shutil.copy2(out_path, desktop_path)
 
+        st.session_state.mp4_path = str(desktop_path)
+        st.session_state.mp4_name = desktop_name
+        st.session_state.mp4_bytes = None
+        st.session_state.last_video_export_mode = (
+            "final" if include_background else "draft"
+        )
+        # ルビ入り最終原稿 ↔ 辞書を比較し、足りないルビを追加
         _pct(99, "ルビ辞書を更新中…")
         applied = sync_script_rubies_into_dictionary(voice_script)
-        mode_label = (
-            "最終版（背景あり）" if include_background else "ドラフト（背景なし）"
-        )
-        message = f"完了・{mode_label}"
+        mode_label = "最終版（背景あり）" if include_background else "ドラフト（背景なし）"
         if applied:
-            message += f"（辞書にルビを {len(applied)} 件追加）"
-        _pct(100, message)
+            _pct(
+                100,
+                f"完了・{mode_label}（辞書にルビを {len(applied)} 件追加）",
+            )
+        else:
+            _pct(100, f"完了・{mode_label}")
+        status.success(f"完了（{mode_label}）: {desktop_path}")
+        # 完成を耳で知らせる（ポーン）
         play_done_chime()
-        return {
-            "mp4_path": str(desktop_path),
-            "mp4_name": desktop_name,
-            "last_video_export_mode": "final" if include_background else "draft",
-            "last_script_path": str(script_docx_path),
-            "last_script_name": script_docx_name,
-            "ruby_dict_post_video_updates": applied,
-            "message": message,
-            "mode_label": mode_label,
-        }
 
 
-def _export_thread_main(job: dict[str, Any]) -> None:
-    """裏で MP4 を作り、進捗をファイルへ書く。"""
-    try:
-        write_export_status(state="running", pct=0, msg="準備中…", error="")
-
-        def _cb(n: int, msg: str) -> None:
-            write_export_status(state="running", pct=int(n), msg=msg, error="")
-
-        result = run_video_export_job(job, progress_cb=_cb)
-        write_export_status(
-            state="done",
-            pct=100,
-            msg=str(result.get("message") or "完了"),
-            error="",
-            result=result,
-        )
-    except Exception as e:  # noqa: BLE001
-        write_export_status(
-            state="error",
-            pct=int((read_export_status() or {}).get("pct") or 0),
-            msg="作成に失敗しました",
-            error=str(e),
-            detail=traceback.format_exc(),
-        )
-
-
-def start_export_thread(job: dict[str, Any]) -> tuple[bool, str]:
-    """動画作成スレッドを1つだけ開始する。"""
-    global _export_thread
-    with _export_thread_lock:
-        if _export_thread is not None and _export_thread.is_alive():
-            return False, "すでに動画を作成中です。完了までお待ちください。"
-        write_export_status(state="starting", pct=0, msg="開始しています…", error="")
-        t = threading.Thread(
-            target=_export_thread_main,
-            args=(job,),
-            daemon=True,
-            name="meddrama-export",
-        )
-        _export_thread = t
-        t.start()
-        return True, ""
-
-
-def clear_export_ui_state() -> None:
-    """作成中フラグを外して通常画面へ戻れるようにする。"""
-    st.session_state.video_encoding = False
-    st.session_state._export_job = None
-
-
-def run_video_export(progress=None, pct_box=None, status=None) -> None:
-    """互換用: 同期で MP4 を作る（進捗バーなし）。"""
-    job = collect_export_job_from_session()
-    result = run_video_export_job(job, progress_cb=None)
-    apply_export_result_to_session(result)
-    if status is not None:
-        status.success(
-            f"完了（{result.get('mode_label') or '動画'}）: {result.get('mp4_path')}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Streamlit メイン
-# ---------------------------------------------------------------------------
 def inject_app_theme() -> None:
     """余計な装飾を抑え、読みやすい白背景にする。選択UIは小さく横並び向き。"""
     st.markdown(
@@ -4497,9 +4359,7 @@ def inject_app_theme() -> None:
   [data-testid="stAppViewContainer"] { background: #fff; color: #111; }
   [data-testid="stHeader"] { background: #fff; }
   [data-testid="stSidebar"] { background: #fafafa; }
-  /* 見出しは読める大きさにする（以前は小さすぎて「動いてない」ように見えた） */
-  h1 { font-size: 1.6rem !important; font-weight: 700 !important; }
-  h2, h3, h4 { font-size: 1.15rem !important; font-weight: 600 !important; }
+  h1, h2, h3, h4 { font-size: 1rem !important; font-weight: 600 !important; }
   div[data-testid="stAlert"] { border: 1px solid #ccc !important; }
 
   /* 選択ラジオ: 小さく横並び */
@@ -4557,80 +4417,64 @@ def main() -> None:
     # ウィジェット生成前に、台本などの予約反映を済ませる
     apply_pending_widget_values()
 
-    # URL に ?reset=1 があれば作成中状態を強制解除
-    try:
-        if str(st.query_params.get("reset", "")) in ("1", "true", "yes"):
-            clear_export_ui_state()
-            st.query_params.clear()
-            st.rerun()
-    except Exception:
-        pass
-
-    # MP4作成（シンプル同期。進捗バーなし）
+    # MP4作成中は他UIを出さず、誤操作を防ぐ
+    # Stop／再読み込みで中断されたあとも通常画面に戻れるようにする
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
-        if st.button("通常画面に戻る", key="btn_cancel_video_encoding"):
-            clear_export_ui_state()
-            st.rerun()
-
-        job = st.session_state.get("_export_job")
-        # 古い「作成中」の残りは自動で外す
-        if job != "pending":
-            clear_export_ui_state()
-            st.rerun()
-
-        ok_vv, ver = check_voicevox()
-        if not ok_vv:
-            clear_export_ui_state()
-            st.error(
-                "VOICEVOX が起動していないため、動画を作れません。"
-                " VOICEVOX を起動してから、もう一度お試しください。"
-            )
-            st.caption(f"詳細: {ver}")
-            st.stop()
-
-        job_data = collect_export_job_from_session()
-        if not str(job_data.get("voice_script") or "").strip():
-            clear_export_ui_state()
-            st.error("台本が空です。先に台本を確定してください。")
-            st.stop()
-
-        st.session_state._export_job = "running"
-        status = st.empty()
-        status.write("動画を作成しています。しばらくお待ちください…")
-        try:
-            with st.spinner("動画を作成しています…"):
-                result = run_video_export_job(job_data, progress_cb=None)
-            apply_export_result_to_session(result)
-            clear_export_ui_state()
-            st.success(str(result.get("message") or "完成しました"))
-            st.rerun()
-        except Exception as e:  # noqa: BLE001
-            clear_export_ui_state()
-            st.session_state.mp4_path = ""
-            st.session_state.mp4_bytes = None
-            st.error(f"動画生成に失敗しました: {e}")
-            st.exception(e)
-            st.stop()
-
-    st.title("医学ドラマ動画メーカー")
-    st.success("接続OK：この画面が出ていればアプリは動いています。")
-    st.caption(
-        "動画を作るときは、このパソコンで VOICEVOX を起動してください。"
-    )
-
-    with st.sidebar:
-        st.write("設定")
-        if st.button("画面をリセット", key="btn_sidebar_reset_ui"):
-            clear_export_ui_state()
+        st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
+        st.markdown(
+            '<div style="font-size:1.2rem;margin-bottom:0.5rem;">'
+            "作業の進捗（パーセント）</div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("中止して通常画面に戻る", key="btn_cancel_video_encoding"):
             st.session_state.video_encoding = False
             st.session_state._export_job = None
             st.rerun()
+
+        job = st.session_state.get("_export_job")
+        # pending / running 以外（古い状態・不明）は自動再開せず中断扱いにする
+        if job not in ("pending", "running"):
+            job = "running"
+        # Stop などで中断されたあと：自動再開せず、再開／中止を選ばせる
+        if job == "running":
+            st.error("前回の作成が中断されたか、作成モードのまま残っています。")
+            if st.button("最初から再開する", type="primary", key="btn_restart_export"):
+                st.session_state._export_job = "pending"
+                st.rerun()
+            st.stop()
+
+        # pending → 書き出し開始
+        st.session_state._export_job = "running"
+        st.session_state.export_progress_pct = 0
+        st.session_state.export_progress_msg = "準備中…"
+        progress = st.progress(0, text="0%  準備中…")
+        pct_box = st.empty()
+        status = st.empty()
+        update_export_progress(progress, pct_box, status, 0, "準備中…")
+        try:
+            run_video_export(progress, pct_box, status)
+        except Exception as e:  # noqa: BLE001
+            st.session_state.mp4_path = ""
+            st.session_state.mp4_bytes = None
+            st.session_state.video_encoding = False
+            st.session_state._export_job = None
+            st.error(f"動画生成に失敗しました: {e}")
+            st.exception(e)
+            st.stop()
+        st.session_state.video_encoding = False
+        st.session_state._export_job = None
+        st.rerun()
+
+    st.write("医学ドラマ動画メーカー")
+
+    with st.sidebar:
+        st.write("設定")
         ok, ver = check_voicevox()
         if ok:
             st.caption(f"VOICEVOX OK（{ver}）")
         else:
-            st.warning("VOICEVOX 未接続（先に VOICEVOX を起動してください）")
+            st.error(f"VOICEVOX 未接続: {ver}")
 
         load_dotenv_file()
         has_saved = bool(get_api_key())
