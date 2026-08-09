@@ -901,6 +901,19 @@ DEFAULT_RUBY_DICT: list[tuple[str, str]] = [
     ("抗凝固", "こうぎょうこ"),
     ("抗生剤", "こうせいざい"),
     ("抗菌薬", "こうきんやく"),
+    # 検査単位（VOICEVOX読み上げ用）
+    ("mmol/L", "ミリモルパーリットル"),
+    ("mmol/l", "ミリモルパーリットル"),
+    ("mg/dL", "ミリグラムパーデシリットル"),
+    ("mg/dl", "ミリグラムパーデシリットル"),
+    ("mg/L", "ミリグラムパーリットル"),
+    ("mg/l", "ミリグラムパーリットル"),
+    ("pg/mL", "ピコグラムパーミリリットル"),
+    ("pg/ml", "ピコグラムパーミリリットル"),
+    ("ng/mL", "ナノグラムパーミリリットル"),
+    ("ng/ml", "ナノグラムパーミリリットル"),
+    ("mmHg", "ミリメートルエイチジー"),
+    ("mm", "ミリメートル"),
 ]
 
 
@@ -4218,6 +4231,7 @@ def init_state() -> None:
         "video_encoding": False,
         "video_export_mode": "draft",  # draft=背景なし / final=背景あり
         "last_video_export_mode": None,  # 直近に完成した draft / final
+        "_editor_rev": 0,  # 台本入力欄の世代（衝突防止）
         "last_plain_script_txt": "",
         "last_plain_script_docx": "",
         "last_ruby_script_txt": "",
