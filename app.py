@@ -1,6 +1,7 @@
 """
-医学論文PDFまたは台本 → 台本確定 → VOICEVOX音声（読み方辞書はMP4直前） → 静止画背景 → MP4 生成
+医学論文PDFまたは台本 → 台本確定 → VOICEVOX音声 → 静止画背景 → MP4 生成
 Streamlit アプリ（macOS / Apple Silicon 向け）
+（読み方辞書の画面操作は凍結。標準辞書のみ自動で VOICEVOX へ渡す）
 """
 
 from __future__ import annotations
@@ -72,11 +73,8 @@ BGM_CANDIDATE_URLS = [
 ]
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
-# ルビ辞書ファイル（用語とよみの対照表）→ VOICEVOX ユーザー辞書へ渡す
+# ルビ辞書ファイル（用語とよみの対照表）→ VOICEVOX ユーザー辞書へ渡す（画面操作は凍結）
 RUBY_DICT_PATH = WORK_DIR / "data" / "medical_ruby_dict.tsv"
-# デスクトップ／ダウンロード用の読み方辞書ファイル名
-RUBY_DICT_EXPORT_NAME = "VOICEVOX読み方辞書.txt"
-RUBY_DICT_EXPORT_PATH = OUTPUT_DIR / RUBY_DICT_EXPORT_NAME
 # VOICEVOX user_dict 用の安定UUID名前空間（同じ用語は毎回同じID）
 VOICEVOX_USER_DICT_NS = uuid.UUID("6f1c9a2e-8b47-4d3f-9c10-2a7e5b8d4f31")
 
@@ -295,7 +293,7 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "no-review-20260810b"
+APP_BUILD = "ui-slim-20260810d"
 # 入力欄キー（旧名 final_script_editor_widget は衝突しやすいので使わない）
 EDITOR_BASE_RAW = "raw_script_box"
 EDITOR_BASE_FINAL = "final_script_box"
@@ -1033,9 +1031,8 @@ def load_ruby_dict_from_path(path: Path | None = None) -> list[tuple[str, str]]:
 
 def get_active_ruby_dictionary() -> list[tuple[str, str]]:
     """
-    VOICEVOX に渡す読み方辞書を返す。
-    優先: 画面で手動アップロードした辞書 → 標準辞書ファイル → 組み込み
-    （自動学習・自動更新はしない。同じ用語は先勝ち）
+    VOICEVOX に渡す読み方辞書を返す（画面操作は凍結中）。
+    優先: 標準辞書ファイル → 組み込み（同じ用語は先勝ち）
     """
     merged: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -1049,35 +1046,9 @@ def get_active_ruby_dictionary() -> list[tuple[str, str]]:
             seen.add(surface)
             merged.append((surface, reading))
 
-    custom = None
-    try:
-        custom = st.session_state.get("ruby_dict_custom")
-    except Exception:
-        custom = None
-    if isinstance(custom, list) and custom:
-        _add([(str(a), str(b)) for a, b in custom])
     _add(load_ruby_dict_from_path(RUBY_DICT_PATH))
     _add(DEFAULT_RUBY_DICT)
     return merged
-
-
-def save_ruby_dict_to_desktop(
-    pairs: list[tuple[str, str]] | None = None,
-) -> Path:
-    """読み方辞書をデスクトップへ保存する（手動編集用）。"""
-    data = pairs if pairs is not None else get_active_ruby_dictionary()
-    text = format_ruby_dict_text(data)
-    desktop = get_desktop_dir()
-    path = desktop / RUBY_DICT_EXPORT_NAME
-    path.write_text(text, encoding="utf-8")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    RUBY_DICT_EXPORT_PATH.write_text(text, encoding="utf-8")
-    try:
-        st.session_state.ruby_dict_export_ready = True
-        st.session_state.last_ruby_dict_desktop = str(path)
-    except Exception:
-        pass
-    return path
 
 
 def hiragana_to_katakana(text: str) -> str:
@@ -1201,149 +1172,6 @@ def push_ruby_dict_to_voicevox(
         "skipped": skipped,
         "source_pairs": len(data),
     }
-
-
-def extract_ruby_pairs_from_script(script: str) -> list[tuple[str, str]]:
-    """台本中の ｛用語｜よみ｝ をすべて取り出す（同じ用語は後勝ち）。"""
-    text = canonicalize_voicevox_ruby_delimiters(script or "")
-    order: list[str] = []
-    mapping: dict[str, str] = {}
-    for m in _RUBY_TAG_RE.finditer(text):
-        surface = (m.group(1) or "").strip()
-        reading = normalize_voicevox_reading(m.group(2) or "")
-        if not surface or not reading or surface == reading:
-            continue
-        if surface not in mapping:
-            order.append(surface)
-        mapping[surface] = reading
-    return [(s, mapping[s]) for s in order]
-
-
-def is_ruby_dict_surface_allowed(surface: str) -> bool:
-    """ルビ辞書へ学習反映してよい用語かを返す。1文字語は取り込まない。"""
-    return len((surface or "").strip()) >= 2
-
-
-def find_ruby_dict_updates(
-    baseline_script: str,
-    edited_script: str,
-) -> list[tuple[str, str]]:
-    """
-    自動付与稿と修正稿を比べ、新規または読みが変わったルビを返す。
-    """
-    base_map = {s: r for s, r in extract_ruby_pairs_from_script(baseline_script)}
-    updates: list[tuple[str, str]] = []
-    for surface, reading in extract_ruby_pairs_from_script(edited_script):
-        if not is_ruby_dict_surface_allowed(surface):
-            continue
-        if base_map.get(surface) != reading:
-            updates.append((surface, reading))
-    return updates
-
-
-def find_rubies_missing_from_dictionary(
-    script: str,
-    dictionary: list[tuple[str, str]] | None = None,
-) -> list[tuple[str, str]]:
-    """
-    ルビ入り原稿にあるが、辞書に無い（または読みが違う）ルビを返す。
-    """
-    dict_map = {
-        s: r
-        for s, r in (
-            dictionary
-            if dictionary is not None
-            else get_active_ruby_dictionary()
-        )
-    }
-    missing: list[tuple[str, str]] = []
-    for surface, reading in extract_ruby_pairs_from_script(script):
-        if not is_ruby_dict_surface_allowed(surface):
-            continue
-        if dict_map.get(surface) != reading:
-            missing.append((surface, reading))
-    return missing
-
-
-def export_active_ruby_dictionary_file() -> Path:
-    """いま有効なルビ辞書を ルビ辞書.txt に書き出す。"""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    export_text = format_ruby_dict_text(get_active_ruby_dictionary())
-    RUBY_DICT_EXPORT_PATH.write_text(export_text, encoding="utf-8")
-    st.session_state.ruby_dict_export_ready = True
-    return RUBY_DICT_EXPORT_PATH
-
-
-def sync_script_rubies_into_dictionary(script: str) -> list[tuple[str, str]]:
-    """
-    ルビ入り最終原稿と辞書を比べ、足りないルビを辞書へ追加する。
-    追加後の辞書ファイルも書き出す。戻り値は今回追加した一覧。
-    """
-    missing = find_rubies_missing_from_dictionary(script)
-    applied = apply_ruby_updates_to_learned_dict(missing) if missing else []
-    # 追加がなくても、完成後にダウンロードできるよう最新版を書き出す
-    export_active_ruby_dictionary_file()
-    st.session_state.ruby_dict_post_video_updates = applied
-    return applied
-
-
-def format_ruby_dict_text(pairs: list[tuple[str, str]]) -> str:
-    """用語\\tよみ 形式の辞書テキストにする。"""
-    lines: list[str] = []
-    seen: set[str] = set()
-    for surface, reading in pairs:
-        surface = (surface or "").strip()
-        reading = normalize_voicevox_reading(reading)
-        if not surface or not reading or surface == reading or surface in seen:
-            continue
-        seen.add(surface)
-        lines.append(f"{surface}\t{reading}")
-    return ("\n".join(lines) + "\n") if lines else ""
-
-
-def apply_ruby_updates_to_learned_dict(
-    updates: list[tuple[str, str]],
-) -> list[tuple[str, str]]:
-    """
-    修正ルビを学習辞書に反映し、ルビ辞書.txt を書き出す。
-    戻り値: 今回反映した更新一覧
-    """
-    if not updates:
-        return []
-    learned_raw = st.session_state.get("ruby_dict_learned") or []
-    learned_map: dict[str, str] = {}
-    order: list[str] = []
-    for item in learned_raw:
-        try:
-            surface, reading = item[0], item[1]
-        except Exception:
-            continue
-        surface = str(surface).strip()
-        reading = normalize_voicevox_reading(str(reading))
-        if not surface or not reading:
-            continue
-        if surface not in learned_map:
-            order.append(surface)
-        learned_map[surface] = reading
-    applied: list[tuple[str, str]] = []
-    for surface, reading in updates:
-        surface = (surface or "").strip()
-        reading = normalize_voicevox_reading(reading)
-        if not surface or not reading or surface == reading:
-            continue
-        if not is_ruby_dict_surface_allowed(surface):
-            continue
-        if learned_map.get(surface) == reading:
-            continue
-        if surface not in learned_map:
-            order.append(surface)
-        learned_map[surface] = reading
-        applied.append((surface, reading))
-    st.session_state.ruby_dict_learned = [(s, learned_map[s]) for s in order]
-    # いま有効な全辞書を書き出し（学習反映後）
-    export_active_ruby_dictionary_file()
-    st.session_state.ruby_dict_last_updates = applied
-    return applied
 
 
 def collect_dictionary_ruby_annotations(
@@ -4428,12 +4256,6 @@ def init_state() -> None:
         "video_title": "",
         "title_suggestion": "",
         "title_decision": "",
-        "ruby_dict_custom": None,
-        "ruby_dict_source_name": "",
-        "ruby_dict_learned": [],
-        "ruby_dict_export_ready": False,
-        "ruby_dict_last_updates": [],
-        "ruby_dict_post_video_updates": [],
         "export_progress_pct": 0,
         "export_progress_msg": "",
         "ruby_script_baseline": "",
@@ -4538,13 +4360,9 @@ def run_video_export(progress, pct_box, status) -> None:
     save_reference_text(st.session_state.get("reference_text", ""))
 
     _pct(3, "読み方辞書を VOICEVOX へ読み込み中…")
+    # 画面のルビ準備は凍結中。標準辞書だけを毎回読み込む
     dict_pairs = get_active_ruby_dictionary()
     dict_info = push_ruby_dict_to_voicevox(dict_pairs)
-    try:
-        desktop_dict = save_ruby_dict_to_desktop(dict_pairs)
-        st.session_state.last_ruby_dict_desktop = str(desktop_dict)
-    except Exception:
-        desktop_dict = None
     st.session_state.last_voicevox_dict_import = dict_info
 
     video_title = str(st.session_state.get("video_title") or "").strip()
@@ -4698,10 +4516,7 @@ def run_video_export(progress, pct_box, status) -> None:
         mode_label = "最終版（背景あり）" if include_background else "ドラフト（背景なし）"
         dict_n = int((st.session_state.get("last_voicevox_dict_import") or {}).get("imported") or 0)
         _pct(100, f"完了・{mode_label}（VOICEVOX辞書 {dict_n} 語）")
-        extra = ""
-        if desktop_dict is not None:
-            extra = f"\n読み方辞書: `{desktop_dict}`"
-        status.success(f"完了（{mode_label}）: {desktop_path}{extra}")
+        status.success(f"完了（{mode_label}）: {desktop_path}")
         # 完成を耳で知らせる（ポーン）
         play_done_chime()
 
@@ -5041,7 +4856,7 @@ def main() -> None:
                 except Exception as e:  # noqa: BLE001
                     st.error(f"台本の保存に失敗しました: {e}")
 
-    # ----- Step 3: 動画作成（読み方辞書は MP4 直前のみ） -----
+    # ----- Step 3: 動画作成（読み方辞書の画面操作は凍結） -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
         render_video_title_input()
@@ -5061,8 +4876,8 @@ def main() -> None:
         st.write("作業の流れ")
         st.markdown(
             """
-1. **A. 最初の確認** … 読み方辞書を用意し、ドラフトMP4（背景なし）を作る  
-2. **B. 読み直し** … 読みがおかしければ辞書や台本を直して、ドラフトを作り直す  
+1. **A. 最初の確認** … ドラフトMP4（背景なし）を作る  
+2. **B. 読み直し** … 読みがおかしければ台本を直して、ドラフトを作り直す  
 3. **C. 仕上げ** … 固まったら最終版（背景あり）を作る  
             """.strip()
         )
@@ -5071,76 +4886,6 @@ def main() -> None:
         plain_txt = st.session_state.get("last_plain_script_txt") or ""
         if plain_txt and Path(plain_txt).exists():
             st.caption(f"デスクトップの台本: `{Path(plain_txt).name}`")
-
-        # MP4作成直前のみ: 読み方辞書を読み込む（他工程では扱わない）
-        st.write("VOICEVOX 読み方辞書（MP4作成直前）")
-        st.caption(
-            "ここでのみ辞書を扱います。"
-            "アップロードするか、標準辞書のまま作成してください。"
-            "MP4作成時に VOICEVOX へ読み込みます。"
-        )
-        dict_file = st.file_uploader(
-            "読み方辞書（.tsv / .txt / .csv）",
-            type=["tsv", "txt", "csv"],
-            key="ruby_dict_upload_before_mp4",
-        )
-        if dict_file is not None:
-            try:
-                raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
-                pairs = parse_ruby_dict_text(raw_dict)
-                if not pairs:
-                    st.warning("辞書から用語を読み取れませんでした。")
-                else:
-                    file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
-                    if st.session_state.get("_ruby_dict_file_id") != file_id:
-                        st.session_state.ruby_dict_custom = pairs
-                        st.session_state.ruby_dict_source_name = dict_file.name
-                        st.session_state._ruby_dict_file_id = file_id
-                        try:
-                            desk = save_ruby_dict_to_desktop(pairs)
-                            st.success(
-                                f"辞書を取り込みました: {dict_file.name}"
-                                f"（{len(pairs)} 語）\nデスクトップへ保存: `{desk}`"
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            st.success(
-                                f"辞書を取り込みました: {dict_file.name}"
-                                f"（{len(pairs)} 語）"
-                            )
-                            st.warning(f"デスクトップ保存に失敗: {e}")
-            except Exception as e:  # noqa: BLE001
-                st.error(f"辞書の読込失敗: {e}")
-
-        active_n = len(get_active_ruby_dictionary())
-        src_name = st.session_state.get("ruby_dict_source_name") or (
-            RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
-        )
-        st.caption(f"今回使う辞書: {src_name}（{active_n} 語）")
-        col_dict_desk, col_dict_dl = st.columns(2)
-        with col_dict_desk:
-            if st.button(
-                "辞書をデスクトップへ保存",
-                key="btn_save_ruby_dict_desktop",
-                use_container_width=True,
-            ):
-                try:
-                    desk = save_ruby_dict_to_desktop()
-                    st.success(f"保存しました: `{desk}`")
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"保存に失敗しました: {e}")
-        with col_dict_dl:
-            try:
-                export_text = format_ruby_dict_text(get_active_ruby_dictionary())
-                st.download_button(
-                    "辞書をダウンロード",
-                    data=export_text.encode("utf-8"),
-                    file_name=RUBY_DICT_EXPORT_NAME,
-                    mime="text/plain",
-                    key="dl_ruby_dict_pre_video",
-                    use_container_width=True,
-                )
-            except Exception as e:  # noqa: BLE001
-                st.caption(f"ダウンロード準備失敗: {e}")
 
         # 台本が空なら止める
         if not voice_now:
@@ -5187,25 +4932,6 @@ def main() -> None:
             on_change=persist_reference_from_widget,
             label_visibility="collapsed",
         )
-        ref_now = (st.session_state.get("reference_text") or "").strip()
-        if ref_now:
-            c_ref_txt, c_ref_docx = st.columns(2)
-            with c_ref_txt:
-                st.download_button(
-                    "参考文献 .txt",
-                    data=ref_now.encode("utf-8"),
-                    file_name="reference.txt",
-                    mime="text/plain",
-                    key="dl_reference_txt",
-                )
-            with c_ref_docx:
-                st.download_button(
-                    "参考文献 .docx",
-                    data=text_to_docx_bytes(ref_now),
-                    file_name="reference.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key="dl_reference_docx",
-                )
 
         st.write("読み上げ")
         selected_style_id = int(
@@ -5436,11 +5162,10 @@ def main() -> None:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-            # 読み直し: 台本を手直ししてから作り直す（辞書は上のMP4直前欄のみ）
+            # 読み直し: 台本を手直ししてから作り直す
             st.write("読み直し・仕上げ")
             st.caption(
-                "読みがおかしいときは、上の「VOICEVOX 読み方辞書」を直してから"
-                "作り直すか、修正した台本を上げてください。"
+                "読みがおかしいときは、修正した台本を上げてから作り直してください。"
             )
             script_reupload = st.file_uploader(
                 "修正した台本（.txt / .docx）",
@@ -5479,7 +5204,6 @@ def main() -> None:
                             st.success(
                                 "修正台本を取り込み、デスクトップへ保存しました。"
                                 f"\n- `{txt_p.name}`\n- `{docx_p.name}`\n"
-                                "必要なら読み方辞書も上げ直し、"
                                 "「ドラフトMP4を再作成」を押してください。"
                             )
                             st.rerun()
