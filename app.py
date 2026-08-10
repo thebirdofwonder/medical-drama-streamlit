@@ -170,7 +170,6 @@ def advance_to_video_with_plain_script(edited: str) -> tuple[Path, Path]:
     title = str(st.session_state.get("video_title") or "").strip()
     txt_path, docx_path = save_script_to_desktop(plain, title, kind="plain")
     st.session_state.final_script = plain
-    st.session_state.final_script_editor = plain
     st.session_state.raw_script = plain
     st.session_state.script_confirmed = True
     st.session_state.ruby_script = plain
@@ -293,11 +292,21 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260810d"
+APP_BUILD = "ui-slim-20260810e"
 # 入力欄キー（旧名 final_script_editor_widget は衝突しやすいので使わない）
 EDITOR_BASE_RAW = "raw_script_box"
 EDITOR_BASE_FINAL = "final_script_box"
 EDITOR_BASE_RUBY = "ruby_script_box"
+# 旧版・世代つき入力欄の衝突対策で消す対象
+_EDITOR_KEY_MARKERS = (
+    "final_script_editor_widget",
+    "raw_script_editor_widget",
+    "ruby_script_editor",
+    "final_script_box",
+    "raw_script_box",
+    "ruby_script_box",
+    "final_script_editor",  # 旧・非ウィジェット名の名残
+)
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +421,12 @@ def apply_pending_widget_values() -> None:
     ]
     for pk in set_keys:
         widget_key = str(pk)[len(_PENDING_WIDGET_SET) :]
-        st.session_state[widget_key] = st.session_state.pop(pk)
+        value = st.session_state.pop(pk)
+        try:
+            st.session_state[widget_key] = value
+        except Exception:
+            # 衝突時は捨てて、次の世代キーで作り直す
+            st.session_state.pop(widget_key, None)
 
 
 def editor_rev() -> int:
@@ -420,31 +434,29 @@ def editor_rev() -> int:
     return int(st.session_state.get("_editor_rev") or 0)
 
 
+def _is_editor_session_key(sk: str) -> bool:
+    """台本入力欄まわりの session_state キーなら True。"""
+    for marker in _EDITOR_KEY_MARKERS:
+        if (
+            sk == marker
+            or sk.startswith(f"{marker}_v")
+            or sk.startswith(f"{_PENDING_WIDGET_SET}{marker}")
+            or sk.startswith(f"{_PENDING_WIDGET_DEL}{marker}")
+        ):
+            return True
+    return False
+
+
 def bump_editor_rev() -> int:
     """
     台本入力欄の名前を世代更新する。
     表示中のキーを書き換えず、新しいキーで作り直す（衝突防止）。
     """
-    # 古い固定キーも消す（過去バージョン互換）
-    for legacy in (
-        "final_script_editor_widget",
-        "raw_script_editor_widget",
-        "ruby_script_editor",
-        "final_script_box",
-        "raw_script_box",
-        "ruby_script_box",
-    ):
-        queue_widget_clear(legacy)
+    for marker in _EDITOR_KEY_MARKERS:
+        queue_widget_clear(marker)
     old = editor_rev()
-    for base in (
-        "final_script_editor_widget",
-        "raw_script_editor_widget",
-        "ruby_script_editor",
-        "final_script_box",
-        "raw_script_box",
-        "ruby_script_box",
-    ):
-        queue_widget_clear(f"{base}_v{old}")
+    for marker in _EDITOR_KEY_MARKERS:
+        queue_widget_clear(f"{marker}_v{old}")
     new_rev = old + 1
     st.session_state["_editor_rev"] = new_rev
     return new_rev
@@ -452,21 +464,41 @@ def bump_editor_rev() -> int:
 
 def purge_legacy_editor_keys() -> None:
     """
-    ウィジェット生成前に、衝突しやすい古い入力欄キーをすべて消す。
-    （旧版の final_script_editor_widget が残っていると取り込みが失敗する）
+    ウィジェット生成前に、衝突しやすい古い入力欄キーを消す。
+    いまの世代の入力欄（raw_script_box_vN など）は残す。
     """
-    doomed_prefixes = (
-        "final_script_editor_widget",
-        "raw_script_editor_widget",
-        "ruby_script_editor",
-    )
+    current = editor_rev()
+    keep = {
+        f"{EDITOR_BASE_RAW}_v{current}",
+        f"{EDITOR_BASE_FINAL}_v{current}",
+        f"{EDITOR_BASE_RUBY}_v{current}",
+    }
     for key in list(st.session_state.keys()):
         sk = str(key)
-        if sk in doomed_prefixes or any(
-            sk.startswith(f"{p}_v") or sk.startswith(f"{_PENDING_WIDGET_SET}{p}") or sk.startswith(f"{_PENDING_WIDGET_DEL}{p}")
-            for p in doomed_prefixes
-        ):
+        if sk in keep:
+            continue
+        if _is_editor_session_key(sk):
             st.session_state.pop(sk, None)
+
+
+def hard_clear_all_editor_keys() -> None:
+    """入力欄キーを世代ごとすべて消し、世代番号を進める（衝突回復用）。"""
+    for key in list(st.session_state.keys()):
+        if _is_editor_session_key(str(key)):
+            st.session_state.pop(key, None)
+    st.session_state["_editor_rev"] = editor_rev() + 1
+
+
+def is_widget_state_conflict_error(exc: BaseException) -> bool:
+    """Streamlit の入力欄キー衝突エラーなら True。"""
+    msg = str(exc)
+    return (
+        "cannot be modified after the widget" in msg
+        or "final_script_editor_widget" in msg
+        or "raw_script_editor_widget" in msg
+        or "final_script_box" in msg
+        or "raw_script_box" in msg
+    )
 
 
 def editor_widget_key(base: str) -> str:
@@ -478,7 +510,12 @@ def ensure_editor_value(base: str, value: str) -> str:
     """入力欄キーが無ければ初期値を入れ、キー名を返す。"""
     key = editor_widget_key(base)
     if key not in st.session_state:
-        st.session_state[key] = value
+        try:
+            st.session_state[key] = value
+        except Exception:
+            hard_clear_all_editor_keys()
+            key = editor_widget_key(base)
+            st.session_state[key] = value
     return key
 
 
@@ -544,17 +581,26 @@ def run_deferred_script_actions() -> None:
             st.session_state["_script_import_notice"] = payload.get("notice") or (
                 f"原稿を取り込みました（約 {len(script):,} 字）"
             )
+        # 修正台本の再上げは、同じファイルで何度も取り込まない
+        if source_id.startswith("reupload-"):
+            st.session_state._ruby_loop_file_id = source_id[len("reupload-") :]
+        st.session_state.pop("_script_import_retries", None)
     except Exception as e:  # noqa: BLE001
-        msg = str(e)
-        if "final_script_editor_widget" in msg or "cannot be modified after the widget" in msg:
-            # 古い画面の名残。キーを消して再試行を促す
-            purge_legacy_editor_keys()
-            bump_editor_rev()
+        if is_widget_state_conflict_error(e):
+            hard_clear_all_editor_keys()
+            retries = int(st.session_state.get("_script_import_retries") or 0)
+            if retries < 1:
+                # 1回だけ自動で取り込み直す（画面を触らなくてよい）
+                st.session_state["_script_import_retries"] = retries + 1
+                st.session_state["_deferred_reload_script"] = payload
+                st.rerun()
+            st.session_state.pop("_script_import_retries", None)
             st.session_state["_script_import_notice"] = (
                 "原稿の取り込みに失敗しました（古い入力欄の残り）。"
                 "左の「画面をリセット」を押してから、もう一度取り込んでください。"
             )
         else:
+            st.session_state.pop("_script_import_retries", None)
             st.session_state["_script_import_notice"] = (
                 f"原稿の取り込みに失敗しました: {e}"
             )
@@ -567,11 +613,10 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     """
     clear_review_decision_widgets(st.session_state.get("review"))
     script = normalize_script_keeping_ruby(text)
+    # 先に入力欄キーを世代更新し、旧キーへ書き込まない
+    bump_editor_rev()
     st.session_state.raw_script = script
     st.session_state.final_script = script
-    st.session_state.final_script_editor = script
-    # 入力欄は世代を進めて新しいキーで作り直す（表示中キーを書き換えない）
-    bump_editor_rev()
     st.session_state.review = None
     st.session_state.review_done = False
     st.session_state.skip_review = False
@@ -4663,7 +4708,8 @@ def main() -> None:
             st.session_state._export_job = None
             st.session_state.pop("_mp4_cache_key", None)
             st.session_state.pop("_mp4_cache_bytes", None)
-            bump_editor_rev()
+            st.session_state.pop("_script_import_retries", None)
+            hard_clear_all_editor_keys()
             try:
                 check_voicevox_cached.clear()
                 fetch_voicevox_speakers_cached.clear()
@@ -4825,12 +4871,12 @@ def main() -> None:
             if not edited_raw:
                 st.error("台本が空です。")
             else:
-                st.session_state.raw_script = edited_raw
-                st.session_state.final_script = edited_raw
-                st.session_state.final_script_editor = edited_raw
-                bump_editor_rev()
-                st.success("台本を上書きしました。")
-                st.rerun()
+                # 入力欄表示中にキーを触らない。次の描画の最初で反映する
+                schedule_script_reload(
+                    edited_raw,
+                    f"overwrite-{len(edited_raw)}-{editor_rev()}",
+                    notice="台本を上書きしました。",
+                )
 
         if st.button(
             "2. 確定して動画作成へ",
@@ -4845,16 +4891,11 @@ def main() -> None:
             if not edited:
                 st.error("台本が空です。")
             else:
-                try:
-                    txt_path, docx_path = advance_to_video_with_plain_script(edited)
-                    st.success(
-                        "台本を確定し、デスクトップへ保存しました。\n"
-                        f"- `{txt_path.name}`\n"
-                        f"- `{docx_path.name}`"
-                    )
-                    st.rerun()
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"台本の保存に失敗しました: {e}")
+                schedule_script_reload(
+                    edited,
+                    f"confirm-{len(edited)}-{editor_rev()}",
+                    advance_plain=True,
+                )
 
     # ----- Step 3: 動画作成（読み方辞書の画面操作は凍結） -----
     if st.session_state.script_confirmed:
@@ -5181,32 +5222,17 @@ def main() -> None:
                         if not script:
                             st.error("台本が空でした。")
                         else:
-                            title = str(
-                                st.session_state.get("video_title") or ""
-                            ).strip()
-                            txt_p, docx_p = save_script_to_desktop(
-                                script, title, kind="plain"
-                            )
-                            st.session_state.ruby_script = script
-                            st.session_state.ruby_script_baseline = script
-                            st.session_state.ruby_ready = True
-                            st.session_state.ruby_skipped = True
-                            st.session_state.final_script = script
-                            bump_editor_rev()
-                            st.session_state.video_export_mode = "draft"
-                            st.session_state.last_plain_script_txt = str(txt_p)
-                            st.session_state.last_plain_script_docx = str(docx_p)
+                            # 入力欄表示中にキーを触らない。次描画の最初で反映する
                             st.session_state._ruby_loop_file_id = file_id
-                            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                            (OUTPUT_DIR / "last_script.txt").write_text(
-                                script, encoding="utf-8"
+                            schedule_script_reload(
+                                script,
+                                f"reupload-{file_id}",
+                                advance_plain=True,
+                                notice=(
+                                    "修正台本を取り込み、デスクトップへ保存しました。\n"
+                                    "「ドラフトMP4を再作成」を押してください。"
+                                ),
                             )
-                            st.success(
-                                "修正台本を取り込み、デスクトップへ保存しました。"
-                                f"\n- `{txt_p.name}`\n- `{docx_p.name}`\n"
-                                "「ドラフトMP4を再作成」を押してください。"
-                            )
-                            st.rerun()
                     except Exception as e:  # noqa: BLE001
                         st.error(f"台本の取り込みに失敗しました: {e}")
 
