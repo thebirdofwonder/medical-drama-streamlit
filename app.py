@@ -294,8 +294,12 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 # 日本語ナレーション目安 約300〜330字/分 × 10〜12分（VOICEVOX 1.0倍速）
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
-# 画面左下で確認できる修正版番号（古い画面のままだと取り込みが失敗しやすい）
-APP_BUILD = "vvox-dict-20260809d"
+# 画面左で確認できる修正版番号（これが出ていれば最新）
+APP_BUILD = "bracket-fix-20260810a"
+# 入力欄キー（旧名 final_script_editor_widget は衝突しやすいので使わない）
+EDITOR_BASE_RAW = "raw_script_box"
+EDITOR_BASE_FINAL = "final_script_box"
+EDITOR_BASE_RUBY = "ruby_script_box"
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +432,9 @@ def bump_editor_rev() -> int:
         "final_script_editor_widget",
         "raw_script_editor_widget",
         "ruby_script_editor",
+        "final_script_box",
+        "raw_script_box",
+        "ruby_script_box",
     ):
         queue_widget_clear(legacy)
     old = editor_rev()
@@ -435,6 +442,9 @@ def bump_editor_rev() -> int:
         "final_script_editor_widget",
         "raw_script_editor_widget",
         "ruby_script_editor",
+        "final_script_box",
+        "raw_script_box",
+        "ruby_script_box",
     ):
         queue_widget_clear(f"{base}_v{old}")
     new_rev = old + 1
@@ -442,8 +452,27 @@ def bump_editor_rev() -> int:
     return new_rev
 
 
+def purge_legacy_editor_keys() -> None:
+    """
+    ウィジェット生成前に、衝突しやすい古い入力欄キーをすべて消す。
+    （旧版の final_script_editor_widget が残っていると取り込みが失敗する）
+    """
+    doomed_prefixes = (
+        "final_script_editor_widget",
+        "raw_script_editor_widget",
+        "ruby_script_editor",
+    )
+    for key in list(st.session_state.keys()):
+        sk = str(key)
+        if sk in doomed_prefixes or any(
+            sk.startswith(f"{p}_v") or sk.startswith(f"{_PENDING_WIDGET_SET}{p}") or sk.startswith(f"{_PENDING_WIDGET_DEL}{p}")
+            for p in doomed_prefixes
+        ):
+            st.session_state.pop(sk, None)
+
+
 def editor_widget_key(base: str) -> str:
-    """世代つきの入力欄キー。例: final_script_editor_widget_v3"""
+    """世代つきの入力欄キー。例: final_script_box_v3"""
     return f"{base}_v{editor_rev()}"
 
 
@@ -488,6 +517,8 @@ def run_deferred_script_actions() -> None:
     payload = st.session_state.pop("_deferred_reload_script", None)
     if not payload or not isinstance(payload, dict):
         return
+    # 取り込み直前にもう一度古いキーを消す（衝突防止）
+    purge_legacy_editor_keys()
     script = normalize_script_keeping_ruby(str(payload.get("text") or ""))
     source_id = str(payload.get("source_id") or f"deferred-{len(script)}")
     if not script:
@@ -518,9 +549,19 @@ def run_deferred_script_actions() -> None:
                 f"原稿を取り込みました（約 {len(script):,} 字）"
             )
     except Exception as e:  # noqa: BLE001
-        st.session_state["_script_import_notice"] = (
-            f"原稿の取り込みに失敗しました: {e}"
-        )
+        msg = str(e)
+        if "final_script_editor_widget" in msg or "cannot be modified after the widget" in msg:
+            # 古い画面の名残。キーを消して再試行を促す
+            purge_legacy_editor_keys()
+            bump_editor_rev()
+            st.session_state["_script_import_notice"] = (
+                "原稿の取り込みに失敗しました（古い入力欄の残り）。"
+                "左の「画面をリセット」を押してから、もう一度取り込んでください。"
+            )
+        else:
+            st.session_state["_script_import_notice"] = (
+                f"原稿の取り込みに失敗しました: {e}"
+            )
 
 
 def commit_loaded_script(text: str, source_id: str) -> None:
@@ -2711,6 +2752,24 @@ def strip_voicevox_ruby(text: str) -> str:
     )
 
 
+# 字幕には残し、VOICEVOXには渡さない括弧（半角・全角の組み合わせを区別しない）
+_SQUARE_BRACKET_SEGMENT_RE = re.compile(r"[\[［][^\[［\]］]*[\]］]")
+
+
+def strip_square_bracket_segments(text: str) -> str:
+    """
+    [ … ] / ［ … ］ / [ … ］ / ［ … ] で囲んだ部分を取り除く。
+    （読み上げ用。字幕用テキストからは呼ばない）
+    """
+    if not text:
+        return ""
+    out = _SQUARE_BRACKET_SEGMENT_RE.sub("", text)
+    # 取り除いたあとの余分な空白を整える
+    out = re.sub(r"[ \t\u3000]{2,}", " ", out)
+    out = re.sub(r" *\n *", "\n", out)
+    return out.strip()
+
+
 def expand_voicevox_ruby_to_reading(text: str) -> str:
     """
     VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ などを外し、
@@ -2896,19 +2955,26 @@ def generate_narration_wav_to_file(
     t = 0.0
     pause_sec = max(0.0, pause_ms / 1000.0)
     speed = clamp_voicevox_speed(speed_scale)
+    # [] だけの区間は音声を作らず、前後の字幕へくっつける
+    pending_subtitle = ""
 
     try:
         for i, chunk in enumerate(chunks):
             if progress_callback:
                 progress_callback(i, len(chunks))
             part = part_dir / f"part_{i:05d}.wav"
-            # 表記のまま送る（読み分けは VOICEVOX ユーザー辞書に任せる）
-            # 万一ルビ記号が残っていても表記だけにする
+            # 字幕: 表記のまま（[] 内も表示）
+            # 読み上げ: [] 内は渡さない
             display = strip_voicevox_ruby(chunk).strip()
-            tts_text = display
-            if not tts_text:
-                # 空区間はスキップ（無音も字幕も入れない）
+            if not display:
                 continue
+            tts_text = strip_square_bracket_segments(display).strip()
+            if not tts_text:
+                # 括弧だけの区間 → 次（または前）の字幕に回す
+                pending_subtitle = f"{pending_subtitle}{display}"
+                continue
+            display_for_sub = f"{pending_subtitle}{display}"
+            pending_subtitle = ""
             # 連結時と同じく、前の音声のあとにだけ無音を入れる
             if part_paths:
                 t += pause_sec
@@ -2920,17 +2986,28 @@ def generate_narration_wav_to_file(
                 dur = w.getnframes() / float(w.getframerate())
             seg_start = t
             seg_end = t + dur
-            if display and dur > 0:
+            if display_for_sub and dur > 0:
                 subtitle_cues.append(
                     {
                         "start": seg_start,
                         "end": seg_end,
-                        "text": display,
+                        "text": display_for_sub,
                         # 検証用: この字幕が対応する読み上げ文
                         "tts": tts_text,
                     }
                 )
             t = seg_end
+        # 末尾に括弧だけ残った場合は、最後の字幕へ足す
+        if pending_subtitle:
+            if subtitle_cues:
+                subtitle_cues[-1]["text"] = (
+                    str(subtitle_cues[-1].get("text") or "") + pending_subtitle
+                )
+            else:
+                # 台本全体が括弧だけ → 読めない
+                raise ValueError(
+                    "読み上げる文章が空です（[] 内だけの台本になっています）。"
+                )
         if progress_callback:
             progress_callback(len(chunks), len(chunks))
         if not part_paths:
@@ -4480,7 +4557,8 @@ def run_video_export(progress, pct_box, status) -> None:
     script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
     # 旧固定名も残す（互換）
     (OUTPUT_DIR / "last_script.docx").write_bytes(script_docx_path.read_bytes())
-    (OUTPUT_DIR / "last_script_tts.txt").write_text(voice_script, encoding="utf-8")
+    tts_for_log = strip_square_bracket_segments(voice_script)
+    (OUTPUT_DIR / "last_script_tts.txt").write_text(tts_for_log, encoding="utf-8")
     (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
         voice_script, encoding="utf-8"
     )
@@ -4693,6 +4771,8 @@ def main() -> None:
     )
     inject_app_theme()
     init_state()
+    # 旧版の入力欄キーが残っていると取り込みが失敗するため、最初に消す
+    purge_legacy_editor_keys()
     # ウィジェット生成前に、予約アクション → 入力欄の値反映 の順で済ませる
     run_deferred_script_actions()
     apply_pending_widget_values()
@@ -4923,7 +5003,7 @@ def main() -> None:
         st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分{ruby_cap}")
         # 台本表示窓は常に編集・上書き可能
         raw_key = ensure_editor_value(
-            "raw_script_editor_widget", st.session_state.raw_script
+            EDITOR_BASE_RAW, st.session_state.raw_script
         )
         st.text_area(
             "台本（編集・上書き可）",
@@ -4932,7 +5012,7 @@ def main() -> None:
         )
         if st.button("この内容で台本を上書き", key="btn_overwrite_raw_script"):
             edited_raw = normalize_script_keeping_ruby(
-                read_editor_value("raw_script_editor_widget")
+                read_editor_value(EDITOR_BASE_RAW)
             )
             if not edited_raw:
                 st.error("台本が空です。")
@@ -5015,7 +5095,7 @@ def main() -> None:
         if st.session_state.get("skip_review"):
             st.write("2. 原稿を確定")
             final_key = ensure_editor_value(
-                "final_script_editor_widget",
+                EDITOR_BASE_FINAL,
                 st.session_state.final_script or st.session_state.raw_script,
             )
             st.text_area(
@@ -5025,7 +5105,7 @@ def main() -> None:
             )
             if st.button("2. 確定して動画作成へ", type="primary", key="btn_confirm_skip"):
                 edited = normalize_script_keeping_ruby(
-                    read_editor_value("final_script_editor_widget").strip()
+                    read_editor_value(EDITOR_BASE_FINAL).strip()
                 )
                 if not edited:
                     st.error("最終台本が空です。")
@@ -5061,7 +5141,7 @@ def main() -> None:
 
             if st.button("採択・別案を台本に反映", type="secondary"):
                 base = (
-                    read_editor_value("final_script_editor_widget")
+                    read_editor_value(EDITOR_BASE_FINAL)
                     or st.session_state.get("final_script")
                     or st.session_state.raw_script
                 )
@@ -5093,7 +5173,7 @@ def main() -> None:
                         st.write(f"- {line}")
 
             final_key = ensure_editor_value(
-                "final_script_editor_widget",
+                EDITOR_BASE_FINAL,
                 st.session_state.final_script or st.session_state.raw_script,
             )
             st.text_area(
@@ -5108,7 +5188,7 @@ def main() -> None:
                 key="btn_confirm_review",
             ):
                 edited = normalize_script_keeping_ruby(
-                    read_editor_value("final_script_editor_widget").strip()
+                    read_editor_value(EDITOR_BASE_FINAL).strip()
                 )
                 if not edited:
                     st.error("最終台本が空です。")
