@@ -292,7 +292,7 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260810e"
+APP_BUILD = "ui-slim-20260810f"
 # 入力欄キー（旧名 final_script_editor_widget は衝突しやすいので使わない）
 EDITOR_BASE_RAW = "raw_script_box"
 EDITOR_BASE_FINAL = "final_script_box"
@@ -4621,6 +4621,55 @@ def inject_app_theme() -> None:
     )
 
 
+def maybe_reset_session_from_query() -> None:
+    """
+    アドレスに ?reset=1 が付いていたら、保存中の画面状態を全部消す。
+    （古い入力欄の名残で取り込みが失敗するとき用）
+    """
+    try:
+        reset = str(st.query_params.get("reset", "") or "").strip().lower()
+    except Exception:
+        reset = ""
+    if reset not in ("1", "true", "yes"):
+        return
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+    try:
+        st.query_params.clear()
+    except Exception:
+        try:
+            st.query_params.from_dict({})
+        except Exception:
+            pass
+    st.rerun()
+
+
+def wipe_session_if_legacy_editor_widget() -> None:
+    """
+    旧入力欄キー final_script_editor_widget が残っていたら、
+    セッションを一度消してやり直す（取り込み失敗の主因）。
+    """
+    if st.session_state.get("_legacy_widget_wiped"):
+        return
+    has_legacy = False
+    for key in list(st.session_state.keys()):
+        sk = str(key)
+        if sk == "final_script_editor_widget" or sk.startswith(
+            "final_script_editor_widget"
+        ):
+            has_legacy = True
+            break
+    if not has_legacy:
+        return
+    pending = st.session_state.get("_deferred_reload_script")
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+    st.session_state["_legacy_widget_wiped"] = True
+    if pending is not None:
+        st.session_state["_deferred_reload_script"] = pending
+    st.rerun()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="医学ドラマ動画メーカー",
@@ -4628,6 +4677,9 @@ def main() -> None:
         layout="wide",
     )
     inject_app_theme()
+    # 古い画面状態を消してから開始（?reset=1 または旧キー検知）
+    maybe_reset_session_from_query()
+    wipe_session_if_legacy_editor_widget()
     init_state()
     # 旧版の入力欄キーが残っていると取り込みが失敗するため、最初に消す
     purge_legacy_editor_keys()
@@ -4704,12 +4756,9 @@ def main() -> None:
         st.write("設定")
         st.caption(f"修正版: `{APP_BUILD}`")
         if st.button("画面をリセット", key="btn_sidebar_reset_ui"):
-            st.session_state.video_encoding = False
-            st.session_state._export_job = None
-            st.session_state.pop("_mp4_cache_key", None)
-            st.session_state.pop("_mp4_cache_bytes", None)
-            st.session_state.pop("_script_import_retries", None)
-            hard_clear_all_editor_keys()
+            # 古い入力欄の名残も含め、画面の記憶を全部消す
+            for key in list(st.session_state.keys()):
+                st.session_state.pop(key, None)
             try:
                 check_voicevox_cached.clear()
                 fetch_voicevox_speakers_cached.clear()
@@ -5294,7 +5343,15 @@ def main() -> None:
                                     advance_plain=True,
                                 )
                         except Exception as e:  # noqa: BLE001
-                            st.error(f"原稿の取り込みに失敗しました: {e}")
+                            if is_widget_state_conflict_error(e):
+                                hard_clear_all_editor_keys()
+                                st.error(
+                                    "原稿の取り込みに失敗しました（古い入力欄の残り）。"
+                                    "左の「画面をリセット」を押すか、"
+                                    "アドレスを http://localhost:8501/?reset=1 にして開き直してください。"
+                                )
+                            else:
+                                st.error(f"原稿の取り込みに失敗しました: {e}")
         elif st.session_state.mp4_bytes:
             st.download_button(
                 label="MP4をダウンロード",
