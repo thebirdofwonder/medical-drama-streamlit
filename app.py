@@ -1,5 +1,5 @@
 """
-医学論文PDFまたは台本 → 台本用意 → AIレビュー → VOICEVOX音声 → 静止画背景 → MP4 生成
+医学論文PDFまたは台本 → 台本確定 → VOICEVOX音声（読み方辞書はMP4直前） → 静止画背景 → MP4 生成
 Streamlit アプリ（macOS / Apple Silicon 向け）
 """
 
@@ -295,7 +295,7 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "bracket-fix-20260810a"
+APP_BUILD = "no-review-20260810b"
 # 入力欄キー（旧名 final_script_editor_widget は衝突しやすいので使わない）
 EDITOR_BASE_RAW = "raw_script_box"
 EDITOR_BASE_FINAL = "final_script_box"
@@ -532,8 +532,6 @@ def run_deferred_script_actions() -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUTPUT_DIR / "last_script.txt").write_text(script, encoding="utf-8")
         if payload.get("advance_plain"):
-            st.session_state.review_done = True
-            st.session_state.skip_review = True
             txt_path, docx_path = advance_to_video_with_plain_script(script)
             (OUTPUT_DIR / "last_script.txt").write_text(
                 st.session_state.final_script,
@@ -4937,15 +4935,13 @@ def main() -> None:
                         citation = _heuristic_vancouver_from_paper(paper_text) or (
                             f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
                         )
-                        n_ruby = count_voicevox_ruby(script)
-                        ruby_note = f"・ルビ {n_ruby} 件" if n_ruby else ""
                         schedule_script_reload(
                             script,
                             f"pdf-{paper_pdf.name}-{len(script)}",
                             citation=citation,
                             notice=(
                                 f"取り込み完了: {paper_pdf.name}"
-                                f"（約 {len(script):,} 字{ruby_note}）"
+                                f"（約 {len(script):,} 字）"
                             ),
                         )
                 except Exception as e:  # noqa: BLE001
@@ -4976,14 +4972,12 @@ def main() -> None:
                         st.error("台本が空でした。")
                     else:
                         script = normalize_script_keeping_ruby(script)
-                        n_ruby = count_voicevox_ruby(script)
-                        ruby_note = f"・ルビ {n_ruby} 件" if n_ruby else ""
                         schedule_script_reload(
                             script,
                             f"script-{script_upload.name}-{len(script)}",
                             notice=(
                                 f"取り込み完了: {script_upload.name}"
-                                f"（約 {len(script):,} 字{ruby_note}）"
+                                f"（約 {len(script):,} 字）"
                             ),
                         )
                 except Exception as e:  # noqa: BLE001
@@ -4995,13 +4989,12 @@ def main() -> None:
     ):
         render_video_title_input()
 
-    if st.session_state.raw_script:
+    # ----- Step 2: 台本を確定（アプリ内レビュー工程は置かない） -----
+    if st.session_state.raw_script and not st.session_state.script_confirmed:
+        st.write("2. 台本を確定")
         n_chars = len(st.session_state.raw_script)
         est_min = max(1, round(n_chars / 320))
-        n_ruby_raw = count_voicevox_ruby(st.session_state.raw_script)
-        ruby_cap = f"・ルビ {n_ruby_raw} 件" if n_ruby_raw else ""
-        st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分{ruby_cap}")
-        # 台本表示窓は常に編集・上書き可能
+        st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
         raw_key = ensure_editor_value(
             EDITOR_BASE_RAW, st.session_state.raw_script
         )
@@ -5011,202 +5004,44 @@ def main() -> None:
             key=raw_key,
         )
         if st.button("この内容で台本を上書き", key="btn_overwrite_raw_script"):
-            edited_raw = normalize_script_keeping_ruby(
+            edited_raw = strip_voicevox_ruby(
                 read_editor_value(EDITOR_BASE_RAW)
-            )
+            ).strip()
             if not edited_raw:
                 st.error("台本が空です。")
             else:
                 st.session_state.raw_script = edited_raw
                 st.session_state.final_script = edited_raw
                 st.session_state.final_script_editor = edited_raw
-                # 表示中の入力欄は触らず、世代を進めて作り直す
                 bump_editor_rev()
-                st.success("台本を上書きしました（既存ルビは残しています）。")
+                st.success("台本を上書きしました。")
                 st.rerun()
 
-        col_rev, col_skip = st.columns(2)
-        with col_rev:
-            review_clicked = st.button(
-                "1. レビューする",
-                type="primary",
-                disabled=not bool(st.session_state.raw_script.strip()),
-                use_container_width=True,
-                key="btn_do_review",
-            )
-        with col_skip:
-            skip_clicked = st.button(
-                "1′. レビューせず進む",
-                type="secondary",
-                disabled=not bool(st.session_state.raw_script.strip()),
-                use_container_width=True,
-                key="btn_skip_review",
-            )
-    else:
-        review_clicked = False
-        skip_clicked = False
+        if st.button(
+            "2. 確定して動画作成へ",
+            type="primary",
+            disabled=not bool(st.session_state.raw_script.strip()),
+            use_container_width=True,
+            key="btn_confirm_to_video",
+        ):
+            edited = strip_voicevox_ruby(
+                read_editor_value(EDITOR_BASE_RAW) or st.session_state.raw_script
+            ).strip()
+            if not edited:
+                st.error("台本が空です。")
+            else:
+                try:
+                    txt_path, docx_path = advance_to_video_with_plain_script(edited)
+                    st.success(
+                        "台本を確定し、デスクトップへ保存しました。\n"
+                        f"- `{txt_path.name}`\n"
+                        f"- `{docx_path.name}`"
+                    )
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"台本の保存に失敗しました: {e}")
 
-    if review_clicked:
-        with st.spinner("台本をレビューしています…"):
-            try:
-                # 古い採否の選択を消してから新しいレビューを入れる
-                clear_review_decision_widgets(st.session_state.get("review"))
-                # レビュー用は読みやすい平文、保存用は既存ルビを残す
-                kept = normalize_script_keeping_ruby(st.session_state.raw_script)
-                review_plain = strip_voicevox_ruby(kept)
-                st.session_state.review = run_script_review(review_plain)
-                st.session_state.review_done = True
-                st.session_state.skip_review = False
-                st.session_state.script_confirmed = False
-                st.session_state.ruby_ready = False
-                st.session_state.mp4_bytes = None
-                st.session_state.mp4_path = ""
-                st.session_state.review_apply_log = []
-                st.session_state.review_manual_log = []
-                st.session_state.last_error = ""
-                st.session_state.final_script = kept
-                st.session_state.final_script_editor = kept
-                bump_editor_rev()
-            except Exception as e:  # noqa: BLE001
-                st.session_state.last_error = str(e)
-                st.error(f"レビューに失敗しました: {e}")
-
-    if skip_clicked:
-        clear_review_decision_widgets(st.session_state.get("review"))
-        kept = normalize_script_keeping_ruby(st.session_state.raw_script)
-        st.session_state.review = None
-        st.session_state.review_done = True
-        st.session_state.skip_review = True
-        st.session_state.script_confirmed = False
-        st.session_state.ruby_ready = False
-        st.session_state.mp4_bytes = None
-        st.session_state.mp4_path = ""
-        st.session_state.review_apply_log = []
-        st.session_state.review_manual_log = []
-        st.session_state.last_error = ""
-        st.session_state.final_script = kept
-        st.session_state.final_script_editor = kept
-        bump_editor_rev()
-        st.success("レビューをスキップしました（既存ルビは残しています）")
-
-    # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
-    # 動画作成へ進んだあとは最終台本欄を出さない（別原稿取り込み時の衝突防止）
-    if st.session_state.review_done and not st.session_state.script_confirmed:
-        if st.session_state.get("skip_review"):
-            st.write("2. 原稿を確定")
-            final_key = ensure_editor_value(
-                EDITOR_BASE_FINAL,
-                st.session_state.final_script or st.session_state.raw_script,
-            )
-            st.text_area(
-                "最終台本（編集・上書き可）",
-                height=320,
-                key=final_key,
-            )
-            if st.button("2. 確定して動画作成へ", type="primary", key="btn_confirm_skip"):
-                edited = normalize_script_keeping_ruby(
-                    read_editor_value(EDITOR_BASE_FINAL).strip()
-                )
-                if not edited:
-                    st.error("最終台本が空です。")
-                else:
-                    try:
-                        txt_path, docx_path = advance_to_video_with_plain_script(
-                            edited
-                        )
-                        st.success(
-                            "ルビなし台本を確定し、デスクトップへ保存しました。\n"
-                            f"- `{txt_path.name}`\n"
-                            f"- `{docx_path.name}`"
-                        )
-                        st.rerun()
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"台本の保存に失敗しました: {e}")
-
-        elif st.session_state.review:
-            st.write("2. レビュー")
-            review = st.session_state.review
-            mode = review.get("mode", "claude")
-            if mode == "heuristic":
-                st.caption("簡易レビュー")
-            if review.get("review_truncated"):
-                st.warning("長い台本のため、レビューは先頭部分のみです。")
-
-            for section_key, section_title in REVIEW_SECTION_DEFS:
-                render_review_section_interactive(
-                    section_key,
-                    section_title,
-                    review.get(section_key, []),
-                )
-
-            if st.button("採択・別案を台本に反映", type="secondary"):
-                base = (
-                    read_editor_value(EDITOR_BASE_FINAL)
-                    or st.session_state.get("final_script")
-                    or st.session_state.raw_script
-                )
-                new_text, applied, manual = apply_review_decisions_to_script(
-                    base, review
-                )
-                new_text = normalize_script_keeping_ruby(new_text)
-                st.session_state.final_script = new_text
-                st.session_state.final_script_editor = new_text
-                # 表示中の入力欄キーは触らず、世代を進めて再表示する
-                bump_editor_rev()
-                st.session_state.review_apply_log = applied
-                st.session_state.review_manual_log = manual
-                if applied:
-                    st.success(f"{len(applied)} 件を反映しました")
-                else:
-                    st.info("自動反映できる項目はありませんでした")
-                if manual:
-                    st.warning("手修正が必要な項目があります")
-                st.rerun()
-
-            if st.session_state.get("review_apply_log"):
-                with st.expander("反映した内容", expanded=False):
-                    for line in st.session_state.review_apply_log:
-                        st.write(f"- {line}")
-            if st.session_state.get("review_manual_log"):
-                with st.expander("手修正が必要な内容", expanded=True):
-                    for line in st.session_state.review_manual_log:
-                        st.write(f"- {line}")
-
-            final_key = ensure_editor_value(
-                EDITOR_BASE_FINAL,
-                st.session_state.final_script or st.session_state.raw_script,
-            )
-            st.text_area(
-                "最終台本（編集・上書き可）",
-                height=320,
-                key=final_key,
-            )
-
-            if st.button(
-                "2. 確定して動画作成へ",
-                type="primary",
-                key="btn_confirm_review",
-            ):
-                edited = normalize_script_keeping_ruby(
-                    read_editor_value(EDITOR_BASE_FINAL).strip()
-                )
-                if not edited:
-                    st.error("最終台本が空です。")
-                else:
-                    try:
-                        txt_path, docx_path = advance_to_video_with_plain_script(
-                            edited
-                        )
-                        st.success(
-                            "ルビなし台本を確定し、デスクトップへ保存しました。\n"
-                            f"- `{txt_path.name}`\n"
-                            f"- `{docx_path.name}`"
-                        )
-                        st.rerun()
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"台本の保存に失敗しました: {e}")
-
-    # ----- Step 3: 動画作成（読み方辞書は MP4 直前に VOICEVOX へ渡す） -----
+    # ----- Step 3: 動画作成（読み方辞書は MP4 直前のみ） -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
         render_video_title_input()
@@ -5226,23 +5061,23 @@ def main() -> None:
         st.write("作業の流れ")
         st.markdown(
             """
-1. **A. 最初の確認** … 台本でドラフトMP4（背景なし）を作る  
-2. **B. 読み方** … 読みがおかしい語は、読み方辞書を手直ししてアップロードする  
-3. **C. 仕上げ** … 読みが固まったら、最終版（背景あり）を作る  
+1. **A. 最初の確認** … 読み方辞書を用意し、ドラフトMP4（背景なし）を作る  
+2. **B. 読み直し** … 読みがおかしければ辞書や台本を直して、ドラフトを作り直す  
+3. **C. 仕上げ** … 固まったら最終版（背景あり）を作る  
             """.strip()
         )
-        st.caption(f"いまの台本: 平文／動画種類の初期値: {mode_now}")
+        st.caption(f"動画種類の初期値: {mode_now}")
 
         plain_txt = st.session_state.get("last_plain_script_txt") or ""
         if plain_txt and Path(plain_txt).exists():
             st.caption(f"デスクトップの台本: `{Path(plain_txt).name}`")
 
-        # MP4作成直前: 読み方辞書を手動アップロード（自動更新なし）
-        st.write("VOICEVOX 読み方辞書")
+        # MP4作成直前のみ: 読み方辞書を読み込む（他工程では扱わない）
+        st.write("VOICEVOX 読み方辞書（MP4作成直前）")
         st.caption(
-            "MP4を作る直前に、手元で直した辞書をアップロードしてください。"
-            "未指定のときは標準辞書を使います。"
-            "辞書は台本には埋め込まず、VOICEVOX 本体へ毎回読み込みます。"
+            "ここでのみ辞書を扱います。"
+            "アップロードするか、標準辞書のまま作成してください。"
+            "MP4作成時に VOICEVOX へ読み込みます。"
         )
         dict_file = st.file_uploader(
             "読み方辞書（.tsv / .txt / .csv）",
@@ -5563,9 +5398,6 @@ def main() -> None:
             dict_n = int(dict_info.get("imported") or 0)
             st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
             st.caption(f"今回の動画: {mode_kind}／VOICEVOX辞書 {dict_n} 語")
-            desk_dict = st.session_state.get("last_ruby_dict_desktop") or ""
-            if desk_dict:
-                st.caption(f"読み方辞書（デスクトップ）: `{desk_dict}`")
             # 大きいMP4を毎回ディスクから読むと落ちやすい → 1回だけメモリに載せる
             if size_mb < 180:
                 mp4_stat = Path(mp4_path).stat()
@@ -5604,20 +5436,12 @@ def main() -> None:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-            # 読み直し: 台本や辞書を手直ししてから作り直す（自動更新なし）
+            # 読み直し: 台本を手直ししてから作り直す（辞書は上のMP4直前欄のみ）
             st.write("読み直し・仕上げ")
             st.caption(
-                "読みがおかしいときは、上の読み方辞書を直してアップロードし直すか、"
-                "修正した台本を上げてからドラフトを作り直してください。"
+                "読みがおかしいときは、上の「VOICEVOX 読み方辞書」を直してから"
+                "作り直すか、修正した台本を上げてください。"
             )
-            if RUBY_DICT_EXPORT_PATH.is_file():
-                st.download_button(
-                    label="読み方辞書をダウンロード",
-                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
-                    file_name=RUBY_DICT_EXPORT_NAME,
-                    mime="text/plain",
-                    key="dl_ruby_dict_after_video",
-                )
             script_reupload = st.file_uploader(
                 "修正した台本（.txt / .docx）",
                 type=["txt", "docx"],
@@ -5692,7 +5516,7 @@ def main() -> None:
                     st.session_state.export_progress_msg = ""
                     st.rerun()
 
-            # 別作品用の次原稿（レビューからやり直し）
+            # 別作品用の次原稿
             with st.expander("別の原稿で新しい動画を始める", expanded=False):
                 next_script = st.file_uploader(
                     "次の原稿（.txt / .docx）",
