@@ -1,7 +1,6 @@
 """
 医学論文PDFまたは台本 → 台本確定 → VOICEVOX音声 → 静止画背景 → MP4 生成
 Streamlit アプリ（macOS / Apple Silicon 向け）
-（読み方辞書の画面操作は凍結。標準辞書のみ自動で VOICEVOX へ渡す）
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ import shutil
 import struct
 import subprocess
 import tempfile
-import uuid
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -73,11 +71,6 @@ BGM_CANDIDATE_URLS = [
 ]
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
-# ルビ辞書ファイル（用語とよみの対照表）→ VOICEVOX ユーザー辞書へ渡す（画面操作は凍結）
-RUBY_DICT_PATH = WORK_DIR / "data" / "medical_ruby_dict.tsv"
-# VOICEVOX user_dict 用の安定UUID名前空間（同じ用語は毎回同じID）
-VOICEVOX_USER_DICT_NS = uuid.UUID("6f1c9a2e-8b47-4d3f-9c10-2a7e5b8d4f31")
-
 # 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
 MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
 LANDSCAPE_DIR = MEDICAL_BG_DIR  # 互換エイリアス
@@ -173,9 +166,7 @@ def advance_to_video_with_plain_script(edited: str) -> tuple[Path, Path]:
     st.session_state.raw_script = plain
     st.session_state.script_confirmed = True
     st.session_state.ruby_script = plain
-    st.session_state.ruby_script_baseline = plain
     st.session_state.ruby_ready = True
-    st.session_state.ruby_skipped = True
     st.session_state.video_export_mode = "draft"
     st.session_state.last_plain_script_txt = str(txt_path)
     st.session_state.last_plain_script_docx = str(docx_path)
@@ -282,8 +273,6 @@ CLAUDE_MODEL_CANDIDATES = [
     "claude-sonnet-4-5",
     "claude-haiku-4-5",
 ]
-# レビュー用に送る台本の上限（長すぎると API が失敗しやすい）
-REVIEW_SCRIPT_MAX_CHARS = 12000
 # 論文PDF→台本化：論文本文の送付上限・VOICEVOX 1倍速 10〜12分目安
 PAPER_TEXT_MAX_CHARS = 100000
 # Claude 1回あたりの待ち上限（秒）。長すぎると画面が止まったように見える
@@ -292,7 +281,7 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260811a"
+APP_BUILD = "ui-slim-20260811b"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -675,14 +664,9 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     bump_editor_rev()
     st.session_state.raw_script = script
     st.session_state.final_script = script
-    st.session_state.review = None
-    st.session_state.review_done = False
-    st.session_state.skip_review = False
     st.session_state.script_confirmed = False
     st.session_state.ruby_ready = False
     st.session_state.ruby_script = ""
-    st.session_state.ruby_script_baseline = ""
-    st.session_state.ruby_skipped = False
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
     st.session_state.mp4_name = "medical_drama.mp4"
@@ -691,8 +675,6 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state._export_job = None
     st.session_state.pop("_mp4_cache_key", None)
     st.session_state.pop("_mp4_cache_bytes", None)
-    st.session_state.review_apply_log = []
-    st.session_state.review_manual_log = []
     st.session_state._script_file_id = source_id
     st.session_state._ruby_loop_file_id = None
     # 旧キーが残っていても触らず捨てる
@@ -701,12 +683,19 @@ def commit_loaded_script(text: str, source_id: str) -> None:
         "raw_script_editor_widget",
         "ruby_script_editor",
         "final_script_editor",
+        "review",
+        "review_done",
+        "skip_review",
+        "review_apply_log",
+        "review_manual_log",
+        "last_voicevox_dict_import",
+        "ruby_dict_post_video_updates",
     ):
         st.session_state.pop(bad, None)
 
 
 # ---------------------------------------------------------------------------
-# AI レビュー（Anthropic Claude API / フォールバック簡易レビュー）
+# APIキー / Claude（台本作成用）
 # ---------------------------------------------------------------------------
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 
@@ -795,66 +784,6 @@ def get_api_key() -> str:
         return ""
 
 
-def build_review_prompt(script: str) -> str:
-    return f"""あなたは現役の救急・集中治療に詳しい医療監修医です。
-あわせて VOICEVOX（音声合成）向けの読み付けも行います。
-以下の医学ドラマ台本を検証し、JSONオブジェクトだけを返してください。
-前後に説明文・Markdown・コードフェンスは付けないでください。
-
-厳守ルール:
-- 有効なJSONのみ（末尾カンマ禁止）
-- 文字列内に半角ダブルクォート " を書かない（必要なら『』や「」を使う）
-- 各指摘配列は最大5件
-- original は40文字以内、issue/suggestion は120文字以内
-- suggestion は「台本にそのまま差し替える完成文」だけを書く
-  （禁止例: 「編集メモを削除する」「確定文にして」「地の文として採用」などの作業手順・解説）
-
-【最重要・禁止事項（レビュー指摘について）】
-この台本では、音声合成の誤読を防ぐため、医学用語・専門用語を意図的にカタカナ表記しています。
-したがって次は絶対に指摘しないでください（medical_contradictions / awkward_for_doctors / immersion_improvements のいずれにも含めない）:
-- 医学用語・専門用語がカタカナであること
-- カタカナを漢字に直す提案
-- 「医師なら漢字で書く」「カタカナは不自然」といった表記スタイルの指摘
-内容の医学的正しさ・現場表現・臨場感のみを見てください。
-
-【VOICEVOXルビ付与（必須）】
-読み間違えやすい漢字の医学用語・専門用語・難読語について、ruby_annotations に列挙してください。
-- surface: 台本中の表記そのもの（漢字など。すでにカタカナだけの語は原則不要）
-- reading: 正しい読み（ひらがな、またはカタカナ）
-- すでに {{表記|よみ}} 形式のものがある場合は重複させない
-- 人名の難読、薬品名、疾患名、手技名、略語の読みなどを優先（最大40件）
-- 読みは実際の医療現場の読みに合わせる（例: 心筋梗塞→しんきんこうそく）
-
-観点:
-1. medical_contradictions … 医学的に矛盾している箇所
-2. awkward_for_doctors … 現役医師が聞くと違和感がある表現（カタカナ表記そのものは対象外）
-3. immersion_improvements … 臨場感が増す修正（カタカナを漢字にする案は出さない）
-4. ruby_annotations … VOICEVOX用ルビ一覧
-
-形式:
-{{
-  "medical_contradictions": [
-    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
-  ],
-  "awkward_for_doctors": [
-    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
-  ],
-  "immersion_improvements": [
-    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
-  ],
-  "ruby_annotations": [
-    {{"surface": "心筋梗塞", "reading": "しんきんこうそく"}}
-  ]
-}}
-
-該当が無い観点は空配列 [] にしてください。
-
-台本:
----
-{script}
----
-"""
-
 
 def normalize_voicevox_reading(reading: str) -> str:
     """ルビの読みから余計な記号を除く。"""
@@ -892,113 +821,6 @@ def canonicalize_voicevox_ruby_delimiters(text: str) -> str:
     return _RUBY_TAG_RE.sub(_repl, text)
 
 
-def apply_voicevox_ruby(
-    script: str,
-    annotations: list[dict[str, str]],
-    *,
-    fullwidth: bool = True,
-) -> str:
-    """
-    VOICEVOXルビを台本へ付与する。
-    fullwidth=True のとき ｛表記｜よみ｝、False のとき {表記|よみ}。
-    半角/全角の区切り記号は区別しない。既にあるルビは壊さない。
-
-    同じ位置に複数の辞書語が当てはまるときは、文字数が多い用語を優先する。
-    例: 「所」と「所見」なら「所見」を採用する。
-    """
-    text = canonicalize_voicevox_ruby_delimiters(script or "")
-    if not annotations:
-        return (
-            to_fullwidth_ruby_delimiters(text)
-            if fullwidth
-            else text
-        )
-
-    protected: dict[str, str] = {}
-
-    def _protect(match: re.Match) -> str:
-        key = f"\x00RUBY{len(protected)}\x00"
-        protected[key] = match.group(0)
-        return key
-
-    def protect_existing(src: str) -> str:
-        return _RUBY_TAG_RE.sub(_protect, src)
-
-    pairs: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for item in annotations:
-        surface = str(item.get("surface") or "").strip()
-        reading = normalize_voicevox_reading(str(item.get("reading") or ""))
-        if not surface or not reading:
-            continue
-        if surface in seen:
-            continue
-        if surface == reading:
-            continue
-        if len(reading) < 1:
-            continue
-        seen.add(surface)
-        pairs.append((surface, reading))
-
-    # 長い用語を先に試し、短い用語（例:「所」）より「所見」を優先
-    pairs.sort(key=lambda x: (len(x[0]), x[0]), reverse=True)
-    text = protect_existing(text)
-
-    # プレースホルダ以外の平文だけを、左から最長一致で置換する
-    placeholder_re = re.compile(r"\x00RUBY\d+\x00")
-    pieces: list[str] = []
-    last = 0
-    for m in placeholder_re.finditer(text):
-        if m.start() > last:
-            pieces.append(
-                _apply_ruby_longest_match(text[last:m.start()], pairs, fullwidth)
-            )
-        pieces.append(m.group(0))
-        last = m.end()
-    if last < len(text):
-        pieces.append(_apply_ruby_longest_match(text[last:], pairs, fullwidth))
-    text = "".join(pieces)
-
-    for key, val in protected.items():
-        text = text.replace(key, val)
-    text = canonicalize_voicevox_ruby_delimiters(text)
-    return to_fullwidth_ruby_delimiters(text) if fullwidth else text
-
-
-def _apply_ruby_longest_match(
-    segment: str,
-    pairs: list[tuple[str, str]],
-    fullwidth: bool,
-) -> str:
-    """
-    平文の先頭から順に見て、その位置で一致する用語のうち
-    いちばん文字数が多いものをルビにする。
-    pairs は文字数の多い順に並べておくこと。
-    """
-    if not segment or not pairs:
-        return segment
-    out: list[str] = []
-    i = 0
-    n = len(segment)
-    while i < n:
-        matched = False
-        for surface, reading in pairs:
-            length = len(surface)
-            if length <= 0 or i + length > n:
-                continue
-            if segment[i : i + length] == surface:
-                if fullwidth:
-                    out.append("｛" + surface + "｜" + reading + "｝")
-                else:
-                    out.append("{" + surface + "|" + reading + "}")
-                i += length
-                matched = True
-                break
-        if not matched:
-            out.append(segment[i])
-            i += 1
-    return "".join(out)
-
 
 def to_fullwidth_ruby_delimiters(text: str) -> str:
     """半角ルビ {表記|よみ} を全角 ｛表記｜よみ｝ にそろえる。"""
@@ -1014,363 +836,9 @@ def to_fullwidth_ruby_delimiters(text: str) -> str:
     return _RUBY_TAG_RE.sub(_repl, text)
 
 
-# 組み込みの最低限辞書（ファイルが無いときの予備）
-DEFAULT_RUBY_DICT: list[tuple[str, str]] = [
-    ("心筋梗塞", "しんきんこうそく"),
-    ("心不全", "しんふぜん"),
-    ("心房細動", "しんぼうさいどう"),
-    ("心室細動", "しんしつさいどう"),
-    ("心静止", "しんせいし"),
-    ("肺塞栓", "はいそくせん"),
-    ("敗血症", "はいけつしょう"),
-    ("呼吸不全", "こきゅうふぜん"),
-    ("気管内挿管", "きかんないそうかん"),
-    ("気管挿管", "きかんそうかん"),
-    ("胸骨圧迫", "きょうこつあっぱく"),
-    ("昇圧剤", "しょうあつざい"),
-    ("降圧", "こうあつ"),
-    ("輸液", "ゆえき"),
-    ("造影剤", "ぞうえいざい"),
-    ("心電図", "しんでんず"),
-    ("動脈血", "どうみゃくけつ"),
-    ("静脈血", "じょうみゃくけつ"),
-    ("酸素飽和度", "さんそほうわど"),
-    ("意識障害", "いしきしょうがい"),
-    ("昏睡", "こんすい"),
-    ("痙攣", "けいれん"),
-    ("麻痺", "まひ"),
-    ("梗塞", "こうそく"),
-    ("出血", "しゅっけつ"),
-    ("麻酔", "ますい"),
-    ("開腹", "かいふく"),
-    ("開胸", "かいきょう"),
-    ("縫合", "ほうごう"),
-    ("抜管", "ばっかん"),
-    ("挿管", "そうかん"),
-    ("透析", "とうせき"),
-    ("血糖", "けっとう"),
-    ("白血球", "はっけっきゅう"),
-    ("赤血球", "せっけっきゅう"),
-    ("血小板", "けっしょうばん"),
-    ("凝固", "ぎょうこ"),
-    ("抗凝固", "こうぎょうこ"),
-    ("抗生剤", "こうせいざい"),
-    ("抗菌薬", "こうきんやく"),
-    ("骨病変", "こつびょうへん"),
-    # 検査単位（VOICEVOX読み上げ用）
-    ("mg/24 h", "みりぐらむぱーにじゅうよじかん"),
-    ("mg/24h", "みりぐらむぱーにじゅうよじかん"),
-    ("mmol/L", "ミリモルパーリットル"),
-    ("mmol/l", "ミリモルパーリットル"),
-    ("mEq/dL", "めっくぱーでしりっとる"),
-    ("mEq/dl", "めっくぱーでしりっとる"),
-    ("mEq/L", "めっくぱーりっとる"),
-    ("mEq/l", "めっくぱーりっとる"),
-    ("mg/dL", "ミリグラムパーデシリットル"),
-    ("mg/dl", "ミリグラムパーデシリットル"),
-    ("g/dL", "ぐらむぱーでしりっとる"),
-    ("g/dl", "ぐらむぱーでしりっとる"),
-    ("mg/L", "ミリグラムパーリットル"),
-    ("mg/l", "ミリグラムパーリットル"),
-    ("pg/mL", "ぴこぐらむぱーみりりっとる"),
-    ("pg/ml", "ぴこぐらむぱーみりりっとる"),
-    ("pg/L", "ぴこぐらむぱーりっとる"),
-    ("pg/l", "ぴこぐらむぱーりっとる"),
-    ("ng/mL", "ナノグラムパーミリリットル"),
-    ("ng/ml", "ナノグラムパーミリリットル"),
-    ("mmHg", "ミリメートルえいちじー"),
-    ("mm", "ミリメートル"),
-    ("/μL", "ぱーまいくろりっとる"),
-    ("/uL", "ぱーまいくろりっとる"),
-    ("/ul", "ぱーまいくろりっとる"),
-]
-
-
-def parse_ruby_dict_text(raw: str) -> list[tuple[str, str]]:
-    """
-    辞書テキストを読む。
-    対応:
-    - 用語<TAB>よみ
-    - 用語,よみ
-    - 用語｜よみ
-    - 用語|よみ
-    - 用語  よみ（空白2つ以上）
-    - 用語 よみ（空白1つ。右側がかな中心のとき）
-    """
-    out: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for line in (raw or "").replace("\r\n", "\n").split("\n"):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        surface = ""
-        reading = ""
-        if "\t" in line:
-            surface, _, reading = line.partition("\t")
-        elif "｜" in line:
-            surface, _, reading = line.partition("｜")
-        elif "|" in line and not line.startswith("{"):
-            surface, _, reading = line.partition("|")
-        elif "," in line:
-            surface, _, reading = line.partition(",")
-        else:
-            parts = re.split(r"\s{2,}", line, maxsplit=1)
-            if len(parts) == 2:
-                surface, reading = parts
-            else:
-                # 1つの空白区切りも、右側が「よみ」らしいときは受け入れる
-                parts = line.split()
-                if len(parts) == 2:
-                    maybe_surface, maybe_reading = parts
-                    if re.fullmatch(r"[ぁ-んァ-ンー・ヴ゛゜A-Za-z0-9]+", maybe_reading):
-                        surface, reading = maybe_surface, maybe_reading
-        surface = surface.strip().strip("「」『』\"'")
-        reading = normalize_voicevox_reading(reading)
-        if not surface or not reading or surface in seen or surface == reading:
-            continue
-        seen.add(surface)
-        out.append((surface, reading))
-    return out
-
-
-def load_ruby_dict_from_path(path: Path | None = None) -> list[tuple[str, str]]:
-    """辞書ファイル（TSVなど）を読み込む。無ければ空リスト。"""
-    p = path or RUBY_DICT_PATH
-    try:
-        if not p.is_file():
-            return []
-        return parse_ruby_dict_text(p.read_text(encoding="utf-8"))
-    except OSError:
-        return []
-
-
-def get_active_ruby_dictionary() -> list[tuple[str, str]]:
-    """
-    VOICEVOX に渡す読み方辞書を返す（画面操作は凍結中）。
-    優先: 標準辞書ファイル → 組み込み（同じ用語は先勝ち）
-    """
-    merged: list[tuple[str, str]] = []
-    seen: set[str] = set()
-
-    def _add(pairs: list[tuple[str, str]]) -> None:
-        for surface, reading in pairs:
-            surface = (surface or "").strip()
-            reading = normalize_voicevox_reading(reading)
-            if not surface or not reading or surface in seen or surface == reading:
-                continue
-            seen.add(surface)
-            merged.append((surface, reading))
-
-    _add(load_ruby_dict_from_path(RUBY_DICT_PATH))
-    _add(DEFAULT_RUBY_DICT)
-    return merged
-
-
-def hiragana_to_katakana(text: str) -> str:
-    """ひらがなをカタカナへ（VOICEVOX発音用）。"""
-    out: list[str] = []
-    for ch in text or "":
-        code = ord(ch)
-        if 0x3041 <= code <= 0x3096:
-            out.append(chr(code + 0x60))
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def reading_to_voicevox_pronunciation(reading: str) -> str:
-    """
-    辞書のよみを VOICEVOX 用カタカナ発音へ変換する。
-    無効な文字が残る場合は空文字（その語はスキップ）。
-    """
-    t = hiragana_to_katakana(normalize_voicevox_reading(reading))
-    t = (
-        t.replace("・", "")
-        .replace(" ", "")
-        .replace("　", "")
-        .replace("-", "ー")
-        .replace("ｰ", "ー")
-    )
-    if not t or not re.fullmatch(r"[ァ-ヴー]+", t):
-        return ""
-    return t
-
-
-def count_katakana_mora(pronunciation: str) -> int:
-    """カタカナ発音のモーラ数（簡易）。"""
-    small = set("ァィゥェォャュョヮ")
-    n = 0
-    for ch in pronunciation or "":
-        if ch in small:
-            continue
-        if ch == "ッ":
-            n += 1
-            continue
-        if "ァ" <= ch <= "ヶ" or ch == "ー" or ch == "ヴ":
-            n += 1
-    return max(1, n)
-
-
-def build_voicevox_user_dict_payload(
-    pairs: list[tuple[str, str]],
-) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """
-    TSV辞書 → VOICEVOX /import_user_dict 用JSON。
-    戻り値: (payload, スキップした用語の一覧)
-    """
-    payload: dict[str, dict[str, Any]] = {}
-    skipped: list[str] = []
-    for surface, reading in pairs:
-        surface = (surface or "").strip()
-        if not surface or "," in surface or '"' in surface:
-            if surface:
-                skipped.append(surface)
-            continue
-        pron = reading_to_voicevox_pronunciation(reading)
-        if not pron:
-            skipped.append(surface)
-            continue
-        mora = count_katakana_mora(pron)
-        # アクセントは語末（尾高）を既定にする
-        accent = mora
-        word_uuid = str(uuid.uuid5(VOICEVOX_USER_DICT_NS, surface))
-        payload[word_uuid] = {
-            "surface": surface,
-            "priority": 9,
-            "context_id": 1348,
-            "part_of_speech": "名詞",
-            "part_of_speech_detail_1": "固有名詞",
-            "part_of_speech_detail_2": "一般",
-            "part_of_speech_detail_3": "*",
-            "inflectional_type": "*",
-            "inflectional_form": "*",
-            "stem": "*",
-            "yomi": pron,
-            "pronunciation": pron,
-            "accent_type": accent,
-            "mora_count": mora,
-            "accent_associative_rule": "*",
-        }
-    return payload, skipped
-
-
-def push_ruby_dict_to_voicevox(
-    pairs: list[tuple[str, str]] | None = None,
-) -> dict[str, Any]:
-    """
-    読み方辞書を VOICEVOX のユーザー辞書へ読み込ませる。
-    MP4作成のたびに呼ぶ。
-    """
-    data = pairs if pairs is not None else get_active_ruby_dictionary()
-    payload, skipped = build_voicevox_user_dict_payload(data)
-    if not payload:
-        raise RuntimeError(
-            "VOICEVOXへ送れる読み方辞書が空です。"
-            "カタカナ／ひらがなのよみがある辞書をアップロードしてください。"
-        )
-    try:
-        resp = http_session_direct().post(
-            f"{VOICEVOX_URL}/import_user_dict",
-            params={"override": "true"},
-            json=payload,
-            timeout=120,
-        )
-    except requests.RequestException as e:
-        raise RuntimeError(f"VOICEVOX辞書の読み込みに失敗しました: {e}") from e
-    if resp.status_code not in (200, 204):
-        raise RuntimeError(
-            "VOICEVOX辞書の読み込みに失敗しました: "
-            f"HTTP {resp.status_code} / {(resp.text or '')[:300]}"
-        )
-    return {
-        "imported": len(payload),
-        "skipped": skipped,
-        "source_pairs": len(data),
-    }
-
-
-def collect_dictionary_ruby_annotations(
-    script: str,
-    dictionary: list[tuple[str, str]] | None = None,
-) -> list[dict[str, str]]:
-    """
-    台本中に現れる用語だけ、辞書からルビ候補を集める。
-    文字数の多い用語を先に並べる（適用時の優先と揃える）。
-    """
-    text = strip_voicevox_ruby(script or "")
-    dict_pairs = dictionary if dictionary is not None else get_active_ruby_dictionary()
-    found: list[dict[str, str]] = []
-    # 長い用語を先に（例: 「所見」を「所」より優先）
-    for surface, reading in sorted(
-        dict_pairs, key=lambda x: (len(x[0]), x[0]), reverse=True
-    ):
-        if surface in text and surface != reading:
-            found.append({"surface": surface, "reading": reading})
-    return found
-
-
-def apply_dictionary_ruby_to_script(
-    script: str,
-    dictionary: list[tuple[str, str]] | None = None,
-) -> tuple[str, int, list[dict[str, str]]]:
-    """
-    辞書を対照して ｛用語｜よみ｝ を付与する。
-    同じ位置では文字数が多い用語を優先（例: 所 < 所見）。
-    戻り値: (ルビ付き台本, 付与件数, 使った注釈一覧)
-    """
-    annotations = collect_dictionary_ruby_annotations(script, dictionary)
-    out = apply_voicevox_ruby(script, annotations, fullwidth=True)
-    return out, count_voicevox_ruby(out), annotations
-
-
-def collect_default_ruby_annotations(script: str) -> list[dict[str, str]]:
-    """互換: 辞書ルビ候補を集める。"""
-    return collect_dictionary_ruby_annotations(script)
-
-
-def merge_ruby_annotations(
-    *groups: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    """複数のルビ一覧をまとめ、同じ表記は先勝ち。"""
-    merged: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for group in groups:
-        for item in group or []:
-            surface = str(item.get("surface") or "").strip()
-            reading = normalize_voicevox_reading(str(item.get("reading") or ""))
-            if not surface or not reading or surface in seen or surface == reading:
-                continue
-            seen.add(surface)
-            merged.append({"surface": surface, "reading": reading})
-    return merged
-
 
 def count_voicevox_ruby(text: str) -> int:
     return len(_RUBY_TAG_RE.findall(canonicalize_voicevox_ruby_delimiters(text or "")))
-
-
-def prepare_script_for_voicevox(
-    script: str,
-    extra_annotations: list[dict[str, str]] | None = None,
-    enabled: bool = True,
-) -> tuple[str, int]:
-    """
-    音声生成直前にルビを整える。
-    enabled=True（既定）: 辞書ルビ＋追加注釈（レビュー等）を付与
-    enabled=False: ルビを外した文を返す
-    戻り値: (台本, ルビ件数)
-    """
-    text = canonicalize_voicevox_ruby_delimiters(script or "")
-    if not enabled:
-        plain = strip_voicevox_ruby(text)
-        return plain, 0
-    # 辞書を優先（誤読の少ないよみ）→ そのあとレビュー等の追加注釈
-    dict_ann = collect_dictionary_ruby_annotations(text)
-    annotations = merge_ruby_annotations(dict_ann, list(extra_annotations or []))
-    out = apply_voicevox_ruby(text, annotations, fullwidth=True)
-    # VOICEVOX処理のため内部は半角にそろえて件数カウント
-    out_half = canonicalize_voicevox_ruby_delimiters(out)
-    return out_half, count_voicevox_ruby(out_half)
 
 
 # 字幕折り返し／分割：行頭に置かない文字（閉じの 」 など）
@@ -1458,29 +926,6 @@ def _safe_force_chunks(text: str, max_chars: int) -> list[str]:
     return out
 
 
-def is_katakana_notation_complaint(item: dict[str, str]) -> bool:
-    """カタカナ表記そのものを問題にしている指摘なら True（除外用）。"""
-    blob = " ".join(
-        [
-            str(item.get("issue") or ""),
-            str(item.get("suggestion") or ""),
-            str(item.get("original") or ""),
-        ]
-    )
-    patterns = [
-        r"カタカナ",
-        r"漢字(に|へ|で|表記|に直|に直し|に修正|で書)",
-        r"漢字表記",
-        r"かな表記",
-        r"仮名表記",
-        r"読み仮名",
-        r"ルビ",
-        r"正式な漢字",
-        r"漢字のほうが",
-        r"漢字に(直し|変え|置換|修正)",
-    ]
-    return any(re.search(p, blob) for p in patterns)
-
 
 def strip_code_fence(text: str) -> str:
     text = text.strip()
@@ -1489,87 +934,6 @@ def strip_code_fence(text: str) -> str:
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
-
-def repair_json_text(text: str) -> str:
-    """よくある壊れ方を直してから json.loads する。"""
-    text = strip_code_fence(text)
-    # 最初の { から最後の } まで
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        text = text[start : end + 1]
-    # 末尾カンマ: ,] や ,} を除去
-    text = re.sub(r",\s*([\]}])", r"\1", text)
-    # スマートクォートを半角に
-    text = (
-        text.replace("“", '"')
-        .replace("”", '"')
-        .replace("‘", "'")
-        .replace("’", "'")
-    )
-    return text
-
-
-def parse_json_loose(text: str) -> dict[str, Any]:
-    """モデル出力から JSON をできるだけ取り出す。"""
-    candidates = [text, repair_json_text(text)]
-    errors: list[str] = []
-    for cand in candidates:
-        try:
-            data = json.loads(cand)
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError as e:
-            errors.append(str(e))
-
-    # さらに: 制御文字除去して再試行
-    cleaned = repair_json_text(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text))
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, dict):
-            return data
-    except json.JSONDecodeError as e:
-        errors.append(str(e))
-
-    raise ValueError(
-        "AIの返答をJSONとして読めませんでした。\n"
-        + (errors[-1] if errors else "")
-    )
-
-
-def ask_claude_fix_json(api_key: str, model: str, broken: str) -> str:
-    """壊れたJSONを、同じモデルに直してもらう。"""
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    body = {
-        "model": model,
-        "max_tokens": 4096,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "次のテキストを、有効なJSONオブジェクトだけに直してください。"
-                    "説明文やコードフェンスは不要です。"
-                    "キーは medical_contradictions / awkward_for_doctors / "
-                    "immersion_improvements / ruby_annotations を維持してください。"
-                    "医学用語のカタカナ表記を問題にする指摘があれば削除してください。\n\n"
-                    f"{broken[:12000]}"
-                ),
-            }
-        ],
-    }
-    resp = http_session_direct().post(url, headers=headers, json=body, timeout=120)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"JSON修正リクエスト失敗 (HTTP {resp.status_code}): {resp.text[:300]}"
-        )
-    data = resp.json()
-    parts = data.get("content", [])
-    return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 
 
 def http_session_direct() -> requests.Session:
@@ -1583,81 +947,6 @@ def http_session_direct() -> requests.Session:
     session.proxies = {"http": None, "https": None}
     return session
 
-
-def review_with_claude(script: str, api_key: str) -> dict[str, Any]:
-    """Anthropic Messages API でレビュー（APIキーは引数経由、直書きしない）。"""
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    prompt = build_review_prompt(script)
-    last_error = ""
-
-    for model in CLAUDE_MODEL_CANDIDATES:
-        body = {
-            "model": model,
-            "max_tokens": 8192,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        try:
-            resp = http_session_direct().post(
-                url, headers=headers, json=body, timeout=120
-            )
-        except requests.exceptions.ProxyError as e:
-            raise RuntimeError(
-                "プロキシ（通信の仲介）のせいで Claude に接続できませんでした。\n"
-                "ターミナルで次を実行してから、アプリを再起動してください:\n"
-                "  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy\n"
-                f"詳細: {e}"
-            ) from e
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(
-                "Claude API への通信に失敗しました。"
-                "ネット接続と APIキーを確認してください。\n"
-                f"詳細: {e}"
-            ) from e
-
-        if resp.status_code == 404 and "model" in resp.text.lower():
-            last_error = f"{model}: {resp.text[:200]}"
-            continue  # 次のモデル候補を試す
-
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Claude API エラー (HTTP {resp.status_code}): {resp.text[:500]}"
-            )
-
-        data = resp.json()
-        parts = data.get("content", [])
-        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-        if not text:
-            raise RuntimeError("Claude API から空の返答が返りました。")
-
-        try:
-            parsed = parse_json_loose(text)
-        except ValueError:
-            # 壊れたJSONを一度だけ修正依頼
-            try:
-                fixed = ask_claude_fix_json(api_key, model, text)
-                parsed = parse_json_loose(fixed)
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    "Claudeのレビュー結果を読み取れませんでした。"
-                    "もう一度『1. 台本をレビューする』を押してください。\n"
-                    f"詳細: {e}"
-                ) from e
-
-        result = normalize_review(parsed)
-        result["mode"] = "claude"
-        result["model_used"] = model
-        return result
-
-    raise RuntimeError(
-        "利用できる Claude モデルが見つかりませんでした。\n"
-        f"試したモデル: {', '.join(CLAUDE_MODEL_CANDIDATES)}\n"
-        f"最後のエラー: {last_error}"
-    )
 
 
 def build_drama_script_prompt(paper_text: str) -> str:
@@ -1785,33 +1074,6 @@ def _strip_script_wrappers(text: str) -> str:
         break
     return "\n".join(lines).strip()
 
-
-def polish_drama_script_medically(script: str, api_key: str) -> str:
-    """医師視点で違和感・論理破綻を直し、台本本文だけ返す。"""
-    prompt = f"""あなたは臨床医です。次の YouTube 医学ドラマ台本を読み、
-医学的に違和感のある表現・論理的におかしい箇所だけを直してください。
-
-【厳守】
-- 出力は修正後の台本本文のみ（説明・箇条書きの修正リストは禁止）
-- ナレーションのみの形式を維持する
-- ドラマ前半で正しい診断を明示しないルールは維持する
-- 難易度は医師免許を持つ研修医が理解できるレベルを維持する（過度に高度化しない）
-- 「研修医のみなさん」「みなさん」など視聴者への呼びかけは入れない／残っていれば削除する
-- 長さは VOICEVOX 1.0倍速で約10〜12分（おおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字）を超えないよう、長くしすぎない
-- セリフの「」、列挙の読点ルールは崩さない
-- 鑑別診断の診断名を列挙するときは読点「、」で区切り、句点「。」では区切らない（文末の一句点だけ可）
-- 検査値の単位は原文表記のまま（mg/dL, mEq/L など）。単位を書き換えない
-- 検査値は「数字＋単位」をくっつけて書く（スペースなし。例: 120mg/dL。禁止: 120 mg/dL）
-- 薬物名はアルファベットでもカタカナでもよい（漢字訳にはしない）
-- 改行・改ページは原則として句読点の直後。単語・単位・薬物名の途中では切らない
-- すでに付いているルビ ｛用語｜よみ｝ は削除しない（新規には付けない）
-- 不要な前置き・後書きを付けない
-
-【台本】
-{script}
-"""
-    text, _model = _claude_messages_text(api_key, prompt, max_tokens=16000)
-    return _strip_script_wrappers(text)
 
 
 def generate_drama_script_from_paper(paper_text: str, api_key: str) -> str:
@@ -2073,183 +1335,6 @@ def update_export_progress(
         status.info(f"{n}%")
     st.session_state.export_progress_pct = n
     st.session_state.export_progress_msg = msg
-
-
-def heuristic_review(script: str) -> dict[str, Any]:
-    """
-    APIキーが無いとき用の簡易レビュー。
-    本格的な医学監修の代わりではなく、プロセス確認用です。
-    """
-    medical: list[dict[str, str]] = []
-    awkward: list[dict[str, str]] = []
-    immersion: list[dict[str, str]] = []
-
-    patterns_medical = [
-        (
-            r"血圧が\s*200[/\／]20",
-            "血圧の下の値（拡張期）が極端に低すぎる表記は非現実的です。",
-            "例: 「血圧 200/110」など臨床で起こりうる数値に修正してください。",
-        ),
-        (
-            r"心電図(が|で)?(止まっ|フラット|直線)",
-            "心停止の表現が曖昧です。波形の種類を明示した方が正確です。",
-            "「心電図は心静止（アスystole）」「心室細動（VF）」など具体名に。",
-        ),
-        (
-            r"酸素飽和度\s*(が)?\s*0%|SpO2\s*(が)?\s*0",
-            "SpO2 0% は測定不能やプローブ外れの可能性が高く、物語上も説明が必要です。",
-            "「測定不能」「プローブ外れの可能性」など状況説明を添えてください。",
-        ),
-    ]
-    for pat, issue, suggestion in patterns_medical:
-        m = re.search(pat, script)
-        if m:
-            medical.append(
-                {
-                    "original": m.group(0),
-                    "issue": issue,
-                    "suggestion": suggestion,
-                }
-            )
-
-    patterns_awkward = [
-        (
-            r"オペ(を)?しよう|オペる",
-            "現場では「オペ」単体より手技名・適応を言うことが多いです。",
-            "「緊急開腹術を開始する」「気管内挿管する」など具体的に。",
-        ),
-        (
-            r"点滴(を)?打(つ|って)",
-            "医療者は「点滴を入れる／開始する」と言うことが多いです。",
-            "「末梢ルートを確保して補液を開始」などに。",
-        ),
-        (
-            r"心臓マッサージ",
-            "現在は「胸骨圧迫」が標準的な言い方です。",
-            "「胸骨圧迫を開始」に言い換えると医師の耳に自然です。",
-        ),
-    ]
-    for pat, issue, suggestion in patterns_awkward:
-        m = re.search(pat, script)
-        if m:
-            awkward.append(
-                {
-                    "original": m.group(0),
-                    "issue": issue,
-                    "suggestion": suggestion,
-                }
-            )
-
-    if len(script) < 200:
-        immersion.append(
-            {
-                "original": script[:80] + ("…" if len(script) > 80 else ""),
-                "issue": "短いため、現場の音・時間経過・バイタルの変化が弱い可能性があります。",
-                "suggestion": "モニター音、時刻、SpO2/血圧の推移、スタッフの短い掛け声を1〜2文足す。",
-            }
-        )
-    if "…" not in script and "……" not in script and "——" not in script:
-        immersion.append(
-            {
-                "original": "（全体）",
-                "issue": "間（ま）や沈黙の描写が少なく、緊張感が平坦になりがちです。",
-                "suggestion": "重要な決断の直前に短い沈黙やモニター音だけの一瞬を入れてください。",
-            }
-        )
-    if not re.search(r"(血圧|SpO2|心拍数|脈拍|呼吸数)", script):
-        immersion.append(
-            {
-                "original": "（バイタル表記なし）",
-                "issue": "数値がないと救急シーンの臨場感が落ちます。",
-                "suggestion": "「血圧 82/40、脈 130、SpO2 88%」など具体値を1か所入れてください。",
-            }
-        )
-
-    if not medical and not awkward and not immersion:
-        immersion.append(
-            {
-                "original": "（全体）",
-                "issue": "自動チェックでは大きな問題は見つかりませんでした（簡易モード）。",
-                "suggestion": "APIキーを設定すると、Claudeによる本格レビューに切り替えられます。",
-            }
-        )
-
-    return normalize_review(
-        {
-            "medical_contradictions": medical,
-            "awkward_for_doctors": awkward,
-            "immersion_improvements": immersion,
-            # 辞書ルビの自動付与はOFF
-            "ruby_annotations": [],
-            "mode": "heuristic",
-        }
-    )
-
-
-def normalize_review(data: dict[str, Any]) -> dict[str, Any]:
-    def _items(key: str) -> list[dict[str, str]]:
-        raw = data.get(key, []) or []
-        out: list[dict[str, str]] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            original = str(item.get("original", "")).strip()
-            raw_suggestion = str(item.get("suggestion", "")).strip()
-            cleaned = clean_script_replacement_text(raw_suggestion, original)
-            normalized = {
-                "original": original,
-                "issue": str(item.get("issue", "")).strip(),
-                # 解説付き修正案は本文だけ残す（反映ミス防止）
-                "suggestion": cleaned or raw_suggestion,
-                "suggestion_raw": raw_suggestion,
-            }
-            # カタカナ医学用語の表記指摘は採用しない
-            if is_katakana_notation_complaint(normalized):
-                continue
-            out.append(normalized)
-        return out
-
-    ruby_out: list[dict[str, str]] = []
-    seen_surface: set[str] = set()
-    for item in data.get("ruby_annotations", []) or []:
-        if not isinstance(item, dict):
-            continue
-        surface = str(item.get("surface", "")).strip()
-        reading = normalize_voicevox_reading(str(item.get("reading", "")))
-        if not surface or not reading or surface in seen_surface:
-            continue
-        seen_surface.add(surface)
-        ruby_out.append({"surface": surface, "reading": reading})
-
-    return {
-        "medical_contradictions": _items("medical_contradictions"),
-        "awkward_for_doctors": _items("awkward_for_doctors"),
-        "immersion_improvements": _items("immersion_improvements"),
-        "ruby_annotations": ruby_out,
-        "mode": data.get("mode", "claude"),
-    }
-
-
-def run_script_review(script: str) -> dict[str, Any]:
-    api_key = get_api_key()
-    review_text = script
-    truncated = False
-    if len(script) > REVIEW_SCRIPT_MAX_CHARS:
-        review_text = (
-            script[:REVIEW_SCRIPT_MAX_CHARS]
-            + "\n\n…（以下省略。レビューは先頭部分のみ）"
-        )
-        truncated = True
-    if api_key:
-        result = review_with_claude(review_text, api_key)
-    else:
-        result = heuristic_review(review_text)
-    result["review_truncated"] = truncated
-
-    # 台本へルビを埋め込む工程は使わない（読みは VOICEVOX ユーザー辞書へ渡す）
-    result["ruby_annotations"] = []
-    result["script_with_ruby"] = script
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2710,20 +1795,6 @@ def strip_square_bracket_segments(text: str) -> str:
     out = re.sub(r" *\n *", "\n", out)
     return out.strip()
 
-
-def expand_voicevox_ruby_to_reading(text: str) -> str:
-    """
-    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ などを外し、
-    読み上げ用に「よみ」だけ残す（半角/全角の区切りは区別しない）。
-    """
-    text = canonicalize_voicevox_ruby_delimiters(text or "")
-    if not text:
-        return ""
-    return re.sub(
-        r"\{[^|\n]+\|([^}\n]+)\}",
-        r"\1",
-        text,
-    )
 
 
 # 1画面に出す字幕の最大行数（これを超える文は時間でページ分割する）
@@ -4128,242 +3199,13 @@ def build_mp4(
     return output_mp4
 
 
-# ---------------------------------------------------------------------------
-# UI ヘルパー（レビュー採否）
-# ---------------------------------------------------------------------------
-REVIEW_SECTION_DEFS = [
-    ("medical_contradictions", "(1) 医学的に矛盾している箇所"),
-    ("awkward_for_doctors", "(2) 現役の医師が聞くと違和感がある表現"),
-    ("immersion_improvements", "(3) 修正すると臨場感が増す箇所"),
-]
-
-CHOICE_ACCEPT = "accept"
-CHOICE_REJECT = "reject"
-CHOICE_REVISE = "revise"
-CHOICE_LABELS = {
-    CHOICE_ACCEPT: "①承諾",
-    CHOICE_REJECT: "②却下",
-    CHOICE_REVISE: "③別案",
-}
-
-
-def decision_widget_key(section_key: str, index: int) -> str:
-    return f"review_choice__{section_key}__{index}"
-
-
-def alt_widget_key(section_key: str, index: int) -> str:
-    return f"review_alt__{section_key}__{index}"
-
-
-def clear_review_decision_widgets(review: dict[str, Any] | None) -> None:
-    """新しいレビュー結果に合わせて、古い採否ウィジェット状態を消す。"""
-    if not review:
-        return
-    for section_key, _ in REVIEW_SECTION_DEFS:
-        items = review.get(section_key, []) or []
-        for i in range(len(items)):
-            for k in (decision_widget_key(section_key, i), alt_widget_key(section_key, i)):
-                if k in st.session_state:
-                    del st.session_state[k]
-
-
-def render_review_section_interactive(
-    section_key: str, title: str, items: list[dict[str, str]]
-) -> None:
-    """各指摘に 承諾／却下／別案 を選べるUI。"""
-    st.subheader(title)
-    if not items:
-        st.caption("該当なし")
-        return
-
-    for i, item in enumerate(items):
-        label = item.get("original") or "（箇所）"
-        with st.expander(f"{i + 1}. {label}", expanded=(i == 0)):
-            st.caption(item.get("issue") or "（なし）")
-            st.caption(item.get("suggestion") or "（なし）")
-
-            choice_key = decision_widget_key(section_key, i)
-            if choice_key not in st.session_state:
-                st.session_state[choice_key] = CHOICE_REJECT
-
-            st.radio(
-                "対応",
-                options=[CHOICE_ACCEPT, CHOICE_REJECT, CHOICE_REVISE],
-                format_func=lambda x: CHOICE_LABELS.get(x, x),
-                key=choice_key,
-                horizontal=True,
-                label_visibility="collapsed",
-            )
-
-            if st.session_state.get(choice_key) == CHOICE_ACCEPT:
-                preview = clean_script_replacement_text(
-                    item.get("suggestion") or "", item.get("original") or ""
-                )
-                if preview:
-                    st.caption(f"反映文: {preview}")
-                else:
-                    st.warning("自動反映不可。「別案」で本文を書いてください。")
-
-            if st.session_state.get(choice_key) == CHOICE_REVISE:
-                alt_key = alt_widget_key(section_key, i)
-                if alt_key not in st.session_state:
-                    st.session_state[alt_key] = item.get("suggestion") or ""
-                st.text_area(
-                    "別案",
-                    key=alt_key,
-                    height=80,
-                )
-
-
-def clean_script_replacement_text(suggestion: str, original: str = "") -> str:
-    """
-    レビュー修正案から、台本へ入れる本文だけを取り出す。
-    「編集メモを削除する」「確定文にして」などの解説・手順は捨てる。
-    """
-    text = (suggestion or "").strip()
-    if not text:
-        return ""
-
-    # 「」『』内の本文を優先（解説付き提案でよく使われる）
-    quoted = re.findall(r"[「『]([^」』]+)[」』]", text)
-    quoted = [q.strip() for q in quoted if q.strip()]
-    meta_hint = re.compile(
-        r"(編集メモ|編集注|編集コメント|確定文|地の文|削除する|してください|採用し)"
-    )
-    usable_quotes = [q for q in quoted if not meta_hint.search(q)]
-    if usable_quotes:
-        text = max(usable_quotes, key=len)
-
-    # 末尾〜文中の作業指示を除去
-    strip_patterns = [
-        r"[、,]?\s*と確定文にして編集メモを削除する。?",
-        r"[、,]?\s*と確定文に書き直し[、,]?編集メモを削除する。?",
-        r"[、,]?\s*と確定文に書き直す。?",
-        r"[、,]?\s*と確定文にして。?",
-        r"[、,]?\s*のみを地の文として採用し[、,]?編集注を削除する。?",
-        r"[、,]?\s*を地の文として採用し[、,]?編集注を削除する。?",
-        r"[、,]?\s*地の文として採用し[、,]?編集注を削除する。?",
-        r"編集メモを削除する。?",
-        r"編集注を削除する。?",
-        r"編集コメントを削除する。?",
-        r"[。．]?[、,]?\s*編集(?:メモ|注|コメント).*$",
-        r"[。．]?[、,]?\s*確定文に.*$",
-        r"[。．]?[、,]?\s*地の文として.*$",
-        r"に修正してください。?",
-        r"に言い換えてください。?",
-        r"に直してください。?",
-        r"を推奨します。?",
-        r"が自然です。?",
-        r"がよいです。?",
-        r"など具体的に。?",
-        r"など具体値を1か所入れてください。?",
-        r"してください。?",
-    ]
-    for pat in strip_patterns:
-        text = re.sub(pat, "", text)
-
-    text = text.strip(" 　\n\r\t「」『』\"'、,")
-
-    # まだ作業指示だけの文章なら空にする（自動反映しない）
-    if re.search(
-        r"(編集メモ|編集注|確定文|地の文として|削除する|してください|手修正)",
-        text,
-    ):
-        # 引用抽出に失敗し、指示文が残っている
-        if original and original in text and len(text) > len(original) + 10:
-            # 原文の後に指示が続く場合は原文側だけ残さない（危険なので空）
-            return ""
-        if not usable_quotes:
-            return ""
-
-    return text.strip()
-
-
-def apply_review_decisions_to_script(
-    script: str, review: dict[str, Any]
-) -> tuple[str, list[str], list[str]]:
-    """
-    採択／別案を台本に反映する。
-    戻り値: (新しい台本, 反映できた一覧, 手動編集が必要な一覧)
-    """
-    text = script
-    applied: list[str] = []
-    manual: list[str] = []
-
-    jobs: list[tuple[int, str, str, str]] = []
-    for section_key, section_title in REVIEW_SECTION_DEFS:
-        items = review.get(section_key, []) or []
-        for i, item in enumerate(items):
-            choice = st.session_state.get(
-                decision_widget_key(section_key, i), CHOICE_REJECT
-            )
-            if choice == CHOICE_REJECT:
-                continue
-
-            original = (item.get("original") or "").strip()
-            suggestion = (item.get("suggestion") or "").strip()
-            if choice == CHOICE_ACCEPT:
-                replacement = clean_script_replacement_text(suggestion, original)
-            else:
-                raw_alt = (
-                    st.session_state.get(alt_widget_key(section_key, i), suggestion)
-                    or ""
-                ).strip()
-                # 別案も解説文が混ざっていたら除去（ユーザーが書いた文はできるだけ残す）
-                replacement = clean_script_replacement_text(raw_alt, original)
-                if not replacement and raw_alt and not re.search(
-                    r"(編集メモ|編集注|確定文|地の文として採用)", raw_alt
-                ):
-                    replacement = raw_alt
-
-            label = f"{section_title} #{i + 1}"
-            if not original or not replacement:
-                manual.append(
-                    f"{label}: 差し替え本文を取り出せませんでした"
-                    f"（修正案に解説だけがある可能性があります。手修正してください）\n"
-                    f"→ 元の修正案: {suggestion}"
-                )
-                continue
-            if original in ("（全体）", "（バイタル表記なし）", "（箇所）"):
-                manual.append(
-                    f"{label}: 全体向けの指摘のため自動反映できません"
-                    f"（別案/修正案を手で入れてください）\n→ {replacement}"
-                )
-                continue
-            pos = text.find(original)
-            if pos < 0:
-                manual.append(
-                    f"{label}: 台本内に『{original}』が見つかりません"
-                    f"（手修正してください）\n→ {replacement}"
-                )
-                continue
-            jobs.append((pos, original, replacement, label))
-
-    jobs.sort(key=lambda x: x[0], reverse=True)
-    for pos, original, replacement, label in jobs:
-        if text[pos : pos + len(original)] != original:
-            pos2 = text.find(original)
-            if pos2 < 0:
-                manual.append(f"{label}: 反映中に原文が見つからなくなりました")
-                continue
-            pos = pos2
-        text = text[:pos] + replacement + text[pos + len(original) :]
-        applied.append(f"{label}: 『{original}』→『{replacement}』")
-
-    return text, applied, manual
-
-
 def init_state() -> None:
     defaults = {
         "raw_script": "",
-        "review": None,
         "final_script": "",
-        "review_done": False,
         "script_confirmed": False,
         "ruby_ready": False,
         "ruby_script": "",
-        "ruby_skipped": False,
-        "skip_review": False,
         "mp4_bytes": None,
         "mp4_path": "",
         "mp4_name": "medical_drama.mp4",
@@ -4373,7 +3215,6 @@ def init_state() -> None:
         "title_decision": "",
         "export_progress_pct": 0,
         "export_progress_msg": "",
-        "ruby_script_baseline": "",
         "ending_credits_text": "",
         "reference_text": "",
         "last_script_path": "",
@@ -4385,11 +3226,7 @@ def init_state() -> None:
         "_upload_gen": 0,  # ファイル選択欄の世代（再取り込み衝突防止）
         "last_plain_script_txt": "",
         "last_plain_script_docx": "",
-        "last_ruby_script_txt": "",
-        "last_ruby_script_docx": "",
         "_export_job": None,
-        "review_apply_log": [],
-        "review_manual_log": [],
         "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
         "vvox_style_name": DEFAULT_STYLE_NAME,
         "vvox_style_id": DEFAULT_SPEAKER_ID,
@@ -4466,7 +3303,7 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
     )
     _pct(2, "台本を準備中…")
-    # 台本は平文のまま（読みは VOICEVOX ユーザー辞書へ渡す）
+    # 台本は平文のまま音声化する
     voice_script = strip_voicevox_ruby(
         str(st.session_state.get("ruby_script") or st.session_state.get("final_script") or "")
     ).strip()
@@ -4474,12 +3311,6 @@ def run_video_export(progress, pct_box, status) -> None:
         raise RuntimeError("台本が空です。先に台本を確定してください。")
 
     save_reference_text(st.session_state.get("reference_text", ""))
-
-    _pct(3, "読み方辞書を VOICEVOX へ読み込み中…")
-    # 画面のルビ準備は凍結中。標準辞書だけを毎回読み込む
-    dict_pairs = get_active_ruby_dictionary()
-    dict_info = push_ruby_dict_to_voicevox(dict_pairs)
-    st.session_state.last_voicevox_dict_import = dict_info
 
     video_title = str(st.session_state.get("video_title") or "").strip()
     script_docx_name = make_script_docx_filename(video_title)
@@ -4499,10 +3330,9 @@ def run_video_export(progress, pct_box, status) -> None:
 
     with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
         tmp_path = Path(tmp)
-        dict_msg = f"辞書{dict_info.get('imported', 0)}語"
         _pct(
             5,
-            f"音声生成中（{speaker_name} / {style_name}・{dict_msg}・"
+            f"音声生成中（{speaker_name} / {style_name}・"
             f"{speed_scale:.1f}倍）…",
         )
         wav_path = tmp_path / "narration.wav"
@@ -4628,10 +3458,9 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.last_video_export_mode = (
             "final" if include_background else "draft"
         )
-        # 辞書の自動アップデートは行わない（手動アップロード方式）
+        # 辞書の自動アップデートは行わない
         mode_label = "最終版（背景あり）" if include_background else "ドラフト（背景なし）"
-        dict_n = int((st.session_state.get("last_voicevox_dict_import") or {}).get("imported") or 0)
-        _pct(100, f"完了・{mode_label}（VOICEVOX辞書 {dict_n} 語）")
+        _pct(100, f"完了・{mode_label}")
         status.success(f"完了（{mode_label}）: {desktop_path}")
         # 完成を耳で知らせる（ポーン）
         play_done_chime()
@@ -4977,7 +3806,7 @@ def main() -> None:
     ):
         render_video_title_input()
 
-    # ----- Step 2: 台本を確定（アプリ内レビュー工程は置かない） -----
+    # ----- Step 2: 台本を確定 -----
     if st.session_state.raw_script and not st.session_state.script_confirmed:
         st.write("2. 台本を確定")
         n_chars = len(st.session_state.raw_script)
@@ -5024,7 +3853,7 @@ def main() -> None:
                     advance_plain=True,
                 )
 
-    # ----- Step 3: 動画作成（読み方辞書の画面操作は凍結） -----
+    # ----- Step 3: 動画作成 -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
         render_video_title_input()
@@ -5270,7 +4099,6 @@ def main() -> None:
             # 次の描画で作業専用画面にし、他ボタンを出さない
             st.session_state.video_encoding = True
             st.session_state._export_job = "pending"
-            st.session_state.ruby_dict_post_video_updates = []
             st.session_state.export_progress_pct = 0
             st.session_state.export_progress_msg = ""
             st.rerun()
@@ -5288,10 +4116,8 @@ def main() -> None:
                 if last_mode == "final"
                 else "ドラフト（背景なし）"
             )
-            dict_info = st.session_state.get("last_voicevox_dict_import") or {}
-            dict_n = int(dict_info.get("imported") or 0)
             st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
-            st.caption(f"今回の動画: {mode_kind}／VOICEVOX辞書 {dict_n} 語")
+            st.caption(f"今回の動画: {mode_kind}")
             # 大きいMP4を毎回ディスクから読むと落ちやすい → 1回だけメモリに載せる
             if size_mb < 180:
                 mp4_stat = Path(mp4_path).stat()
@@ -5374,7 +4200,6 @@ def main() -> None:
                     st.session_state.video_export_mode = "draft"
                     st.session_state.video_encoding = True
                     st.session_state._export_job = "pending"
-                    st.session_state.ruby_dict_post_video_updates = []
                     st.session_state.export_progress_pct = 0
                     st.session_state.export_progress_msg = ""
                     st.rerun()
@@ -5388,7 +4213,6 @@ def main() -> None:
                     st.session_state.video_export_mode = "final"
                     st.session_state.video_encoding = True
                     st.session_state._export_job = "pending"
-                    st.session_state.ruby_dict_post_video_updates = []
                     st.session_state.export_progress_pct = 0
                     st.session_state.export_progress_msg = ""
                     st.rerun()
