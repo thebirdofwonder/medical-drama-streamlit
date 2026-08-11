@@ -292,12 +292,12 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260810f"
-# 入力欄キー（旧名 final_script_editor_widget は衝突しやすいので使わない）
-EDITOR_BASE_RAW = "raw_script_box"
-EDITOR_BASE_FINAL = "final_script_box"
-EDITOR_BASE_RUBY = "ruby_script_box"
-# 旧版・世代つき入力欄の衝突対策で消す対象
+APP_BUILD = "ui-slim-20260811a"
+# 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
+EDITOR_BASE_RAW = "ta_src_a"
+EDITOR_BASE_FINAL = "ta_src_b"
+EDITOR_BASE_RUBY = "ta_src_c"
+# 旧版・世代つき入力欄の衝突対策で消す対象（いまのキー名も含む）
 _EDITOR_KEY_MARKERS = (
     "final_script_editor_widget",
     "raw_script_editor_widget",
@@ -305,7 +305,18 @@ _EDITOR_KEY_MARKERS = (
     "final_script_box",
     "raw_script_box",
     "ruby_script_box",
-    "final_script_editor",  # 旧・非ウィジェット名の名残
+    "final_script_editor",
+    "ta_src_a",
+    "ta_src_b",
+    "ta_src_c",
+)
+# 台本の再取り込み時も残す設定（声優など）
+_PRESERVE_ON_SCRIPT_RELOAD = (
+    "vvox_speaker_name",
+    "vvox_style_name",
+    "vvox_style_id",
+    "vvox_speed_scale",
+    "reference_text",
 )
 
 
@@ -492,17 +503,61 @@ def hard_clear_all_editor_keys() -> None:
 def is_widget_state_conflict_error(exc: BaseException) -> bool:
     """Streamlit の入力欄キー衝突エラーなら True。"""
     msg = str(exc)
+    name = type(exc).__name__
+    if "StreamlitAPIException" in name and (
+        "cannot be modified" in msg or "session_state" in msg
+    ):
+        return True
     return (
         "cannot be modified after the widget" in msg
         or "final_script_editor_widget" in msg
         or "raw_script_editor_widget" in msg
         or "final_script_box" in msg
         or "raw_script_box" in msg
+        or "ta_src_a" in msg
+        or "ta_src_b" in msg
     )
 
 
+def upload_gen() -> int:
+    """ファイル選択欄の世代（取り込みのたびに進めて古い選択を残さない）。"""
+    return int(st.session_state.get("_upload_gen") or 0)
+
+
+def bump_upload_gen() -> int:
+    """ファイル選択欄の世代を1つ進める。"""
+    n = upload_gen() + 1
+    st.session_state["_upload_gen"] = n
+    return n
+
+
+def nuclear_reset_session_for_script_import() -> None:
+    """
+    台本取り込みの直前に、画面の記憶をほぼ全部消す。
+    （1本目のMP4のあと、2本目の台本で必ず衝突していた問題の根本対策）
+    """
+    preserved: dict[str, Any] = {}
+    for key in _PRESERVE_ON_SCRIPT_RELOAD:
+        if key in st.session_state:
+            preserved[key] = st.session_state[key]
+    retries = st.session_state.get("_script_import_retries")
+    upload_n = upload_gen()
+
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+
+    init_state()
+    for key, value in preserved.items():
+        st.session_state[key] = value
+    if retries is not None:
+        st.session_state["_script_import_retries"] = retries
+    # 新しい入力欄・ファイル選択欄として始める
+    st.session_state["_editor_rev"] = max(1, int(st.session_state.get("_editor_rev") or 0) + 1)
+    st.session_state["_upload_gen"] = upload_n + 1
+
+
 def editor_widget_key(base: str) -> str:
-    """世代つきの入力欄キー。例: final_script_box_v3"""
+    """世代つきの入力欄キー。例: ta_src_a_v3"""
     return f"{base}_v{editor_rev()}"
 
 
@@ -548,17 +603,21 @@ def run_deferred_script_actions() -> None:
     """
     ボタン押下と同じ描画内でウィジェットを触ると衝突するため、
     次の描画の最初（入力欄を作る前）で原稿取り込みを実行する。
+    2本目以降も必ずセッションをやり直してから取り込む。
     """
     payload = st.session_state.pop("_deferred_reload_script", None)
     if not payload or not isinstance(payload, dict):
         return
-    # 取り込み直前にもう一度古いキーを消す（衝突防止）
-    purge_legacy_editor_keys()
+
     script = normalize_script_keeping_ruby(str(payload.get("text") or ""))
     source_id = str(payload.get("source_id") or f"deferred-{len(script)}")
     if not script:
         st.session_state["_script_import_notice"] = "原稿が空でした。"
         return
+
+    # 根本対策: 取り込み前に画面状態をほぼ全部消す（1本目MP4後の衝突を防ぐ）
+    nuclear_reset_session_for_script_import()
+
     try:
         commit_loaded_script(script, source_id)
         citation = payload.get("citation")
@@ -587,17 +646,17 @@ def run_deferred_script_actions() -> None:
         st.session_state.pop("_script_import_retries", None)
     except Exception as e:  # noqa: BLE001
         if is_widget_state_conflict_error(e):
-            hard_clear_all_editor_keys()
             retries = int(st.session_state.get("_script_import_retries") or 0)
-            if retries < 1:
-                # 1回だけ自動で取り込み直す（画面を触らなくてよい）
+            nuclear_reset_session_for_script_import()
+            if retries < 2:
                 st.session_state["_script_import_retries"] = retries + 1
                 st.session_state["_deferred_reload_script"] = payload
                 st.rerun()
             st.session_state.pop("_script_import_retries", None)
             st.session_state["_script_import_notice"] = (
-                "原稿の取り込みに失敗しました（古い入力欄の残り）。"
-                "左の「画面をリセット」を押してから、もう一度取り込んでください。"
+                "原稿の取り込みに失敗しました（画面の古い記憶が残っていました）。"
+                "左の「画面をリセット」を押すか、"
+                "http://localhost:8501/?reset=1 を開き直してから、もう一度取り込んでください。"
             )
         else:
             st.session_state.pop("_script_import_retries", None)
@@ -611,9 +670,8 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     読み込んだ台本をセッションに入れ、以降の工程を最初からにする。
     すでに付いているルビ ｛用語｜よみ｝ は削除しない。
     """
-    clear_review_decision_widgets(st.session_state.get("review"))
     script = normalize_script_keeping_ruby(text)
-    # 先に入力欄キーを世代更新し、旧キーへ書き込まない
+    # 入力欄は新しい世代キーだけを使う（旧キーへは一切書かない）
     bump_editor_rev()
     st.session_state.raw_script = script
     st.session_state.final_script = script
@@ -627,12 +685,24 @@ def commit_loaded_script(text: str, source_id: str) -> None:
     st.session_state.ruby_skipped = False
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
+    st.session_state.mp4_name = "medical_drama.mp4"
+    st.session_state.last_video_export_mode = None
+    st.session_state.video_encoding = False
+    st.session_state._export_job = None
     st.session_state.pop("_mp4_cache_key", None)
     st.session_state.pop("_mp4_cache_bytes", None)
     st.session_state.review_apply_log = []
     st.session_state.review_manual_log = []
     st.session_state._script_file_id = source_id
     st.session_state._ruby_loop_file_id = None
+    # 旧キーが残っていても触らず捨てる
+    for bad in (
+        "final_script_editor_widget",
+        "raw_script_editor_widget",
+        "ruby_script_editor",
+        "final_script_editor",
+    ):
+        st.session_state.pop(bad, None)
 
 
 # ---------------------------------------------------------------------------
@@ -4312,6 +4382,7 @@ def init_state() -> None:
         "video_export_mode": "draft",  # draft=背景なし / final=背景あり
         "last_video_export_mode": None,  # 直近に完成した draft / final
         "_editor_rev": 0,  # 台本入力欄の世代（衝突防止）
+        "_upload_gen": 0,  # ファイル選択欄の世代（再取り込み衝突防止）
         "last_plain_script_txt": "",
         "last_plain_script_docx": "",
         "last_ruby_script_txt": "",
@@ -4646,27 +4717,34 @@ def maybe_reset_session_from_query() -> None:
 
 def wipe_session_if_legacy_editor_widget() -> None:
     """
-    旧入力欄キー final_script_editor_widget が残っていたら、
-    セッションを一度消してやり直す（取り込み失敗の主因）。
+    旧入力欄キー final_script_editor_widget などが残っていたら、
+    セッションを消してやり直す（回数制限つき）。
     """
-    if st.session_state.get("_legacy_widget_wiped"):
-        return
     has_legacy = False
     for key in list(st.session_state.keys()):
         sk = str(key)
-        if sk == "final_script_editor_widget" or sk.startswith(
-            "final_script_editor_widget"
+        if (
+            sk == "final_script_editor_widget"
+            or sk.startswith("final_script_editor_widget")
+            or sk == "raw_script_editor_widget"
+            or sk.startswith("raw_script_editor_widget")
         ):
             has_legacy = True
             break
     if not has_legacy:
         return
+    wipe_n = int(st.session_state.get("_legacy_wipe_count") or 0)
+    if wipe_n >= 3:
+        return
     pending = st.session_state.get("_deferred_reload_script")
+    retries = st.session_state.get("_script_import_retries")
     for key in list(st.session_state.keys()):
         st.session_state.pop(key, None)
-    st.session_state["_legacy_widget_wiped"] = True
+    st.session_state["_legacy_wipe_count"] = wipe_n + 1
     if pending is not None:
         st.session_state["_deferred_reload_script"] = pending
+    if retries is not None:
+        st.session_state["_script_import_retries"] = retries
     st.rerun()
 
 
@@ -4813,7 +4891,7 @@ def main() -> None:
         paper_pdf = st.file_uploader(
             "医学論文PDF",
             type=["pdf"],
-            key="paper_pdf_upload",
+            key=f"paper_pdf_u{upload_gen()}",
         )
         if st.button(
             "PDFから台本を作成",
@@ -4861,7 +4939,7 @@ def main() -> None:
         script_upload = st.file_uploader(
             "台本ファイル（.docx / .pdf）",
             type=["docx", "pdf"],
-            key="ready_script_upload",
+            key=f"ready_script_u{upload_gen()}",
         )
         if st.button(
             "台本を取り込む",
@@ -5260,7 +5338,7 @@ def main() -> None:
             script_reupload = st.file_uploader(
                 "修正した台本（.txt / .docx）",
                 type=["txt", "docx"],
-                key="ruby_loop_script_upload",
+                key=f"reupload_script_u{upload_gen()}",
             )
             if script_reupload is not None:
                 file_id = f"{script_reupload.name}-{script_reupload.size}"
@@ -5320,11 +5398,11 @@ def main() -> None:
                 next_script = st.file_uploader(
                     "次の原稿（.txt / .docx）",
                     type=["txt", "docx"],
-                    key="next_loop_script_upload",
+                    key=f"next_script_u{upload_gen()}",
                 )
                 if st.button(
                     "この原稿で最初から作り直す",
-                    key="btn_next_video_loop",
+                    key=f"btn_next_video_loop_u{upload_gen()}",
                 ):
                     if next_script is None:
                         st.error("原稿ファイル（.txt または .docx）を選んでください。")
@@ -5344,9 +5422,9 @@ def main() -> None:
                                 )
                         except Exception as e:  # noqa: BLE001
                             if is_widget_state_conflict_error(e):
-                                hard_clear_all_editor_keys()
+                                nuclear_reset_session_for_script_import()
                                 st.error(
-                                    "原稿の取り込みに失敗しました（古い入力欄の残り）。"
+                                    "原稿の取り込みに失敗しました（画面の古い記憶が残っていました）。"
                                     "左の「画面をリセット」を押すか、"
                                     "アドレスを http://localhost:8501/?reset=1 にして開き直してください。"
                                 )
