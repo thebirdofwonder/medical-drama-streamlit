@@ -1,5 +1,5 @@
 """
-医学論文PDFまたは台本 → 台本確定 → VOICEVOX音声 → 静止画背景 → MP4 生成
+台本取り込み → 台本確定 → VOICEVOX音声 → 静止画背景 → MP4 生成
 Streamlit アプリ（macOS / Apple Silicon 向け）
 """
 
@@ -109,74 +109,29 @@ def make_script_docx_filename(title: str = "") -> str:
     return f"{make_title_basename(title)}.docx"
 
 
-def make_desktop_script_basename(
-    title: str = "",
-    *,
-    kind: str = "plain",
-) -> str:
-    """デスクトップ保存用の台本ファイル名（拡張子なし）。kind: plain / ruby"""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    label = "plain" if kind == "plain" else "ruby"
-    return f"{make_title_basename(title)}_{label}_{stamp}"
-
-
-def save_script_to_desktop(
-    text: str,
-    title: str = "",
-    *,
-    kind: str = "plain",
-) -> tuple[Path, Path]:
+def advance_to_video_with_script(edited: str) -> None:
     """
-    台本をデスクトップへ .txt と .docx で保存する。
-    kind=plain … ルビなし確認用 / kind=ruby … ルビあり修正稿
-    戻り値: (txtパス, docxパス)
+    台本確定 → 動画作成へ進める。
+    ルビも 〈〉 背景ヒントも削除・追加しない。デスクトップへ台本は保存しない。
     """
-    body = (text or "").strip()
-    if not body:
-        raise ValueError("保存する台本が空です。")
-    desktop = get_desktop_dir()
-    base = make_desktop_script_basename(title, kind=kind)
-    txt_path = desktop / f"{base}.txt"
-    docx_path = desktop / f"{base}.docx"
-    txt_path.write_text(body + "\n", encoding="utf-8")
-    docx_path.write_bytes(text_to_docx_bytes(body))
-    return txt_path, docx_path
-
-
-def prepare_plain_script_for_video(edited: str) -> str:
-    """
-    最初の確認用: ルビを外した平文台本にする。
-    （読み・抑揚の確認は、このあとルビあり台本で繰り返す）
-    """
-    plain = strip_voicevox_ruby(edited or "").strip()
-    return plain
-
-
-def advance_to_video_with_plain_script(edited: str) -> tuple[Path, Path]:
-    """
-    台本確定 → ルビなしのまま動画作成へ進める。
-    デスクトップにルビなし台本を保存し、パスを返す。
-    """
-    plain = prepare_plain_script_for_video(edited)
-    if not plain:
+    script = normalize_script_keeping_ruby(edited or "").strip()
+    if not script:
         raise ValueError("最終台本が空です。")
-    title = str(st.session_state.get("video_title") or "").strip()
-    txt_path, docx_path = save_script_to_desktop(plain, title, kind="plain")
-    st.session_state.final_script = plain
-    st.session_state.raw_script = plain
+    st.session_state.final_script = script
+    st.session_state.raw_script = script
     st.session_state.script_confirmed = True
-    st.session_state.ruby_script = plain
+    st.session_state.ruby_script = script
     st.session_state.ruby_ready = True
     st.session_state.video_export_mode = "draft"
-    st.session_state.last_plain_script_txt = str(txt_path)
-    st.session_state.last_plain_script_docx = str(docx_path)
+    st.session_state.last_plain_script_txt = ""
+    st.session_state.last_plain_script_docx = ""
     # 新しい確認サイクルなので、前回の完成動画は消す
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
     st.session_state.last_video_export_mode = None
     # 入力欄は世代更新して、final_script / raw_script から作り直す
     bump_editor_rev()
-    return txt_path, docx_path
+
 
 def load_saved_reference_text() -> str:
     """前回保存した参考文献を読み込む。"""
@@ -266,22 +221,8 @@ MAX_VOICEVOX_CHARS = 90
 # 字幕切替の時間精度（低いと最大で約 1/fps 秒ずれる）
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
-# Anthropic の現行モデル（旧 claude-sonnet-4-20250514 は引退済み）
-CLAUDE_MODEL_CANDIDATES = [
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-    "claude-sonnet-4-5",
-    "claude-haiku-4-5",
-]
-# 論文PDF→台本化：論文本文の送付上限・VOICEVOX 1倍速 10〜12分目安
-PAPER_TEXT_MAX_CHARS = 100000
-# Claude 1回あたりの待ち上限（秒）。長すぎると画面が止まったように見える
-CLAUDE_HTTP_TIMEOUT_SEC = 120
-# 日本語ナレーション目安 約300〜330字/分 × 10〜12分（VOICEVOX 1.0倍速）
-DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
-DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812e"
+APP_BUILD = "ui-slim-20260812g"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -615,15 +556,13 @@ def run_deferred_script_actions() -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUTPUT_DIR / "last_script.txt").write_text(script, encoding="utf-8")
         if payload.get("advance_plain"):
-            txt_path, docx_path = advance_to_video_with_plain_script(script)
+            advance_to_video_with_script(script)
             (OUTPUT_DIR / "last_script.txt").write_text(
                 st.session_state.final_script,
                 encoding="utf-8",
             )
             st.session_state["_script_import_notice"] = payload.get("notice") or (
-                "新しい原稿を取り込み、動画作成の準備をしました。\n"
-                f"- `{txt_path.name}`\n"
-                f"- `{docx_path.name}`"
+                "新しい原稿を取り込み、動画作成の準備をしました。"
             )
         else:
             st.session_state["_script_import_notice"] = payload.get("notice") or (
@@ -695,96 +634,8 @@ def commit_loaded_script(text: str, source_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# APIキー / Claude（台本作成用）
+# VOICEVOX ルビ（台本の既存ルビは削除・追加しない。字幕表示時のみ表記を使う）
 # ---------------------------------------------------------------------------
-ENV_FILE = Path(__file__).resolve().parent / ".env"
-
-
-def load_dotenv_file(path: Path | None = None) -> None:
-    """
-    .env から KEY=VALUE を読み、未設定の環境変数だけ入れる。
-    （GitHub には上げないローカル専用ファイル）
-    """
-    env_path = path or ENV_FILE
-    if not env_path.is_file():
-        return
-    try:
-        raw = env_path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip().strip('"').strip("'")
-        if not key:
-            continue
-        # すでにターミナル等で設定済みなら上書きしない
-        if os.environ.get(key, "").strip():
-            continue
-        os.environ[key] = val
-
-
-def save_api_key_to_env_file(api_key: str, path: Path | None = None) -> Path:
-    """
-    APIキーを .env に保存（または更新）。他の行はそのまま残す。
-    """
-    env_path = path or ENV_FILE
-    key_name = "ANTHROPIC_API_KEY"
-    api_key = (api_key or "").strip()
-    if not api_key:
-        raise ValueError("保存する APIキーが空です。")
-
-    lines: list[str] = []
-    found = False
-    if env_path.is_file():
-        try:
-            old = env_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            old = []
-        for line in old:
-            stripped = line.strip()
-            if stripped.startswith("#") or "=" not in stripped:
-                lines.append(line)
-                continue
-            k, _, _ = stripped.partition("=")
-            if k.strip() == key_name:
-                lines.append(f"{key_name}={api_key}")
-                found = True
-            else:
-                lines.append(line)
-    if not found:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append(f"# Anthropic Claude API（このファイルは GitHub に上げません）")
-        lines.append(f"{key_name}={api_key}")
-
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    # すぐに使えるように環境変数にも入れる
-    os.environ[key_name] = api_key
-    return env_path
-
-
-def get_api_key() -> str:
-    """
-    APIキー取得の優先順位:
-    1. 環境変数 ANTHROPIC_API_KEY（.env 読込後含む）
-    2. Streamlit secrets（.streamlit/secrets.toml）
-    コードには直書きしない。
-    """
-    load_dotenv_file()
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        return str(st.secrets.get("ANTHROPIC_API_KEY", "") or "").strip()
-    except Exception:
-        return ""
-
-
-
 def normalize_voicevox_reading(reading: str) -> str:
     """ルビの読みから余計な記号を除く。"""
     reading = (reading or "").strip()
@@ -949,233 +800,6 @@ def http_session_direct() -> requests.Session:
 
 
 
-def build_drama_script_prompt(paper_text: str) -> str:
-    """医学論文テキストから YouTube 医学ドラマ台本を作る指示文。"""
-    paper = (paper_text or "").strip()
-    if len(paper) > PAPER_TEXT_MAX_CHARS:
-        paper = (
-            paper[:PAPER_TEXT_MAX_CHARS]
-            + "\n\n…（以下、長さ制限のため省略）"
-        )
-    return f"""あなたは医学教育向け YouTube 動画の台本作家かつ臨床医です。
-次の医学論文（または症例報告）の内容をもとに、ナレーション台本だけを書いてください。
-
-【必須条件】
-① VOICEVOX 1.0倍速で読み上げたとき約10〜12分に収まる YouTube 医学ドラマ台本にする（本文の文字数はおおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字を目安。これより長くしない）。
-② すべてナレーターが話し、ドラマが展開する。場面転換もナレーションで示す。
-③ 読み上げる台本本文以外は一切書かない。タイトル見出し、サブタイトル、シーン番号、「注釈」「解説」「制作メモ」、私への説明、前置き、後書き、Markdown記法は禁止。
-④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
-⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。ただし台本本文で視聴者に呼びかけない。「研修医のみなさん」「みなさん」「皆さん」などへの呼びかける表現は禁止（難易度の目安と、台詞・ナレーションの相手は別）。
-⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。ただし単位は原文の表記をそのまま使う（例: mg/dL, mEq/L, g/dL, IU/L）。単位を日本語訳や別表記に変えない。数字と単位のあいだにスペースを入れない（正しい例: 120mg/dL、3.5mEq/L／禁止例: 120 mg/dL、3.5 mEq/L）。
-⑦ 薬物名はアルファベットでもカタカナでもよい（例: vancomycin / バンコマイシン）。漢字訳にはしない。
-⑧ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
-⑨ 登場人物のセリフには必ずカギ括弧「」を付ける。
-⑩ 必ずしも一文ごとに改行しない。1画面の字幕に収まる長さなら、複数文を改行せずにつなげてよい。
-⑪ 次の画面（改ページ／改行）へ移るときは、原則として句読点（。、！？ など）の直後で切る。単語の途中（漢字熟語の途中、英単語や単位・薬物名の途中）では切らない。
-⑫ 鑑別診断の診断名を列挙するときは、診断名どうしを読点「、」だけで区切る。句点「。」では区切らない（禁止例: 心筋梗塞。心不全。肺炎。／正しい例: 心筋梗塞、心不全、肺炎。）。臓器名などの列挙も同様に読点でつなぎ、途中で改行しない。列挙全体の文末だけ句点で閉じる。例：胃、小腸、大腸、肝臓、胆嚢、骨盤内。
-⑬ この段階ではルビ（｛用語｜よみ｝）を付けない。漢字のまま書く（ルビは後工程で辞書から付与する）。ただし、入力側にすでにルビがある場合は消さない（この工程では新規には付けない）。
-⑭ 出力する前に、医師として医学的に違和感のある表現・論理の破綻を自分で直し、その最終稿だけを出す。
-
-【出力形式】
-- 台本本文のみ（プレーンテキスト）
-- 最初の行からナレーションを始める
-- コードブロックやJSONで囲まない
-
-【論文テキスト】
-{paper}
-"""
-
-
-def _claude_messages_text(
-    api_key: str,
-    prompt: str,
-    *,
-    max_tokens: int = 16000,
-    timeout_sec: int | None = None,
-) -> tuple[str, str]:
-    """Claude Messages API を呼び、返答テキストと使用モデル名を返す。"""
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    timeout = int(timeout_sec or CLAUDE_HTTP_TIMEOUT_SEC)
-    last_error = ""
-    for model in CLAUDE_MODEL_CANDIDATES:
-        body = {
-            "model": model,
-            "max_tokens": int(max_tokens),
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        try:
-            resp = http_session_direct().post(
-                url, headers=headers, json=body, timeout=timeout
-            )
-        except requests.exceptions.ProxyError as e:
-            raise RuntimeError(
-                "プロキシのせいで Claude に接続できませんでした。\n"
-                "ターミナルで proxy を解除してからアプリを再起動してください。\n"
-                f"詳細: {e}"
-            ) from e
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(
-                "Claude API への通信に失敗しました。\n"
-                f"詳細: {e}"
-            ) from e
-
-        if resp.status_code == 404 and "model" in resp.text.lower():
-            last_error = f"{model}: {resp.text[:200]}"
-            continue
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Claude API エラー (HTTP {resp.status_code}): {resp.text[:500]}"
-            )
-        data = resp.json()
-        parts = data.get("content", [])
-        text = "".join(
-            p.get("text", "") for p in parts if p.get("type") == "text"
-        ).strip()
-        if not text:
-            raise RuntimeError("Claude API から空の返答が返りました。")
-        return text, model
-
-    raise RuntimeError(
-        "利用できる Claude モデルが見つかりませんでした。\n"
-        f"試したモデル: {', '.join(CLAUDE_MODEL_CANDIDATES)}\n"
-        f"最後のエラー: {last_error}"
-    )
-
-
-def _strip_script_wrappers(text: str) -> str:
-    """台本以外の前置き・コード枠を取り除く。"""
-    text = strip_code_fence((text or "").strip())
-    # よくある前置き行を落とす
-    lines = text.replace("\r\n", "\n").split("\n")
-    drop_prefixes = (
-        "以下が",
-        "以下に",
-        "台本を作成",
-        "承知",
-        "了解",
-        "【台本】",
-        "■台本",
-        "# ",
-    )
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines:
-        first = lines[0].strip()
-        if any(first.startswith(p) for p in drop_prefixes) and len(first) < 80:
-            lines.pop(0)
-            while lines and not lines[0].strip():
-                lines.pop(0)
-            continue
-        break
-    return "\n".join(lines).strip()
-
-
-
-def generate_drama_script_from_paper(paper_text: str, api_key: str) -> str:
-    """
-    医学論文テキストから、VOICEVOX 1倍速で約10〜12分のナレーション台本を作る。
-    （安定化のため、医学校正の2回目APIは呼ばない）
-    """
-    paper = (paper_text or "").strip()
-    if not paper:
-        raise ValueError("論文テキストが空です。")
-    if not (api_key or "").strip():
-        raise RuntimeError(
-            "論文から台本を作るには ANTHROPIC_API_KEY（Claude用の鍵）が必要です。"
-            "画面上部でキーを入力・保存してください。"
-        )
-    # 安定化: 医学校正の2回目APIは行わない（待ち時間が倍になり画面が止まったように見える）
-    draft, model_used = _claude_messages_text(
-        api_key,
-        build_drama_script_prompt(paper),
-        max_tokens=16000,
-        timeout_sec=CLAUDE_HTTP_TIMEOUT_SEC,
-    )
-    draft = _strip_script_wrappers(draft)
-    if not draft:
-        raise RuntimeError("台本が空でした。もう一度お試しください。")
-    _ = model_used
-    return draft.strip()
-
-
-def _heuristic_vancouver_from_paper(paper_text: str) -> str:
-    """APIなし時の簡易抽出（DOIなどが見えるとき）。"""
-    text = (paper_text or "").replace("\r\n", "\n")
-    head = text[:8000]
-    doi = ""
-    m = re.search(
-        r"(?:doi[:\s]*|https?://doi\.org/)(10\.\d{4,9}/[-._;()/:A-Z0-9]+)",
-        head,
-        flags=re.I,
-    )
-    if m:
-        doi = m.group(1).rstrip(".")
-    # 先頭付近のそれらしいタイトル行
-    lines = [ln.strip() for ln in head.split("\n") if ln.strip()]
-    title = ""
-    for ln in lines[:40]:
-        if len(ln) < 20 or len(ln) > 300:
-            continue
-        if re.search(r"abstract|introduction|keywords|©|copyright", ln, re.I):
-            continue
-        if re.search(r"[A-Za-z]{4,}", ln):
-            title = ln
-            break
-    parts = []
-    if title:
-        parts.append(title.rstrip("."))
-    if doi:
-        parts.append(f"doi:{doi}")
-    if parts:
-        return ". ".join(parts) + ("." if not parts[-1].endswith(".") else "")
-    return ""
-
-
-def extract_vancouver_citation_from_paper(paper_text: str, api_key: str = "") -> str:
-    """
-    論文テキストから Vancouver 方式の参考文献1件を作る。
-    例: Author A, Author B. Title. Journal. Year;Vol(Issue):Pages. doi:...
-    """
-    paper = (paper_text or "").strip()
-    if not paper:
-        return ""
-    excerpt = paper[:PAPER_TEXT_MAX_CHARS]
-    if (api_key or "").strip():
-        prompt = f"""次の医学論文テキストから、エンディング画面用の参考文献を
-Vancouver（バンクーバー）引用様式で1件だけ書いてください。
-
-【形式の例】
-Lim J, Wenham T. An Atypical Presentation of Mycoplasma pneumoniae Infection Mimicking Acute Surgical Abdomen in an Adult. Cureus. 2024;16(11):e73665. doi:10.7759/cureus.73665
-
-【ルール】
-- 出力は引用文1行（または必要なら2行）だけ。説明・箇条書き・前後の文言は禁止
-- 著者は姓→名頭文字。3名超なら et al. を使ってよい
-- 雑誌名・年・巻号・ページ／論文番号・DOI が分かれば入れる
-- ライセンス（CC BY など）が本文にあれば末尾に「 / CC BY 4.0」のように付けてよい
-- 不明な項目は無理に作らず省略する
-- Markdownやコードブロックで囲まない
-
-【論文テキスト】
-{excerpt}
-"""
-        try:
-            text, _ = _claude_messages_text(api_key, prompt, max_tokens=800)
-            cite = _strip_script_wrappers(text)
-            # 1〜3行に収める
-            cite_lines = [ln.strip() for ln in cite.splitlines() if ln.strip()]
-            cite = " ".join(cite_lines[:3]).strip()
-            if cite:
-                return cite
-        except Exception:
-            pass
-    return _heuristic_vancouver_from_paper(paper)
-
-
 def apply_paper_reference_to_session(citation: str) -> None:
     """参考文献をセッションとエンディング文面の初期値へ反映する。"""
     cite = (citation or "").strip()
@@ -1190,108 +814,6 @@ def apply_paper_reference_to_session(citation: str) -> None:
     st.session_state.ending_credits_text = ""
     st.session_state._ending_auto_text = ""
     st.session_state._ending_prefill_sig = None
-
-
-def normalize_title_mukougawa(raw: str) -> str:
-    """タイトルを『〜の向こう側』形に整える（すでに付いていればそのまま）。"""
-    t = (raw or "").strip()
-    t = t.strip("「」『』\"'").strip()
-    t = re.sub(r"^(タイトル案|タイトル)[:：\s]*", "", t).strip()
-    if "\n" in t:
-        t = t.split("\n")[0].strip()
-    t = re.sub(r"[。．!！?？]+$", "", t).strip()
-    if not t:
-        return "診断の向こう側"
-    if t.endswith("の向こう側"):
-        return t
-    return f"{t}の向こう側"
-
-
-def _heuristic_title_from_paper(paper_text: str) -> str:
-    """APIなし時の簡潔なタイトル案。"""
-    head = (paper_text or "")[:5000]
-    # よくある疾患・病態キーワード（短いもの優先で拾う）
-    keywords = [
-        "敗血症",
-        "心筋梗塞",
-        "肺塞栓",
-        "大動脈解離",
-        "髄膜炎",
-        "脳梗塞",
-        "消化管穿孔",
-        "急性腹症",
-        "糖尿病性ケトアシドーシス",
-        "アナフィラキシー",
-        "心タンポナーデ",
-        "気胸",
-        "肺炎",
-        "虫垂炎",
-        "胆石",
-        "膵炎",
-        "腎盂腎炎",
-        "腸閉塞",
-        "心筋炎",
-        "心不全",
-        "喘息",
-        "結核",
-        "HIV",
-        "SLE",
-        "白血病",
-        "リンパ腫",
-    ]
-    for kw in keywords:
-        if kw in head:
-            return normalize_title_mukougawa(kw)
-    # 英語病名の簡易対応
-    eng = [
-        (r"\bsepsis\b", "敗血症"),
-        (r"\bpneumonia\b", "肺炎"),
-        (r"mycoplasma", "マイコプラズマ"),
-        (r"appendicitis", "虫垂炎"),
-        (r"pulmonary embolism", "肺塞栓"),
-        (r"myocardial infarction", "心筋梗塞"),
-    ]
-    for pat, jp in eng:
-        if re.search(pat, head, re.I):
-            return normalize_title_mukougawa(jp)
-    return "診断の向こう側"
-
-
-def suggest_drama_title_from_paper(paper_text: str, api_key: str = "") -> str:
-    """
-    論文内容から簡潔なタイトル案を1つ作る。
-    必ず『〜の向こう側』の形にする。
-    """
-    paper = (paper_text or "").strip()
-    if not paper:
-        return "診断の向こう側"
-    excerpt = paper[: min(20000, len(paper))]
-    if (api_key or "").strip():
-        prompt = f"""次の医学論文（症例報告など）の内容から、
-YouTube医学ドラマ用の簡潔な日本語タイトルを1つだけ考えてください。
-
-【必須形式】
-「〇〇の向こう側」
-（例: 敗血症の向こう側 / 急性腹症の向こう側 / 肺塞栓の向こう側）
-
-【ルール】
-- 出力はタイトル1行だけ。説明・箇条書き・引用符・前置きは禁止
-- 〇〇は疾患・病態・臨床テーマを短い日本語で（長くしすぎない）
-- 論文タイトルの直訳にしない。視聴者が惹かれる簡潔な言葉にする
-- 正しい診断名をネタバレしすぎない範囲で、テーマが伝わる語を選ぶ
-- Markdownやコードブロックで囲まない
-
-【論文テキスト】
-{excerpt}
-"""
-        try:
-            text, _ = _claude_messages_text(api_key, prompt, max_tokens=200)
-            title = normalize_title_mukougawa(_strip_script_wrappers(text))
-            if title:
-                return title
-        except Exception:
-            pass
-    return _heuristic_title_from_paper(paper)
 
 
 def render_video_title_input() -> None:
@@ -1837,10 +1359,10 @@ def strip_background_hint_segments(text: str) -> str:
 def parse_script_background_events(script: str) -> list[tuple[str, str, int]]:
     """
     台本を「背景ヒント」と「本文」に順番どおり分解する（行単位）。
+    台本そのものから 〈〉 やルビは消さない（分解用の読み取りのみ）。
     戻り値: [('hint', '救急外来', 0), ('text', '患者が…', 1), ...]
-    別行の 〈手術室〉 を直前の字幕へ誤って付けないため、行番号を保持する。
     """
-    text = strip_voicevox_ruby(script or "")
+    text = str(script or "")
     events: list[tuple[str, str, int]] = []
     for line_idx, line in enumerate(text.split("\n")):
         pos = 0
@@ -1865,8 +1387,9 @@ def parse_script_background_events(script: str) -> list[tuple[str, str, int]]:
 def plan_narration_segments(script: str) -> list[dict[str, str]]:
     """
     台本を「字幕用」「読み上げ用」「背景ヒント」に分ける。
-    - text: 字幕（<> / 〈〉 ヒントなし。[] 注釈は残す）
-    - tts: VOICEVOX へ送る文（<> / 〈〉 も [] もなし）
+    台本ファイル自体からはルビも 〈〉 も削除しない。
+    - text: 字幕（ルビ記号なし・〈〉なし。[] 注釈は残す）
+    - tts: VOICEVOX へ送る文（ルビは残す。〈〉 と [] は除く）
     - bg_hint: 背景画だけに使う（空文字可）
     """
     events = parse_script_background_events(script)
@@ -1882,6 +1405,7 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
             i += 1
             continue
 
+        # 分解済み本文。字幕・読み上げ用にだけヒントを外す（台本は変更しない）
         body = strip_background_hint_segments(payload).strip()
         i += 1
 
@@ -1889,13 +1413,17 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
             continue
 
         for chunk in split_text_for_voicevox(body):
-            display = strip_voicevox_ruby(chunk).strip()
-            if not display:
+            raw_chunk = strip_background_hint_segments(chunk).strip()
+            if not raw_chunk:
                 continue
+            # 字幕: 表記だけ（ルビ記号・ヒントなし）
+            display = strip_voicevox_ruby(raw_chunk).strip()
             display = strip_background_hint_segments(display).strip()
-            tts_text = strip_background_hint_segments(
-                strip_square_bracket_segments(display).strip()
-            ).strip()
+            # 読み上げ: ルビは残し、[] とヒントだけ外す
+            tts_text = canonicalize_voicevox_ruby_delimiters(
+                strip_square_bracket_segments(raw_chunk).strip()
+            )
+            tts_text = strip_background_hint_segments(tts_text).strip()
             if not tts_text:
                 if display:
                     pending_subtitle = f"{pending_subtitle}{display}"
@@ -2129,8 +1657,10 @@ def generate_narration_wav_to_file(
     長い台本向け: VOICEVOXで音声生成し、字幕用タイミングも返す。
     1音声区間＝1字幕。開始・終了は各WAVの実時間（よみ上げと完全同期）。
     戻り値: (wavパス, 字幕キュー[{start,end,text}, ...])
-    text は表記のみ（ルビ記号なし、<> 背景ヒントなし）。
+    text は字幕用（ルビ記号なし、<> 背景ヒントなし）。
+    tts は読み上げ用（ルビは残す。<> ヒントと [] は除く）。
     各キューに bg_hint があれば背景切替用（字幕・読み上げには出さない）。
+    台本そのものからはルビも 〈〉 も削除しない。
     """
     segments = plan_narration_segments(script)
     if not segments:
@@ -2151,10 +1681,11 @@ def generate_narration_wav_to_file(
                 progress_callback(i, len(segments))
             part = part_dir / f"part_{i:05d}.wav"
             display_for_sub = strip_background_hint_segments(
-                str(seg.get("text") or "")
+                strip_voicevox_ruby(str(seg.get("text") or ""))
             ).strip()
+            # 読み上げ: ヒントだけ外す（ルビは残す）
             tts_text = strip_background_hint_segments(
-                str(seg.get("tts") or "")
+                canonicalize_voicevox_ruby_delimiters(str(seg.get("tts") or ""))
             ).strip()
             bg_hint_for_cue = str(seg.get("bg_hint") or "").strip()
             if not tts_text or not display_for_sub:
@@ -3549,8 +3080,8 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
     )
     _pct(2, "台本を準備中…")
-    # 台本は平文のまま音声化する
-    voice_script = strip_voicevox_ruby(
+    # 台本のルビも 〈〉 も削除しない（字幕・読み上げ側でだけ外す）
+    voice_script = normalize_script_keeping_ruby(
         str(st.session_state.get("ruby_script") or st.session_state.get("final_script") or "")
     ).strip()
     if not voice_script:
@@ -3566,9 +3097,14 @@ def run_video_export(progress, pct_box, status) -> None:
     script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
     # 旧固定名も残す（互換）
     (OUTPUT_DIR / "last_script.docx").write_bytes(script_docx_path.read_bytes())
-    subtitle_for_log = strip_background_hint_segments(voice_script)
+    # ログ用: 字幕は表記のみ、読み上げはルビ残し・ヒントと [] を外す
+    subtitle_for_log = strip_voicevox_ruby(
+        strip_background_hint_segments(voice_script)
+    )
     tts_for_log = strip_background_hint_segments(
-        strip_square_bracket_segments(voice_script)
+        strip_square_bracket_segments(
+            canonicalize_voicevox_ruby_delimiters(voice_script)
+        )
     )
     (OUTPUT_DIR / "last_script_tts.txt").write_text(tts_for_log, encoding="utf-8")
     (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
@@ -3927,127 +3463,44 @@ def main() -> None:
         else:
             st.error(f"VOICEVOX 未接続: {ver}")
 
-        load_dotenv_file()
-        has_saved = bool(get_api_key())
-        typed = st.text_input(
-            "APIキー",
-            type="password",
-            placeholder="ANTHROPIC_API_KEY",
-            help="保存済み" if has_saved else "未設定",
-        )
-        if typed.strip():
-            os.environ["ANTHROPIC_API_KEY"] = typed.strip()
-
-        if st.button("キーを保存"):
-            to_save = typed.strip() or get_api_key()
-            if not to_save:
-                st.error("先にキーを入力してください。")
-            else:
-                try:
-                    saved_path = save_api_key_to_env_file(to_save)
-                    st.success(f"保存: `{saved_path.name}`")
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"保存失敗: {e}")
-
     # ----- Step 1 -----
     st.write("1. 台本")
 
-    input_mode = st.radio(
-        "入力方法",
-        options=["paper", "script"],
-        format_func=lambda x: (
-            "論文PDFから作る"
-            if x == "paper"
-            else "台本ファイルを取り込む"
-        ),
-        key="step1_input_mode",
-        horizontal=True,
-        label_visibility="collapsed",
+    script_upload = st.file_uploader(
+        "台本ファイル（.txt / .docx / .pdf）",
+        type=["txt", "docx", "pdf"],
+        key=f"ready_script_u{upload_gen()}",
     )
-
-    if input_mode == "paper":
-        paper_pdf = st.file_uploader(
-            "医学論文PDF",
-            type=["pdf"],
-            key=f"paper_pdf_u{upload_gen()}",
-        )
-        if st.button(
-            "PDFから台本を作成",
-            type="primary",
-            key="btn_pdf_to_script",
-            use_container_width=True,
-        ):
-            api_key = get_api_key()
-            if not api_key:
-                st.error("先にAPIキーを入力・保存してください。")
-            elif paper_pdf is None:
-                st.error("PDFを選んでください。")
-            else:
-                try:
-                    with st.spinner("PDFの文字を読み取っています…"):
-                        raw = paper_pdf.getvalue()
-                        paper_text = extract_text_from_pdf_bytes(raw)
-                    with st.spinner(
-                        "台本を作成中です（1〜3分かかることがあります。"
-                        "止まったように見えても待ってください）…"
-                    ):
-                        script = generate_drama_script_from_paper(paper_text, api_key)
-                    if not script.strip():
-                        st.error("台本が空でした。別のPDFで試してください。")
-                    else:
-                        # 既存ルビがあれば残して取り込む
-                        script = normalize_script_keeping_ruby(script)
-                        # 安定化: 台本作成直後の Claude 再呼び出しはしない
-                        citation = _heuristic_vancouver_from_paper(paper_text) or (
-                            f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
-                        )
-                        schedule_script_reload(
-                            script,
-                            f"pdf-{paper_pdf.name}-{len(script)}",
-                            citation=citation,
-                            notice=(
-                                f"取り込み完了: {paper_pdf.name}"
-                                f"（約 {len(script):,} 字）"
-                            ),
-                        )
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"台本作成に失敗しました: {e}")
-
-    else:
-        script_upload = st.file_uploader(
-            "台本ファイル（.docx / .pdf）",
-            type=["docx", "pdf"],
-            key=f"ready_script_u{upload_gen()}",
-        )
-        if st.button(
-            "台本を取り込む",
-            type="primary",
-            key="btn_import_ready_script",
-            use_container_width=True,
-        ):
-            if script_upload is None:
-                st.error("台本ファイルを選んでください。")
-            else:
-                try:
-                    with st.spinner("台本を読み取っています…"):
-                        raw = script_upload.getvalue()
-                        script = extract_text_from_bytes(
-                            script_upload.name, raw
-                        ).strip()
-                    if not script:
-                        st.error("台本が空でした。")
-                    else:
-                        script = normalize_script_keeping_ruby(script)
-                        schedule_script_reload(
-                            script,
-                            f"script-{script_upload.name}-{len(script)}",
-                            notice=(
-                                f"取り込み完了: {script_upload.name}"
-                                f"（約 {len(script):,} 字）"
-                            ),
-                        )
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"台本の取り込みに失敗しました: {e}")
+    if st.button(
+        "台本を取り込む",
+        type="primary",
+        key="btn_import_ready_script",
+        use_container_width=True,
+    ):
+        if script_upload is None:
+            st.error("台本ファイルを選んでください。")
+        else:
+            try:
+                with st.spinner("台本を読み取っています…"):
+                    raw = script_upload.getvalue()
+                    script = extract_text_from_bytes(
+                        script_upload.name, raw
+                    ).strip()
+                if not script:
+                    st.error("台本が空でした。")
+                else:
+                    # 既存ルビは削除も追加もしない
+                    script = normalize_script_keeping_ruby(script)
+                    schedule_script_reload(
+                        script,
+                        f"script-{script_upload.name}-{len(script)}",
+                        notice=(
+                            f"取り込み完了: {script_upload.name}"
+                            f"（約 {len(script):,} 字）"
+                        ),
+                    )
+            except Exception as e:  # noqa: BLE001
+                st.error(f"台本の取り込みに失敗しました: {e}")
 
     # タイトルは手入力のみ（提案しない）。値は上書きするまで保持。
     if st.session_state.get("raw_script") and not st.session_state.get(
@@ -4062,11 +3515,11 @@ def main() -> None:
         est_min = max(1, round(n_chars / 320))
         st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
         st.caption(
-            "背景ヒント: `<救急外来>` `＜病棟＞` `〈手術室〉` など <> / 〈〉 系で囲んだ部分は、"
-            "字幕にも読み上げにも出ません（背景画像の選び方だけに使います）。"
+            "背景ヒント `〈手術室〉` とルビは、台本からは削除しません（追加もしません）。"
+            "字幕・読み上げでは `〈〉` は出さず、背景画像の選び方だけに使います。"
             " `[注釈]` は字幕にだけ出し、読み上げません。"
-            " ※左サイドバーの修正版が `ui-slim-20260812e` 以降であることを確認してから MP4 を作り直してください。"
-            " 背景は **最終版（背景あり）** で作成してください。"
+            " ※左サイドバーの修正版が `ui-slim-20260812g` 以降であること、"
+            "背景は **最終版（背景あり）** で MP4 を作り直してください。"
         )
         raw_key = ensure_editor_value(
             EDITOR_BASE_RAW, st.session_state.raw_script
@@ -4077,7 +3530,7 @@ def main() -> None:
             key=raw_key,
         )
         if st.button("この内容で台本を上書き", key="btn_overwrite_raw_script"):
-            edited_raw = strip_voicevox_ruby(
+            edited_raw = normalize_script_keeping_ruby(
                 read_editor_value(EDITOR_BASE_RAW)
             ).strip()
             if not edited_raw:
@@ -4097,7 +3550,7 @@ def main() -> None:
             use_container_width=True,
             key="btn_confirm_to_video",
         ):
-            edited = strip_voicevox_ruby(
+            edited = normalize_script_keeping_ruby(
                 read_editor_value(EDITOR_BASE_RAW) or st.session_state.raw_script
             ).strip()
             if not edited:
@@ -4114,14 +3567,14 @@ def main() -> None:
         st.write("3. 動画")
         render_video_title_input()
 
-        voice_now = strip_voicevox_ruby(
+        voice_now = normalize_script_keeping_ruby(
             str(
                 st.session_state.get("ruby_script")
                 or st.session_state.get("final_script")
                 or ""
             )
         ).strip()
-        # 台本は平文で扱う（埋め込みルビ工程は使わない）
+        # 台本のルビは削除も追加もしない
         st.session_state.ruby_script = voice_now
         st.session_state.ruby_ready = bool(voice_now)
         mode_now = str(st.session_state.get("video_export_mode") or "draft")
@@ -4135,10 +3588,6 @@ def main() -> None:
             """.strip()
         )
         st.caption(f"動画種類の初期値: {mode_now}")
-
-        plain_txt = st.session_state.get("last_plain_script_txt") or ""
-        if plain_txt and Path(plain_txt).exists():
-            st.caption(f"デスクトップの台本: `{Path(plain_txt).name}`")
 
         # 台本が空なら止める
         if not voice_now:
@@ -4427,7 +3876,7 @@ def main() -> None:
                 if st.session_state.get("_ruby_loop_file_id") != file_id:
                     try:
                         loaded = load_text_from_upload(script_reupload).strip()
-                        script = strip_voicevox_ruby(loaded).strip()
+                        script = normalize_script_keeping_ruby(loaded).strip()
                         if not script:
                             st.error("台本が空でした。")
                         else:
@@ -4438,7 +3887,7 @@ def main() -> None:
                                 f"reupload-{file_id}",
                                 advance_plain=True,
                                 notice=(
-                                    "修正台本を取り込み、デスクトップへ保存しました。\n"
+                                    "修正台本を取り込みました（ルビ・〈〉は削除していません）。\n"
                                     "「ドラフトMP4を再作成」を押してください。"
                                 ),
                             )
@@ -4581,6 +4030,25 @@ def _self_test_background_hints() -> None:
     assert themes[0] == "er", themes
     assert "surgery" in themes, themes
     assert "ward" in themes, themes
+
+    # 台本そのものから 〈〉 / ルビを消していないこと、
+    # 字幕には出さず・読み上げにはルビを残すこと
+    ruby_script = (
+        "〈救急外来〉\n"
+        "｛心不全｜しんふぜん｝が進行した。\n"
+    )
+    assert "〈救急外来〉" in ruby_script
+    assert "しんふぜん" in ruby_script
+    events = parse_script_background_events(ruby_script)
+    assert any(k == "hint" and p == "救急外来" for k, p, _ in events)
+    assert any(k == "text" and ("心不全" in p) for k, p, _ in events)
+    ruby_segs = plan_narration_segments(ruby_script)
+    assert ruby_segs, ruby_segs
+    assert ruby_segs[0]["bg_hint"] == "救急外来"
+    assert "心不全" in ruby_segs[0]["text"]
+    assert "{" not in ruby_segs[0]["text"] and "｛" not in ruby_segs[0]["text"]
+    assert "〈" not in ruby_segs[0]["text"] and "〈" not in ruby_segs[0]["tts"]
+    assert "しんふぜん" in ruby_segs[0]["tts"]
 
 
 if __name__ == "__main__":

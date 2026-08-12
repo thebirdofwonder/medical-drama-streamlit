@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")"
 
 BRANCH="cursor/cloud-agent-1786051249580-ewceu"
-NEED_BUILD="ui-slim-20260811"
+NEED_BUILD="ui-slim-20260812"
 
 echo "========================================"
 echo " 最新版を取得して起動します"
