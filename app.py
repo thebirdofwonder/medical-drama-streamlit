@@ -281,7 +281,7 @@ CLAUDE_HTTP_TIMEOUT_SEC = 120
 DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
 DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812c"
+APP_BUILD = "ui-slim-20260812e"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -1779,13 +1779,23 @@ def strip_voicevox_ruby(text: str) -> str:
 
 
 # 背景指定ヒント（<> ＜＞ 〈〉 ‹› など）。字幕・読み上げには出さず、背景切替だけに使う
-# 開き／閉じの混在（例: <あ＞）や見た目が似た記号（《》など）も拾う
-_BG_HINT_OPEN_CHARS = "＜<〈‹《〈⟨"
-_BG_HINT_CLOSE_CHARS = "＞>〉›》〉⟩"
+# 開き／閉じの混在（例: <あ＞）や見た目が似た記号（《》❮❯ など）も拾う
+_BG_HINT_OPEN_CHARS = "＜<〈‹《〈⟨❮"
+_BG_HINT_CLOSE_CHARS = "＞>〉›》〉⟩❯"
 _BACKGROUND_HINT_SEGMENT_RE = re.compile(
     rf"[{re.escape(_BG_HINT_OPEN_CHARS)}]"
-    rf"[^{re.escape(_BG_HINT_OPEN_CHARS + _BG_HINT_CLOSE_CHARS)}]{{0,80}}"
+    rf"[^{re.escape(_BG_HINT_OPEN_CHARS + _BG_HINT_CLOSE_CHARS)}]{{0,200}}"
     rf"[{re.escape(_BG_HINT_CLOSE_CHARS)}]"
+)
+# 分割で括弧が途中で切れたときの保険（未閉じ／未開始）
+_BACKGROUND_HINT_UNCLOSED_OPEN_RE = re.compile(
+    rf"[{re.escape(_BG_HINT_OPEN_CHARS)}][^{re.escape(_BG_HINT_CLOSE_CHARS)}\n]*"
+)
+_BACKGROUND_HINT_UNCLOSED_CLOSE_RE = re.compile(
+    rf"[^{re.escape(_BG_HINT_OPEN_CHARS)}\n]*[{re.escape(_BG_HINT_CLOSE_CHARS)}]"
+)
+_BACKGROUND_HINT_LONE_BRACKET_RE = re.compile(
+    rf"[{re.escape(_BG_HINT_OPEN_CHARS + _BG_HINT_CLOSE_CHARS)}]"
 )
 
 
@@ -1802,7 +1812,7 @@ def extract_background_hints(text: str) -> list[str]:
 
 
 def strip_background_hint_segments(text: str) -> str:
-    """<> 系の背景ヒントを取り除く（字幕・読み上げ用）。繰り返し除去で取りこぼしを防ぐ。"""
+    """<> / 〈〉 系の背景ヒントを取り除く（字幕・読み上げ用）。"""
     if not text:
         return ""
     out = str(text)
@@ -1811,58 +1821,121 @@ def strip_background_hint_segments(text: str) -> str:
         if nxt == out:
             break
         out = nxt
+    # 分割途中で切れた 〈… や …〉 も除去
+    for _ in range(4):
+        nxt = _BACKGROUND_HINT_UNCLOSED_OPEN_RE.sub("", out)
+        nxt = _BACKGROUND_HINT_UNCLOSED_CLOSE_RE.sub("", nxt)
+        nxt = _BACKGROUND_HINT_LONE_BRACKET_RE.sub("", nxt)
+        if nxt == out:
+            break
+        out = nxt
     out = re.sub(r"[ \t\u3000]{2,}", " ", out)
     out = re.sub(r" *\n *", "\n", out)
     return out.strip()
 
 
+def parse_script_background_events(script: str) -> list[tuple[str, str, int]]:
+    """
+    台本を「背景ヒント」と「本文」に順番どおり分解する（行単位）。
+    戻り値: [('hint', '救急外来', 0), ('text', '患者が…', 1), ...]
+    別行の 〈手術室〉 を直前の字幕へ誤って付けないため、行番号を保持する。
+    """
+    text = strip_voicevox_ruby(script or "")
+    events: list[tuple[str, str, int]] = []
+    for line_idx, line in enumerate(text.split("\n")):
+        pos = 0
+        while pos < len(line):
+            m = _BACKGROUND_HINT_SEGMENT_RE.search(line, pos)
+            if not m:
+                tail = line[pos:]
+                if tail.strip():
+                    events.append(("text", tail, line_idx))
+                break
+            if m.start() > pos:
+                chunk = line[pos : m.start()]
+                if chunk.strip():
+                    events.append(("text", chunk, line_idx))
+            inner = (m.group(0) or "")[1:-1].strip()
+            if inner:
+                events.append(("hint", inner, line_idx))
+            pos = m.end()
+    return events
+
+
 def plan_narration_segments(script: str) -> list[dict[str, str]]:
     """
     台本を「字幕用」「読み上げ用」「背景ヒント」に分ける。
-    - text: 字幕（<> ヒントなし。[] 注釈は残す）
-    - tts: VOICEVOX へ送る文（<> も [] もなし）
+    - text: 字幕（<> / 〈〉 ヒントなし。[] 注釈は残す）
+    - tts: VOICEVOX へ送る文（<> / 〈〉 も [] もなし）
     - bg_hint: 背景画だけに使う（空文字可）
     """
-    chunks = split_text_for_voicevox(script)
+    events = parse_script_background_events(script)
     pending_subtitle = ""
-    pending_bg_hint = ""
+    pending_hint = ""
     segments: list[dict[str, str]] = []
-    for chunk in chunks:
-        display = strip_voicevox_ruby(chunk).strip()
-        if not display:
+
+    i = 0
+    while i < len(events):
+        kind, payload, line_idx = events[i]
+        if kind == "hint":
+            pending_hint = payload
+            i += 1
             continue
-        chunk_hints = extract_background_hints(display)
-        if chunk_hints:
-            pending_bg_hint = chunk_hints[-1]
-        body = strip_background_hint_segments(display).strip()
-        tts_text = strip_square_bracket_segments(body).strip()
-        # 読み上げ文にもヒントが残らないように再除去
-        tts_text = strip_background_hint_segments(tts_text).strip()
-        if not tts_text:
-            if body:
-                pending_subtitle = f"{pending_subtitle}{body}"
+
+        body = strip_background_hint_segments(payload).strip()
+        i += 1
+
+        if not body:
             continue
-        display_for_sub = strip_background_hint_segments(
-            f"{pending_subtitle}{body}"
-        ).strip()
-        pending_subtitle = ""
-        bg_hint = pending_bg_hint
-        pending_bg_hint = ""
-        if not display_for_sub:
-            continue
-        segments.append(
-            {
-                "text": display_for_sub,
-                "tts": tts_text,
-                "bg_hint": bg_hint,
-            }
-        )
+
+        for chunk in split_text_for_voicevox(body):
+            display = strip_voicevox_ruby(chunk).strip()
+            if not display:
+                continue
+            display = strip_background_hint_segments(display).strip()
+            tts_text = strip_background_hint_segments(
+                strip_square_bracket_segments(display).strip()
+            ).strip()
+            if not tts_text:
+                if display:
+                    pending_subtitle = f"{pending_subtitle}{display}"
+                continue
+            display_for_sub = strip_background_hint_segments(
+                f"{pending_subtitle}{display}"
+            ).strip()
+            pending_subtitle = ""
+            bg_hint = pending_hint
+            pending_hint = ""
+            if not display_for_sub:
+                continue
+            segments.append(
+                {
+                    "text": display_for_sub,
+                    "tts": tts_text,
+                    "bg_hint": bg_hint,
+                }
+            )
+
+        # 同じ行末尾の 執刀〈手術室〉 だけ、直前の音声区間へ付ける
+        if (
+            i < len(events)
+            and events[i][0] == "hint"
+            and events[i][2] == line_idx
+        ):
+            same_line_hint = str(events[i][1] or "").strip()
+            if same_line_hint:
+                if segments:
+                    segments[-1]["bg_hint"] = same_line_hint
+                else:
+                    pending_hint = same_line_hint
+            i += 1
+
     if pending_subtitle and segments:
         segments[-1]["text"] = strip_background_hint_segments(
             str(segments[-1].get("text") or "") + pending_subtitle
         ).strip()
-    if pending_bg_hint and segments:
-        segments[-1]["bg_hint"] = pending_bg_hint
+    if pending_hint and segments and not segments[-1].get("bg_hint"):
+        segments[-1]["bg_hint"] = pending_hint
     return segments
 
 
@@ -2634,15 +2707,64 @@ THEME_KEYWORDS: dict[str, list[tuple[str, int]]] = {
 THEME_PRIORITY = list(THEME_KEYWORDS)
 THEME_CYCLE = list(THEME_TO_BG_INDICES)  # 自作背景の互換用
 
+# 〈〉 背景ヒントの日本語 → 場面キー（部分一致より先に使う）
+BACKGROUND_HINT_ALIASES: dict[str, str] = {
+    "救急外来": "er",
+    "救命救急": "er",
+    "救急": "er",
+    "初療室": "er",
+    "er": "er",
+    "手術室": "surgery",
+    "手術": "surgery",
+    "オペ室": "surgery",
+    "執刀": "surgery",
+    "病棟": "ward",
+    "病室": "ward",
+    "入院": "ward",
+    "回診": "ward",
+    "icu": "icu",
+    "集中治療室": "icu",
+    "ccu": "icu",
+    "ct": "imaging",
+    "ct室": "imaging",
+    "MRI": "imaging",
+    "レントゲン": "imaging",
+    "画像": "imaging",
+    "検査室": "lab",
+    "病理": "lab",
+    "培養": "lab",
+    "薬局": "pharma",
+    "投薬": "pharma",
+    "点滴": "pharma",
+    "外来": "consult",
+    "診察": "consult",
+    "説明": "consult",
+    "廊下": "corridor",
+    "受付": "corridor",
+    "待合": "corridor",
+    "救急車": "ambulance",
+    "搬送": "ambulance",
+}
+
 
 def infer_theme_from_background_hint(hint: str) -> str | None:
-    """背景ヒント（<> 内の文字）から場面を決める。通常のキーワード判定より優先。"""
+    """背景ヒント（<> / 〈〉 内の文字）から場面を決める。通常のキーワード判定より優先。"""
     text = (hint or "").strip()
     if not text:
         return None
     key = text.lower().replace(" ", "").replace("　", "")
     if key in THEME_TO_BG_INDICES:
         return key
+    compact = text.replace(" ", "").replace("　", "")
+    if compact in BACKGROUND_HINT_ALIASES:
+        return BACKGROUND_HINT_ALIASES[compact]
+    lower_compact = compact.lower()
+    if lower_compact in BACKGROUND_HINT_ALIASES:
+        return BACKGROUND_HINT_ALIASES[lower_compact]
+    # 長い別名から部分一致（例: 救急外来センター → 救急外来）
+    for alias in sorted(BACKGROUND_HINT_ALIASES, key=len, reverse=True):
+        if alias in compact or alias in lower_compact:
+            return BACKGROUND_HINT_ALIASES[alias]
     return infer_theme_from_text(text)
 
 
@@ -2840,14 +2962,16 @@ def plan_scene_schedule(
         cue_text = strip_background_hint_segments(
             strip_voicevox_ruby(str(cue.get("text") or ""))
         ).strip()
+        explicit_hint = str(cue.get("bg_hint") or "").strip()
         detected, _context = _theme_from_cue_context(cues, i)
         elapsed = cue_start - scene_start
 
         # 物語上の場面が変わったら、その字幕の開始時刻で背景を切り替える。
+        # 〈〉 で明示されたヒントは最短時間を待たずに切り替える。
         if (
             detected
             and detected != current_theme
-            and elapsed >= SCENE_MIN_DURATION_SEC
+            and (explicit_hint or elapsed >= SCENE_MIN_DURATION_SEC)
         ):
             _append_scene(cue_start)
             current_theme = detected
@@ -3938,10 +4062,11 @@ def main() -> None:
         est_min = max(1, round(n_chars / 320))
         st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
         st.caption(
-            "背景ヒント: `<救急外来>` `＜病棟＞` `〈手術室〉` など <> 系で囲んだ部分は、"
+            "背景ヒント: `<救急外来>` `＜病棟＞` `〈手術室〉` など <> / 〈〉 系で囲んだ部分は、"
             "字幕にも読み上げにも出ません（背景画像の選び方だけに使います）。"
             " `[注釈]` は字幕にだけ出し、読み上げません。"
-            " ※左サイドバーの修正版が `ui-slim-20260812c` 以降であることを確認してから MP4 を作り直してください。"
+            " ※左サイドバーの修正版が `ui-slim-20260812e` 以降であることを確認してから MP4 を作り直してください。"
+            " 背景は **最終版（背景あり）** で作成してください。"
         )
         raw_key = ensure_editor_value(
             EDITOR_BASE_RAW, st.session_state.raw_script
@@ -4397,7 +4522,7 @@ def main() -> None:
 
 
 def _self_test_background_hints() -> None:
-    """<> 背景ヒントの除去・テーマ判定（開発用）。"""
+    """<> / 〈〉 背景ヒントの除去・テーマ判定（開発用）。"""
     samples = [
         ("<>", ""),
         ("<ER>救急室", "救急室"),
@@ -4405,37 +4530,57 @@ def _self_test_background_hints() -> None:
         ("<あ＞い", "い"),
         ("＜あ>う", "う"),
         ("〈手術室〉", ""),
+        ("〈手術室〉執刀", "執刀"),
         ("‹外来›", ""),
         ("《病棟》回診", "回診"),
         ("[注]<ER>テスト", "[注]テスト"),
+        ("〈手術室", ""),  # 閉じ忘れ
+        ("手術室〉執刀", "執刀"),  # 開き忘れ
     ]
     for raw, expected in samples:
         got = strip_background_hint_segments(raw)
         assert got == expected, f"strip: {raw!r} -> {got!r}, want {expected!r}"
     assert extract_background_hints("<ER><病棟>") == ["ER", "病棟"]
+    assert extract_background_hints("〈ER〉〈病棟〉") == ["ER", "病棟"]
     assert infer_theme_from_background_hint("ER") == "er"
     assert infer_theme_from_background_hint("救急外来") == "er"
 
     script = (
-        "＜救急外来＞\n"
+        "〈救急外来〉\n"
         "患者が運ばれてきた。[緊急]\n"
-        "〈手術室〉執刀が始まった。\n"
+        "〈手術室〉\n"
+        "執刀が始まった。\n"
+        "執刀〈病棟〉\n"
+        "回診を始めた。\n"
     )
     segs = plan_narration_segments(script)
-    assert len(segs) >= 2, segs
+    assert len(segs) >= 3, segs
     for seg in segs:
-        assert "<" not in seg["text"]
-        assert ">" not in seg["text"]
-        assert "＜" not in seg["text"]
-        assert "＞" not in seg["text"]
-        assert "〈" not in seg["text"]
-        assert "〉" not in seg["text"]
-        assert "<" not in seg["tts"]
-        assert "緊急" not in seg["tts"]  # [] は読み上げない
-    assert segs[0]["bg_hint"] == "救急外来"
-    assert "患者が運ばれてきた" in segs[0]["text"]
-    assert any("[緊急]" in s["text"] for s in segs)
-    assert any(s.get("bg_hint") == "手術室" for s in segs)
+        for ch in "<>＜＞〈〉‹›《》":
+            assert ch not in seg["text"], seg
+            assert ch not in seg["tts"], seg
+    assert segs[0]["bg_hint"] == "救急外来", segs
+    assert segs[1]["bg_hint"] == "手術室", segs
+    assert any(s.get("bg_hint") == "病棟" for s in segs), segs
+
+    cues = []
+    t = 0.0
+    for seg in segs:
+        cues.append(
+            {
+                "start": t,
+                "end": t + 10.0,
+                "text": seg["text"],
+                "tts": seg["tts"],
+                "bg_hint": seg.get("bg_hint", ""),
+            }
+        )
+        t += 10.0
+    schedule = plan_scene_schedule(script, total_duration=t, subtitle_cues=cues)
+    themes = [item["theme"] for item in schedule]
+    assert themes[0] == "er", themes
+    assert "surgery" in themes, themes
+    assert "ward" in themes, themes
 
 
 if __name__ == "__main__":
