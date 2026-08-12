@@ -222,7 +222,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812h"
+APP_BUILD = "ui-slim-20260812i"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -1317,16 +1317,17 @@ def voicevox_tts_from_ruby_text(text: str) -> str:
     return _RUBY_TAG_RE.sub(_repl, text)
 
 
-# 背景指定ヒント（‹› 〈〉 <> ＜＞ など同等）。字幕・読み上げには出さず背景切替だけ
-# 開き／閉じの混在（例: <あ＞）や見た目が似た記号（《》❮❯ など）も拾う
-_BG_HINT_OPEN_CHARS = "＜<〈‹《〈⟨❮"
-_BG_HINT_CLOSE_CHARS = "＞>〉›》〉⟩❯"
+# 背景指定ヒント（<> ＜＞ <＞ ＜> 〈〉 ‹› など同等）。字幕・読み上げには出さず背景切替だけ
+# 開き／閉じの混在（例: <あ＞）や見た目が似た記号（《》❮❯ «» など）も拾う
+_BG_HINT_OPEN_CHARS = "＜<〈‹《〈⟨❮«❬❰"
+_BG_HINT_CLOSE_CHARS = "＞>〉›》〉⟩❯»❭❱"
 _BACKGROUND_HINT_SEGMENT_RE = re.compile(
     rf"[{re.escape(_BG_HINT_OPEN_CHARS)}]"
-    rf"[^{re.escape(_BG_HINT_OPEN_CHARS + _BG_HINT_CLOSE_CHARS)}]{{0,200}}"
-    rf"[{re.escape(_BG_HINT_CLOSE_CHARS)}]"
+    rf"[^{re.escape(_BG_HINT_OPEN_CHARS + _BG_HINT_CLOSE_CHARS)}]{{0,400}}"
+    rf"[{re.escape(_BG_HINT_CLOSE_CHARS)}]",
+    re.DOTALL,
 )
-# 分割で括弧が途中で切れたときの保険（未閉じ／未開始）
+# 分割で括弧が途中で切れたときの保険（未閉じ／未開始）。行内に限定して本文を消さない
 _BACKGROUND_HINT_UNCLOSED_OPEN_RE = re.compile(
     rf"[{re.escape(_BG_HINT_OPEN_CHARS)}][^{re.escape(_BG_HINT_CLOSE_CHARS)}\n]*"
 )
@@ -1338,20 +1339,31 @@ _BACKGROUND_HINT_LONE_BRACKET_RE = re.compile(
 )
 
 
+def _normalize_background_hint_inner(raw: str) -> str:
+    """山括弧の中身を背景ヒント用に整える（改行・余分な空白を詰める）。"""
+    inner = (raw or "").replace("\r", "\n")
+    inner = re.sub(r"[\n\t\u3000]+", " ", inner)
+    inner = re.sub(r" +", " ", inner).strip()
+    return inner
+
+
 def extract_background_hints(text: str) -> list[str]:
     """台本中の <> 系ヒントの中身だけを順に返す。"""
     if not text:
         return []
     hints: list[str] = []
     for m in _BACKGROUND_HINT_SEGMENT_RE.finditer(text):
-        inner = (m.group(0) or "")[1:-1].strip()
+        inner = _normalize_background_hint_inner((m.group(0) or "")[1:-1])
         if inner:
             hints.append(inner)
     return hints
 
 
 def strip_background_hint_segments(text: str) -> str:
-    """<> / 〈〉 系の背景ヒントを取り除く（字幕・読み上げ用）。"""
+    """
+    <> / 〈〉 / ‹› / ＜＞ など背景ヒントを取り除く（字幕・読み上げ用）。
+    括弧とその中身をまとめて消す。改行をまたぐヒントも消す。
+    """
     if not text:
         return ""
     out = str(text)
@@ -1360,7 +1372,7 @@ def strip_background_hint_segments(text: str) -> str:
         if nxt == out:
             break
         out = nxt
-    # 分割途中で切れた 〈… や …〉 も除去
+    # 分割途中で切れた 〈… や …〉 も除去（改行またぎ含む）
     for _ in range(4):
         nxt = _BACKGROUND_HINT_UNCLOSED_OPEN_RE.sub("", out)
         nxt = _BACKGROUND_HINT_UNCLOSED_CLOSE_RE.sub("", nxt)
@@ -1370,34 +1382,34 @@ def strip_background_hint_segments(text: str) -> str:
         out = nxt
     out = re.sub(r"[ \t\u3000]{2,}", " ", out)
     out = re.sub(r" *\n *", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
     return out.strip()
 
 
 def parse_script_background_events(script: str) -> list[tuple[str, str, int]]:
     """
-    台本を「背景ヒント」と「本文」に順番どおり分解する（行単位）。
+    台本を「背景ヒント」と「本文」に順番どおり分解する（全文・改行またぎ対応）。
     台本そのものから 〈〉 やルビは消さない（分解用の読み取りのみ）。
-    戻り値: [('hint', '救急外来', 0), ('text', '患者が…', 1), ...]
+    戻り値: [('hint', '救急外来', 行番号), ('text', '患者が…', 行番号), ...]
     """
     text = str(script or "")
     events: list[tuple[str, str, int]] = []
-    for line_idx, line in enumerate(text.split("\n")):
-        pos = 0
-        while pos < len(line):
-            m = _BACKGROUND_HINT_SEGMENT_RE.search(line, pos)
-            if not m:
-                tail = line[pos:]
-                if tail.strip():
-                    events.append(("text", tail, line_idx))
-                break
-            if m.start() > pos:
-                chunk = line[pos : m.start()]
-                if chunk.strip():
-                    events.append(("text", chunk, line_idx))
-            inner = (m.group(0) or "")[1:-1].strip()
-            if inner:
-                events.append(("hint", inner, line_idx))
-            pos = m.end()
+    pos = 0
+    while pos < len(text):
+        m = _BACKGROUND_HINT_SEGMENT_RE.search(text, pos)
+        if not m:
+            tail = text[pos:]
+            if tail.strip():
+                events.append(("text", tail, text[:pos].count("\n")))
+            break
+        if m.start() > pos:
+            chunk = text[pos : m.start()]
+            if chunk.strip():
+                events.append(("text", chunk, text[:pos].count("\n")))
+        inner = _normalize_background_hint_inner((m.group(0) or "")[1:-1])
+        if inner:
+            events.append(("hint", inner, text[: m.start()].count("\n")))
+        pos = m.end()
     return events
 
 
@@ -1405,42 +1417,66 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
     """
     台本を「字幕用」「読み上げ用」「背景ヒント」に分ける。
     台本ファイル自体からはルビも 〈〉 も削除しない。
-    - text: 字幕（{表記|よみ} の表記部分。〈〉 ヒントなし。[] 注釈は残す）
-    - tts: VOICEVOX 用（{表記|よみ} の読み部分。〈〉 と [] は除く）
+    - text: 字幕（{表記|よみ} の表記部分。山括弧ヒントなし。[] 注釈は残す）
+    - tts: VOICEVOX 用（{表記|よみ} の読み部分。山括弧ヒントと [] は除く）
     - bg_hint: 背景画だけに使う（空文字可）
     """
     events = parse_script_background_events(script)
+    # ヒントが出たら、本文ブロックへ正しく紐づける
+    blocks: list[tuple[str, str]] = []
+    current_hint = ""
+    current_text_parts: list[str] = []
+
+    for kind, payload, _line_idx in events:
+        if kind == "hint":
+            has_text = bool(
+                current_text_parts and "".join(current_text_parts).strip()
+            )
+            if has_text:
+                if current_hint:
+                    # 〈救急〉本文〈手術〉 → 本文は救急、手術は次の本文へ
+                    blocks.append((current_hint, "".join(current_text_parts)))
+                    current_text_parts = []
+                    current_hint = payload
+                else:
+                    # 本文〈病棟〉 → 直後のヒントは直前の本文へ
+                    blocks.append((payload, "".join(current_text_parts)))
+                    current_text_parts = []
+                    current_hint = ""
+            else:
+                # 本文より前のヒント
+                current_hint = payload
+            continue
+        current_text_parts.append(payload)
+
+    if current_text_parts and "".join(current_text_parts).strip():
+        blocks.append((current_hint, "".join(current_text_parts)))
+    elif current_hint and blocks:
+        prev_hint, prev_body = blocks[-1]
+        blocks[-1] = (current_hint or prev_hint, prev_body)
+
     pending_subtitle = ""
-    pending_hint = ""
     segments: list[dict[str, str]] = []
 
-    i = 0
-    while i < len(events):
-        kind, payload, line_idx = events[i]
-        if kind == "hint":
-            pending_hint = payload
-            i += 1
-            continue
-
-        # 分解済み本文。字幕・読み上げ用にだけヒントを外す（台本は変更しない）
-        body = strip_background_hint_segments(payload).strip()
-        i += 1
-
+    for bg_hint, raw_body in blocks:
+        body = strip_background_hint_segments(raw_body).strip()
         if not body:
             continue
-
+        block_hint = bg_hint
         for chunk in split_text_for_voicevox(body):
             raw_chunk = strip_background_hint_segments(chunk).strip()
             if not raw_chunk:
                 continue
-            # 字幕: { と | の間（表記）
-            display = strip_voicevox_ruby(raw_chunk).strip()
-            display = strip_background_hint_segments(display).strip()
-            # 読み上げ: | と } の間（読み）。[] と 〈〉 ヒントは除く
-            tts_text = voicevox_tts_from_ruby_text(
-                strip_square_bracket_segments(raw_chunk).strip()
-            )
-            tts_text = strip_background_hint_segments(tts_text).strip()
+            # 字幕: { と | の間（表記）。山括弧ヒントは絶対に残さない
+            display = strip_background_hint_segments(
+                strip_voicevox_ruby(raw_chunk)
+            ).strip()
+            # 読み上げ: | と } の間（読み）。[] と山括弧ヒントは除く
+            tts_text = strip_background_hint_segments(
+                voicevox_tts_from_ruby_text(
+                    strip_square_bracket_segments(raw_chunk).strip()
+                )
+            ).strip()
             if not tts_text:
                 if display:
                     pending_subtitle = f"{pending_subtitle}{display}"
@@ -1449,38 +1485,26 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
                 f"{pending_subtitle}{display}"
             ).strip()
             pending_subtitle = ""
-            bg_hint = pending_hint
-            pending_hint = ""
             if not display_for_sub:
+                continue
+            # ヒント文字列そのものが字幕／音声に混入していないことを保証
+            if block_hint and display_for_sub == block_hint:
+                continue
+            if block_hint and tts_text == block_hint:
                 continue
             segments.append(
                 {
                     "text": display_for_sub,
                     "tts": tts_text,
-                    "bg_hint": bg_hint,
+                    "bg_hint": block_hint,
                 }
             )
-
-        # 同じ行末尾の 執刀〈手術室〉 だけ、直前の音声区間へ付ける
-        if (
-            i < len(events)
-            and events[i][0] == "hint"
-            and events[i][2] == line_idx
-        ):
-            same_line_hint = str(events[i][1] or "").strip()
-            if same_line_hint:
-                if segments:
-                    segments[-1]["bg_hint"] = same_line_hint
-                else:
-                    pending_hint = same_line_hint
-            i += 1
+            block_hint = ""  # 同じブロックの2チャンク目以降はヒントを繰り返さない
 
     if pending_subtitle and segments:
         segments[-1]["text"] = strip_background_hint_segments(
             str(segments[-1].get("text") or "") + pending_subtitle
         ).strip()
-    if pending_hint and segments and not segments[-1].get("bg_hint"):
-        segments[-1]["bg_hint"] = pending_hint
     return segments
 
 
@@ -3535,7 +3559,7 @@ def main() -> None:
             " 背景ヒント: `‹›` `〈〉` `<>` `＜＞`（同等）→ 台本には残し、"
             "字幕・読み上げには出さず背景画像だけに使います。"
             " `[注釈]` は字幕のみ（読み上げなし）。"
-            " 修正版 `ui-slim-20260812h`、MP4 は **最終版（背景あり）** で作り直してください。"
+            " 修正版 `ui-slim-20260812i`、MP4 は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
             EDITOR_BASE_RAW, st.session_state.raw_script
@@ -4001,12 +4025,15 @@ def _self_test_background_hints() -> None:
         ("[注]<ER>テスト", "[注]テスト"),
         ("〈手術室", ""),  # 閉じ忘れ
         ("手術室〉執刀", "執刀"),  # 開き忘れ
+        ("〈\n救急外来\n〉患者", "患者"),  # 改行またぎ
+        ("«病棟»回診", "回診"),
     ]
     for raw, expected in samples:
         got = strip_background_hint_segments(raw)
         assert got == expected, f"strip: {raw!r} -> {got!r}, want {expected!r}"
     assert extract_background_hints("<ER><病棟>") == ["ER", "病棟"]
     assert extract_background_hints("〈ER〉〈病棟〉") == ["ER", "病棟"]
+    assert extract_background_hints("〈\n救急外来\n〉") == ["救急外来"]
     assert infer_theme_from_background_hint("ER") == "er"
     assert infer_theme_from_background_hint("救急外来") == "er"
 
@@ -4021,12 +4048,40 @@ def _self_test_background_hints() -> None:
     segs = plan_narration_segments(script)
     assert len(segs) >= 3, segs
     for seg in segs:
-        for ch in "<>＜＞〈〉‹›《》":
+        for ch in "<>＜＞〈〉‹›《》«»":
             assert ch not in seg["text"], seg
             assert ch not in seg["tts"], seg
+        # ヒントの中身そのものが字幕・音声になっていないこと
+        for hint_word in ("救急外来", "手術室"):
+            if seg.get("bg_hint") == hint_word:
+                assert seg["text"] != hint_word, seg
+                assert seg["tts"] != hint_word, seg
     assert segs[0]["bg_hint"] == "救急外来", segs
     assert segs[1]["bg_hint"] == "手術室", segs
     assert any(s.get("bg_hint") == "病棟" for s in segs), segs
+
+    # 改行をまたぐ山括弧でも、中身は字幕にも音声にも出ない
+    multiline = "〈\n救急外来\n〉\n患者が来た。"
+    ml_segs = plan_narration_segments(multiline)
+    assert ml_segs, ml_segs
+    assert ml_segs[0]["bg_hint"] == "救急外来", ml_segs
+    assert "救急外来" not in ml_segs[0]["text"], ml_segs
+    assert "救急外来" not in ml_segs[0]["tts"], ml_segs
+    assert "患者が来た" in ml_segs[0]["text"], ml_segs
+
+    # 半角・全角・混在の山括弧はすべて同等
+    for raw in (
+        "<手術室>執刀",
+        "＜手術室＞執刀",
+        "<手術室＞執刀",
+        "＜手術室>執刀",
+        "〈手術室〉執刀",
+        "‹手術室›執刀",
+    ):
+        mixed = plan_narration_segments(raw)
+        assert mixed and mixed[0]["bg_hint"] == "手術室", (raw, mixed)
+        assert "手術室" not in mixed[0]["text"], (raw, mixed)
+        assert "執刀" in mixed[0]["text"], (raw, mixed)
 
     cues = []
     t = 0.0
@@ -4048,7 +4103,7 @@ def _self_test_background_hints() -> None:
     assert "ward" in themes, themes
 
     # 台本そのものから 〈〉 / ルビを消していないこと、
-    # 字幕には出さず・読み上げにはルビを残すこと
+    # 字幕には出さず・読み上げは読みだけ
     ruby_script = (
         "〈救急外来〉\n"
         "｛心不全｜しんふぜん｝が進行した。\n"
@@ -4064,6 +4119,8 @@ def _self_test_background_hints() -> None:
     assert "心不全" in ruby_segs[0]["text"]
     assert "{" not in ruby_segs[0]["text"] and "｛" not in ruby_segs[0]["text"]
     assert "〈" not in ruby_segs[0]["text"] and "〈" not in ruby_segs[0]["tts"]
+    assert "救急外来" not in ruby_segs[0]["text"]
+    assert "救急外来" not in ruby_segs[0]["tts"]
     assert "しんふぜん" in ruby_segs[0]["tts"]
     assert "心不全" not in ruby_segs[0]["tts"]
 
