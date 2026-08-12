@@ -222,7 +222,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812k"
+APP_BUILD = "ui-slim-20260812l"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -818,13 +818,18 @@ def apply_paper_reference_to_session(citation: str) -> None:
 
 def render_video_title_input() -> None:
     """
-    タイトル手入力欄のみ（自動提案なし）。
+    MP4作成直前のタイトル入力（この画面に1つだけ）。
     一度入れた内容は、ユーザーが上書きするまで session に残る。
     """
+    st.write("動画タイトル")
     st.text_input(
-        "動画のタイトル（自分で入力）",
+        "動画のタイトル（自分で入力・あとから上書き可）",
         key="video_title",
         placeholder="ここにタイトルを入力",
+    )
+    st.caption(
+        "MP4作成の直前に1度入力します。ファイル名に使います。"
+        " あとから書き換えても大丈夫です。"
     )
 
 
@@ -3605,12 +3610,6 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001
                 st.error(f"台本の取り込みに失敗しました: {e}")
 
-    # タイトルは手入力のみ（提案しない）。値は上書きするまで保持。
-    if st.session_state.get("raw_script") and not st.session_state.get(
-        "script_confirmed"
-    ):
-        render_video_title_input()
-
     # ----- Step 2: 台本を確定 -----
     if st.session_state.raw_script and not st.session_state.script_confirmed:
         st.write("2. 台本を確定")
@@ -3621,7 +3620,7 @@ def main() -> None:
             "ルビ: `{表記|よみ}` / `｛表記｜よみ｝` → 字幕は表記、VOICEVOX は読み。"
             " 背景ヒント: `‹›` `〈〉` `<>` `＜＞` → 字幕・読み上げなし（背景のみ）。"
             " 大かっこ: `[注釈]` / `［注釈］` → **字幕には出す**、VOICEVOX は読まない。"
-            " 修正版 `ui-slim-20260812j`。VOICEVOX 起動後に"
+            " 修正版 `ui-slim-20260812l`。VOICEVOX 起動後に"
             " **最終版（背景あり）** で MP4 を作り直してください。"
         )
         raw_key = ensure_editor_value(
@@ -3668,7 +3667,6 @@ def main() -> None:
     # ----- Step 3: 動画作成 -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
-        render_video_title_input()
 
         voice_now = normalize_script_keeping_ruby(
             str(
@@ -3884,6 +3882,9 @@ def main() -> None:
             key="ending_credits_text",
             height=280,
         )
+
+        # 動画タイトルは MP4 作成直前にだけ出す（他ステップには出さない）
+        render_video_title_input()
 
         st.write("動画の種類")
         st.radio(
