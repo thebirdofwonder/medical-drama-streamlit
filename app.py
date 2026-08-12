@@ -222,7 +222,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812j"
+APP_BUILD = "ui-slim-20260812k"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -3125,12 +3125,26 @@ def begin_video_encoding(mode: str) -> bool:
         st.info(voicevox_howto_start())
         st.caption(f"詳細: {ver_vv_now}")
         return False
-    st.session_state.video_export_mode = mode
+    mode_norm = "final" if str(mode) == "final" else "draft"
+    # radio の key=video_export_mode は表示後に直接書き換えできない。
+    # 作成ジョブ用は別キーへ。画面に戻ったとき用に radio へは予約反映する。
+    st.session_state["_export_mode"] = mode_norm
+    queue_widget_value("video_export_mode", mode_norm)
     st.session_state.video_encoding = True
     st.session_state._export_job = "pending"
     st.session_state.export_progress_pct = 0
     st.session_state.export_progress_msg = ""
     return True
+
+
+def current_video_export_mode() -> str:
+    """今回の動画作成が draft / final のどちらかを返す。"""
+    mode = str(
+        st.session_state.get("_export_mode")
+        or st.session_state.get("video_export_mode")
+        or "draft"
+    )
+    return "final" if mode == "final" else "draft"
 
 
 # ---------------------------------------------------------------------------
@@ -3247,9 +3261,7 @@ def run_video_export(progress, pct_box, status) -> None:
         with _wave.open(str(wav_path), "rb") as wf:
             audio_sec = wf.getnframes() / float(wf.getframerate())
 
-        include_background = (
-            str(st.session_state.get("video_export_mode") or "draft") == "final"
-        )
+        include_background = current_video_export_mode() == "final"
         scene_dir = tmp_path / "scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
         scene_clips: list[tuple[Path, float]] = []
