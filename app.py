@@ -222,7 +222,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812i"
+APP_BUILD = "ui-slim-20260812j"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -862,6 +862,20 @@ def update_export_progress(
 # ---------------------------------------------------------------------------
 # VOICEVOX
 # ---------------------------------------------------------------------------
+def voicevox_howto_start() -> str:
+    """VOICEVOX が起動していないときの、初心者向け手順。"""
+    return (
+        "【やること】\n"
+        "1. Mac の「アプリケーション」または Dock から **VOICEVOX** を起動する"
+        "（この Streamlit 画面とは別のアプリです）\n"
+        "2. VOICEVOX のウィンドウが開くまで待つ\n"
+        "3. このブラウザ画面を再読み込みする（サイドバーに"
+        "「VOICEVOX OK」と出れば成功）\n"
+        "4. もう一度「動画を作成」を押す\n"
+        f"（接続先: {VOICEVOX_URL}）"
+    )
+
+
 def check_voicevox() -> tuple[bool, str]:
     try:
         r = requests.get(f"{VOICEVOX_URL}/version", timeout=3)
@@ -869,7 +883,20 @@ def check_voicevox() -> tuple[bool, str]:
             return True, r.text.strip().strip('"')
         return False, f"HTTP {r.status_code}"
     except requests.RequestException as e:
-        return False, str(e)
+        detail = str(e)
+        # Connection refused = VOICEVOX が起動していないときが多い
+        if (
+            "Connection refused" in detail
+            or "Errno 61" in detail
+            or "Errno 111" in detail
+            or "Max retries exceeded" in detail
+        ):
+            return (
+                False,
+                "VOICEVOX が起動していないか、応答していません。"
+                " VOICEVOX アプリを先に起動してください。",
+            )
+        return False, detail
 
 
 def fetch_voicevox_speakers() -> list[dict[str, Any]]:
@@ -880,7 +907,10 @@ def fetch_voicevox_speakers() -> list[dict[str, Any]]:
     try:
         r = requests.get(f"{VOICEVOX_URL}/speakers", timeout=8)
     except requests.RequestException as e:
-        raise RuntimeError(f"VOICEVOXの声優一覧を取得できません: {e}") from e
+        raise RuntimeError(
+            "VOICEVOXの声優一覧を取得できません。\n" + voicevox_howto_start()
+            + f"\n（詳細: {e}）"
+        ) from e
     if r.status_code != 200:
         raise RuntimeError(
             f"VOICEVOXの声優一覧取得に失敗: HTTP {r.status_code} / {r.text[:200]}"
@@ -3084,6 +3114,25 @@ def init_state() -> None:
 # ---------------------------------------------------------------------------
 # Streamlit メイン
 # ---------------------------------------------------------------------------
+def begin_video_encoding(mode: str) -> bool:
+    """
+    動画作成モードへ入る。VOICEVOX 未接続なら False を返し、画面に手順を出す。
+    mode: "draft" または "final"
+    """
+    ok_vv_now, ver_vv_now = check_voicevox()
+    if not ok_vv_now:
+        st.error("VOICEVOX に接続できないため、動画を作成できません。")
+        st.info(voicevox_howto_start())
+        st.caption(f"詳細: {ver_vv_now}")
+        return False
+    st.session_state.video_export_mode = mode
+    st.session_state.video_encoding = True
+    st.session_state._export_job = "pending"
+    st.session_state.export_progress_pct = 0
+    st.session_state.export_progress_msg = ""
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 動画書き出し
 # ---------------------------------------------------------------------------
@@ -3098,8 +3147,9 @@ def run_video_export(progress, pct_box, status) -> None:
     ok, ver = check_voicevox()
     if not ok:
         raise RuntimeError(
-            "VOICEVOX に接続できません。アプリを起動してから再実行してください。"
-            f"（詳細: {ver}）"
+            "VOICEVOX に接続できません。\n"
+            + voicevox_howto_start()
+            + f"\n（詳細: {ver}）"
         )
 
     style_id = int(st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID))
@@ -3500,7 +3550,9 @@ def main() -> None:
         if ok:
             st.caption(f"VOICEVOX OK（{ver}）")
         else:
-            st.error(f"VOICEVOX 未接続: {ver}")
+            st.error("VOICEVOX 未接続")
+            st.caption(ver)
+            st.info(voicevox_howto_start())
 
     # ----- Step 1 -----
     st.write("1. 台本")
@@ -3554,12 +3606,11 @@ def main() -> None:
         est_min = max(1, round(n_chars / 320))
         st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
         st.caption(
-            "ルビ: `{表記|よみ}` または `｛表記｜よみ｝`（半角/全角は同等）→ "
-            "字幕は表記、VOICEVOX は読み。"
-            " 背景ヒント: `‹›` `〈〉` `<>` `＜＞`（同等）→ 台本には残し、"
-            "字幕・読み上げには出さず背景画像だけに使います。"
-            " `[注釈]` は字幕のみ（読み上げなし）。"
-            " 修正版 `ui-slim-20260812i`、MP4 は **最終版（背景あり）** で作り直してください。"
+            "ルビ: `{表記|よみ}` / `｛表記｜よみ｝` → 字幕は表記、VOICEVOX は読み。"
+            " 背景ヒント: `‹›` `〈〉` `<>` `＜＞` → 字幕・読み上げなし（背景のみ）。"
+            " 大かっこ: `[注釈]` / `［注釈］` → **字幕には出す**、VOICEVOX は読まない。"
+            " 修正版 `ui-slim-20260812j`。VOICEVOX 起動後に"
+            " **最終版（背景あり）** で MP4 を作り直してください。"
         )
         raw_key = ensure_editor_value(
             EDITOR_BASE_RAW, st.session_state.raw_script
@@ -3688,7 +3739,12 @@ def main() -> None:
         try:
             ok_vv, _ver = check_voicevox_cached()
             if not ok_vv:
-                st.warning("VOICEVOXに接続できません。起動して再読み込みしてください。")
+                st.warning(
+                    "VOICEVOX に接続できません。"
+                    " 先に VOICEVOX アプリを起動してから、"
+                    "ブラウザを再読み込みしてください。"
+                )
+                st.info(voicevox_howto_start())
             else:
                 speakers = fetch_voicevox_speakers_cached()
                 speaker_names = [
@@ -3841,12 +3897,9 @@ def main() -> None:
             else "3. 最終版MP4を作成する（背景あり）"
         )
         if st.button(gen_label, type="primary"):
-            # 次の描画で作業専用画面にし、他ボタンを出さない
-            st.session_state.video_encoding = True
-            st.session_state._export_job = "pending"
-            st.session_state.export_progress_pct = 0
-            st.session_state.export_progress_msg = ""
-            st.rerun()
+            mode_now = str(st.session_state.get("video_export_mode") or "draft")
+            if begin_video_encoding(mode_now):
+                st.rerun()
 
         mp4_path = st.session_state.get("mp4_path") or ""
         if mp4_path and Path(mp4_path).exists():
@@ -3942,12 +3995,8 @@ def main() -> None:
                     key="btn_recreate_draft_mp4",
                     use_container_width=True,
                 ):
-                    st.session_state.video_export_mode = "draft"
-                    st.session_state.video_encoding = True
-                    st.session_state._export_job = "pending"
-                    st.session_state.export_progress_pct = 0
-                    st.session_state.export_progress_msg = ""
-                    st.rerun()
+                    if begin_video_encoding("draft"):
+                        st.rerun()
             with col_final:
                 if st.button(
                     "最終版MP4を作成（背景あり）",
@@ -3955,12 +4004,8 @@ def main() -> None:
                     key="btn_create_final_mp4",
                     use_container_width=True,
                 ):
-                    st.session_state.video_export_mode = "final"
-                    st.session_state.video_encoding = True
-                    st.session_state._export_job = "pending"
-                    st.session_state.export_progress_pct = 0
-                    st.session_state.export_progress_msg = ""
-                    st.rerun()
+                    if begin_video_encoding("final"):
+                        st.rerun()
 
             # 別作品用の次原稿
             with st.expander("別の原稿で新しい動画を始める", expanded=False):
@@ -4130,6 +4175,22 @@ def _self_test_background_hints() -> None:
     assert half == "患者しんふぜんが来た。"
     full = voicevox_tts_from_ruby_text("患者｛心不全｜しんふぜん｝が来た。")
     assert full == "患者しんふぜんが来た。"
+
+    # 大かっこ [] / ［］ : 字幕には残し、VOICEVOX には送らない
+    for raw, want_sub, want_tts in (
+        ("患者が来た。[緊急]", "患者が来た。[緊急]", "患者が来た。"),
+        ("患者が来た。［緊急］", "患者が来た。［緊急］", "患者が来た。"),
+        ("患者が来た。[緊急］", "患者が来た。[緊急］", "患者が来た。"),
+        ("患者が来た。［緊急]", "患者が来た。［緊急]", "患者が来た。"),
+        ("前置き[注]本文。", "前置き[注]本文。", "前置き本文。"),
+    ):
+        br_segs = plan_narration_segments(raw)
+        assert br_segs, raw
+        assert br_segs[0]["text"] == want_sub, (raw, br_segs)
+        assert br_segs[0]["tts"] == want_tts, (raw, br_segs)
+        assert "[" not in br_segs[0]["tts"] and "［" not in br_segs[0]["tts"]
+        assert "]" not in br_segs[0]["tts"] and "］" not in br_segs[0]["tts"]
+    assert strip_square_bracket_segments("a[注]b［注2］c") == "abc"
 
 
 if __name__ == "__main__":
