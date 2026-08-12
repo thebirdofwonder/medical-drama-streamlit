@@ -222,7 +222,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812g"
+APP_BUILD = "ui-slim-20260812h"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -1287,8 +1287,8 @@ def shift_subtitle_cues(
 
 def strip_voicevox_ruby(text: str) -> str:
     """
-    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ などを外し、
-    字幕・表示用に「表記」だけ残す（半角/全角の区切りは区別しない）。
+    字幕用: {表記|よみ} / ｛表記｜よみ｝ では { と | の間（表記）だけ残す。
+    半角/全角の {｛ }｝ と |｜ は区別しない。
     """
     text = canonicalize_voicevox_ruby_delimiters(text or "")
     if not text:
@@ -1300,7 +1300,24 @@ def strip_voicevox_ruby(text: str) -> str:
     )
 
 
-# 背景指定ヒント（<> ＜＞ 〈〉 ‹› など）。字幕・読み上げには出さず、背景切替だけに使う
+def voicevox_tts_from_ruby_text(text: str) -> str:
+    """
+    VOICEVOX用: {表記|よみ} / ｛表記｜よみ｝ では | と } の間（読み）だけ残す。
+    半角/全角の {｛ }｝ と |｜ は区別しない。
+    """
+    text = canonicalize_voicevox_ruby_delimiters(text or "")
+    if not text:
+        return ""
+
+    def _repl(match: re.Match[str]) -> str:
+        surface = (match.group(1) or "").strip()
+        reading = normalize_voicevox_reading(match.group(2))
+        return reading if reading else surface
+
+    return _RUBY_TAG_RE.sub(_repl, text)
+
+
+# 背景指定ヒント（‹› 〈〉 <> ＜＞ など同等）。字幕・読み上げには出さず背景切替だけ
 # 開き／閉じの混在（例: <あ＞）や見た目が似た記号（《》❮❯ など）も拾う
 _BG_HINT_OPEN_CHARS = "＜<〈‹《〈⟨❮"
 _BG_HINT_CLOSE_CHARS = "＞>〉›》〉⟩❯"
@@ -1388,8 +1405,8 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
     """
     台本を「字幕用」「読み上げ用」「背景ヒント」に分ける。
     台本ファイル自体からはルビも 〈〉 も削除しない。
-    - text: 字幕（ルビ記号なし・〈〉なし。[] 注釈は残す）
-    - tts: VOICEVOX へ送る文（ルビは残す。〈〉 と [] は除く）
+    - text: 字幕（{表記|よみ} の表記部分。〈〉 ヒントなし。[] 注釈は残す）
+    - tts: VOICEVOX 用（{表記|よみ} の読み部分。〈〉 と [] は除く）
     - bg_hint: 背景画だけに使う（空文字可）
     """
     events = parse_script_background_events(script)
@@ -1416,11 +1433,11 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
             raw_chunk = strip_background_hint_segments(chunk).strip()
             if not raw_chunk:
                 continue
-            # 字幕: 表記だけ（ルビ記号・ヒントなし）
+            # 字幕: { と | の間（表記）
             display = strip_voicevox_ruby(raw_chunk).strip()
             display = strip_background_hint_segments(display).strip()
-            # 読み上げ: ルビは残し、[] とヒントだけ外す
-            tts_text = canonicalize_voicevox_ruby_delimiters(
+            # 読み上げ: | と } の間（読み）。[] と 〈〉 ヒントは除く
+            tts_text = voicevox_tts_from_ruby_text(
                 strip_square_bracket_segments(raw_chunk).strip()
             )
             tts_text = strip_background_hint_segments(tts_text).strip()
@@ -1683,9 +1700,9 @@ def generate_narration_wav_to_file(
             display_for_sub = strip_background_hint_segments(
                 strip_voicevox_ruby(str(seg.get("text") or ""))
             ).strip()
-            # 読み上げ: ヒントだけ外す（ルビは残す）
+            # 読み上げ: | と } の間（読み）
             tts_text = strip_background_hint_segments(
-                canonicalize_voicevox_ruby_delimiters(str(seg.get("tts") or ""))
+                voicevox_tts_from_ruby_text(str(seg.get("tts") or ""))
             ).strip()
             bg_hint_for_cue = str(seg.get("bg_hint") or "").strip()
             if not tts_text or not display_for_sub:
@@ -3102,9 +3119,7 @@ def run_video_export(progress, pct_box, status) -> None:
         strip_background_hint_segments(voice_script)
     )
     tts_for_log = strip_background_hint_segments(
-        strip_square_bracket_segments(
-            canonicalize_voicevox_ruby_delimiters(voice_script)
-        )
+        strip_square_bracket_segments(voicevox_tts_from_ruby_text(voice_script))
     )
     (OUTPUT_DIR / "last_script_tts.txt").write_text(tts_for_log, encoding="utf-8")
     (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
@@ -3515,11 +3530,12 @@ def main() -> None:
         est_min = max(1, round(n_chars / 320))
         st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
         st.caption(
-            "背景ヒント `〈手術室〉` とルビは、台本からは削除しません（追加もしません）。"
-            "字幕・読み上げでは `〈〉` は出さず、背景画像の選び方だけに使います。"
-            " `[注釈]` は字幕にだけ出し、読み上げません。"
-            " ※左サイドバーの修正版が `ui-slim-20260812g` 以降であること、"
-            "背景は **最終版（背景あり）** で MP4 を作り直してください。"
+            "ルビ: `{表記|よみ}` または `｛表記｜よみ｝`（半角/全角は同等）→ "
+            "字幕は表記、VOICEVOX は読み。"
+            " 背景ヒント: `‹›` `〈〉` `<>` `＜＞`（同等）→ 台本には残し、"
+            "字幕・読み上げには出さず背景画像だけに使います。"
+            " `[注釈]` は字幕のみ（読み上げなし）。"
+            " 修正版 `ui-slim-20260812h`、MP4 は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
             EDITOR_BASE_RAW, st.session_state.raw_script
@@ -4049,6 +4065,14 @@ def _self_test_background_hints() -> None:
     assert "{" not in ruby_segs[0]["text"] and "｛" not in ruby_segs[0]["text"]
     assert "〈" not in ruby_segs[0]["text"] and "〈" not in ruby_segs[0]["tts"]
     assert "しんふぜん" in ruby_segs[0]["tts"]
+    assert "心不全" not in ruby_segs[0]["tts"]
+
+    half = voicevox_tts_from_ruby_text("患者{心不全|しんふぜん}が来た。")
+    sub_half = strip_voicevox_ruby("患者{心不全|しんふぜん}が来た。")
+    assert sub_half == "患者心不全が来た。"
+    assert half == "患者しんふぜんが来た。"
+    full = voicevox_tts_from_ruby_text("患者｛心不全｜しんふぜん｝が来た。")
+    assert full == "患者しんふぜんが来た。"
 
 
 if __name__ == "__main__":
