@@ -59,6 +59,15 @@ if [ -d ".git" ]; then
   echo "いまの枝:"
   git branch --show-current 2>/dev/null || true
   echo ""
+
+  # pull でこのスクリプト自身が新しくなっても、いま動いているのは古い版のまま。
+  # 一度だけやり直して、新しい起動スクリプトで続きを実行する。
+  if [ "${MDS_REEXEC_AFTER_PULL:-}" != "1" ]; then
+    export MDS_REEXEC_AFTER_PULL=1
+    echo "最新の起動スクリプトでやり直します…"
+    echo ""
+    exec bash "$0" "$@"
+  fi
 else
   echo "注意: このフォルダは Git 管理ではありません。"
   echo "最新版が入っていない可能性があります。"
