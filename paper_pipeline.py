@@ -22,7 +22,16 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 # app.py 側の共通関数は呼び出し時に渡す／遅延 import する
 
 
-CLAUDE_MODEL_DEFAULT = "claude-sonnet-4-20250514"
+# 古い日付付きID（例: claude-sonnet-4-20250514）は API で 404 になる。
+# 上書きは環境変数 ANTHROPIC_MODEL / CLAUDE_MODEL、または .env。
+CLAUDE_MODEL_DEFAULT = "claude-sonnet-4-5"
+CLAUDE_MODEL_FALLBACKS = (
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-3-5-sonnet-latest",
+)
 TITLE_ACCENTS = [
     ("red", (140, 36, 36)),
     ("orange", (150, 78, 24)),
@@ -109,53 +118,83 @@ def strip_code_fence(text: str) -> str:
     return text.strip()
 
 
+def _claude_model_candidates(preferred: str = "") -> list[str]:
+    """使うモデル名の候補一覧（重複なし）。先頭から順に試す。"""
+    ordered: list[str] = []
+    for name in (
+        (preferred or "").strip(),
+        (os.environ.get("ANTHROPIC_MODEL") or "").strip(),
+        (os.environ.get("CLAUDE_MODEL") or "").strip(),
+        CLAUDE_MODEL_DEFAULT,
+        *CLAUDE_MODEL_FALLBACKS,
+    ):
+        if name and name not in ordered:
+            ordered.append(name)
+    return ordered or ["claude-sonnet-4-5"]
+
+
 def claude_messages(
     prompt: str,
     *,
     api_key: str,
-    model: str = CLAUDE_MODEL_DEFAULT,
+    model: str = "",
     max_tokens: int = 8000,
     system: str = "",
 ) -> str:
-    """Anthropic Messages API を呼び、テキストを返す。"""
+    """Anthropic Messages API を呼び、テキストを返す。
+
+    モデル名が 404（not_found）のときは、別の候補へ自動で切り替える。
+    """
     key = (api_key or "").strip()
     if not key:
         raise RuntimeError(
             "Anthropic APIキーがありません。"
             " 左の設定でキーを入れるか、.env に ANTHROPIC_API_KEY=... を書いてください。"
         )
-    body: dict[str, Any] = {
-        "model": model or CLAUDE_MODEL_DEFAULT,
-        "max_tokens": int(max_tokens),
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if system.strip():
-        body["system"] = system.strip()
-    r = http_session_direct().post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json=body,
-        timeout=180,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(
-            f"Claude API エラー HTTP {r.status_code}: {r.text[:500]}"
+    last_err = ""
+    for model_id in _claude_model_candidates(model):
+        body: dict[str, Any] = {
+            "model": model_id,
+            "max_tokens": int(max_tokens),
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system.strip():
+            body["system"] = system.strip()
+        r = http_session_direct().post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=body,
+            timeout=180,
         )
-    data = r.json()
-    parts = data.get("content") or []
-    texts = [
-        str(p.get("text") or "")
-        for p in parts
-        if isinstance(p, dict) and p.get("type") == "text"
-    ]
-    out = "\n".join(t for t in texts if t).strip()
-    if not out:
-        raise RuntimeError("Claude から空の応答が返りました。")
-    return out
+        if r.status_code == 404 and (
+            "not_found" in (r.text or "").lower() or "model" in (r.text or "").lower()
+        ):
+            last_err = f"HTTP 404 model={model_id}: {r.text[:300]}"
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"Claude API エラー HTTP {r.status_code}: {r.text[:500]}"
+            )
+        data = r.json()
+        parts = data.get("content") or []
+        texts = [
+            str(p.get("text") or "")
+            for p in parts
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        out = "\n".join(t for t in texts if t).strip()
+        if not out:
+            raise RuntimeError("Claude から空の応答が返りました。")
+        return out
+    raise RuntimeError(
+        "Claude API: 利用できるモデル名が見つかりませんでした。"
+        f" 最後のエラー: {last_err or '(なし)'}"
+        " .env に ANTHROPIC_MODEL=claude-sonnet-4-5 のように書いてみてください。"
+    )
 
 
 def fetch_paper_from_url(url: str, extract_pdf_bytes: Callable[[bytes], str]) -> str:
