@@ -1,8 +1,7 @@
 【背景静止画の使い方】
 
 1. 背景画は別途事前に作成する
-2. 必ずこのフォルダに保存する:
-   /workspace/custom_backgrounds
+2. 必ずこのフォルダ（custom_backgrounds）に保存する
    （デスクトップや別フォルダでは読み込まれません）
 3. 形式: .jpg または .png
 4. ファイル名は、台本の 〈〉 内の文字と完全に同じ
@@ -16,4 +15,4 @@
 5. アプリで「最終版（背景あり）」の MP4 を作る
 
 ※ フォルダ名は custom_backgrounds
-※ 見つからないときは outputs/last_bg_schedule.txt を確認
+※ 見つからないときは outputs/last_custom_bg_debug.txt を確認
