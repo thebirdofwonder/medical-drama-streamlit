@@ -1,10 +1,9 @@
 #!/bin/bash
 # 最新版を取り込んでから、医学ドラマ動画メーカーを起動します。
 # Finder でこのファイルをダブルクリックするか、
-# ターミナルで: bash 更新して起動.command
+# ターミナルで: bash "更新して起動.command"
 
-set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 BRANCH="cursor/cloud-agent-1786051249580-ewceu"
 NEED_BUILD="ui-slim-202608"
@@ -20,21 +19,37 @@ echo ""
 if [ ! -f "app.py" ]; then
   echo "エラー: このフォルダに app.py がありません。"
   echo "正しいプロジェクトフォルダで実行してください。"
+  echo "例: cd ~/Documents/Cursor/medical-drama-app"
   read -r -p "Enter で閉じる…"
   exit 1
 fi
 
+# Git の失敗で起動まで進まない、という状態を防ぐ
 if [ -d ".git" ]; then
   echo "GitHub から最新版を取得中…"
   echo "  枝（ブランチ）: $BRANCH"
-  git fetch origin "$BRANCH" || git fetch origin
-  git checkout "$BRANCH"
-  git pull origin "$BRANCH"
+  echo ""
+
+  # ローカルだけの変更が pull を邪魔することがあるので退避
+  if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+    echo "注意: このフォルダに未保存の変更があります。"
+    echo "  いったん退避（stash）してから最新版を取ります。"
+    git stash push -u -m "auto-stash-before-update-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  fi
+
+  git fetch origin "$BRANCH" 2>&1 || git fetch origin 2>&1 || echo "警告: fetch に失敗しました（ネット確認）"
+  git checkout "$BRANCH" 2>&1 || echo "警告: checkout に失敗しました"
+  if ! git pull --ff-only origin "$BRANCH" 2>&1; then
+    echo "警告: 早送り pull に失敗しました。強制的に remote に合わせます…"
+    git fetch origin "$BRANCH" 2>&1 || true
+    git reset --hard "origin/$BRANCH" 2>&1 || echo "警告: reset にも失敗しました"
+  fi
+
   echo ""
   echo "いまの版:"
-  git log -1 --oneline || true
+  git log -1 --oneline 2>/dev/null || true
   echo "いまの枝:"
-  git branch --show-current || true
+  git branch --show-current 2>/dev/null || true
   echo ""
 else
   echo "注意: このフォルダは Git 管理ではありません。"
@@ -42,16 +57,23 @@ else
   echo ""
 fi
 
-# app.py に修正版番号があるか確認（古い main のままだと取り込みが失敗する）
+# 必須ファイル確認
+if [ ! -f "paper_pipeline.py" ]; then
+  echo "========================================"
+  echo " エラー: paper_pipeline.py がありません。"
+  echo " 最新版の取得に失敗している可能性があります。"
+  echo "========================================"
+  read -r -p "Enter で閉じる…"
+  exit 1
+fi
+
 BUILD_LINE="$(grep -E '^APP_BUILD\s*=' app.py | head -1 || true)"
 echo "app.py の修正版: $BUILD_LINE"
 if echo "$BUILD_LINE" | grep -q "$NEED_BUILD"; then
-  echo "OK: 取り込みエラー修正版が入っています。"
+  echo "OK: 新しい修正版が入っています。"
 else
   echo "========================================"
   echo " 警告: まだ古い app.py のようです。"
-  echo " 左の「設定」に 修正版: ui-slim-20260810… が"
-  echo " 出ない場合は、別フォルダを開いている可能性があります。"
   echo "========================================"
   echo ""
   read -r -p "このまま起動しますか？ (y/N): " ans
@@ -62,32 +84,37 @@ else
 fi
 echo ""
 
-# 自由文の背景画像フォルダを必ず用意する
+# 背景フォルダ
 mkdir -p "./custom_backgrounds"
-cat > "./custom_backgrounds/使い方.txt" <<'EOF'
+if [ ! -f "./custom_backgrounds/使い方.txt" ]; then
+  cat > "./custom_backgrounds/使い方.txt" <<'EOF'
 【背景静止画の使い方】
-
 1. 背景画は別途事前に作成する
-2. このフォルダ（custom_backgrounds）に保存する
-   形式: .jpg または .png
-3. ファイル名は、台本の 〈〉 内の文字と完全に同じにする
-
-例:
-  台本: 〈夜の暗い手術室〉
-  ファイル: 夜の暗い手術室.jpg
-        または 夜の暗い手術室.png
-
-4. アプリで「最終版（背景あり）」の MP4 を作る
-
-※ フォルダ名は custom_backgrounds（bacgrounds ではなく backgrounds）
-※ このアプリは文章から自動で絵を描きません
+2. このフォルダ（custom_backgrounds）に .jpg または .png で保存
+3. ファイル名は台本の 〈〉 内の文字と同じにする
+4. 「最終版（背景あり）」で MP4 を作る
 EOF
+fi
 echo "背景画像フォルダ:"
 echo "  $(pwd)/custom_backgrounds"
-# macOS なら Finder で開く
-if command -v open >/dev/null 2>&1; then
-  open "./custom_backgrounds" || true
+echo ""
+
+# 依存パッケージの最低限チェック
+echo "起動前チェック…"
+if ! python3 -c "import streamlit, requests, docx, PIL, pypdf" 2>/dev/null; then
+  echo "必要な Python パッケージが不足しています。インストールを試します…"
+  python3 -m pip install -r requirements.txt --user
 fi
+if ! python3 -c "import app" 2>/dev/null; then
+  echo "========================================"
+  echo " エラー: app.py を読み込めません。"
+  echo " 下の詳細をコピーして共有してください。"
+  echo "========================================"
+  python3 -c "import app" 2>&1 || true
+  read -r -p "Enter で閉じる…"
+  exit 1
+fi
+echo "OK: アプリの読み込み確認できました。"
 echo ""
 
 exec bash "./起動する.command"
