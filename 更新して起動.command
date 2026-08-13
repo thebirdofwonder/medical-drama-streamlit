@@ -64,18 +64,24 @@ echo ""
 
 # 自由文の背景画像フォルダを必ず用意する
 mkdir -p "./custom_backgrounds"
-if [ ! -f "./custom_backgrounds/使い方.txt" ]; then
-  cat > "./custom_backgrounds/使い方.txt" <<'EOF'
-【自由文の背景の使い方】
-1. 台本に 〈夜の暗い手術室〉 のように書く
-2. このフォルダに、同じ名前の画像を置く
-   例: 夜の暗い手術室.jpg  /  夜の暗い手術室.png
-3. アプリで「最終版（背景あり）」の MP4 を作る
+cat > "./custom_backgrounds/使い方.txt" <<'EOF'
+【背景静止画の使い方】
 
-※ 画像は自分で用意するか、別の画像生成サービスで作って保存してください。
-※ このアプリ自体は、文章から自動で絵を描きません。
+1. 背景画は別途事前に作成する
+2. このフォルダ（custom_backgrounds）に保存する
+   形式: .jpg または .png
+3. ファイル名は、台本の 〈〉 内の文字と完全に同じにする
+
+例:
+  台本: 〈夜の暗い手術室〉
+  ファイル: 夜の暗い手術室.jpg
+        または 夜の暗い手術室.png
+
+4. アプリで「最終版（背景あり）」の MP4 を作る
+
+※ フォルダ名は custom_backgrounds（bacgrounds ではなく backgrounds）
+※ このアプリは文章から自動で絵を描きません
 EOF
-fi
 echo "背景画像フォルダ:"
 echo "  $(pwd)/custom_backgrounds"
 # macOS なら Finder で開く

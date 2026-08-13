@@ -31,15 +31,13 @@ echo ""
 
 # 自由文の背景画像フォルダを必ず用意する
 mkdir -p "./custom_backgrounds"
-if [ ! -f "./custom_backgrounds/使い方.txt" ]; then
-  cat > "./custom_backgrounds/使い方.txt" <<'EOF'
-【自由文の背景の使い方】
-1. 台本に 〈夜の暗い手術室〉 のように書く
-2. このフォルダに、同じ名前の画像を置く
-   例: 夜の暗い手術室.jpg  /  夜の暗い手術室.png
-3. アプリで「最終版（背景あり）」の MP4 を作る
+cat > "./custom_backgrounds/使い方.txt" <<'EOF'
+【背景静止画の使い方】
+1. 背景画は別途事前に作成する
+2. このフォルダ（custom_backgrounds）に .jpg または .png で保存
+3. ファイル名は台本の 〈〉 内の文字と同じにする
+4. 「最終版（背景あり）」で MP4 を作る
 EOF
-fi
 echo "背景画像フォルダ:"
 echo "  $(pwd)/custom_backgrounds"
 echo ""

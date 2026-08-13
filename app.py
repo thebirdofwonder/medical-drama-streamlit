@@ -74,9 +74,16 @@ OUTPUT_DIR = WORK_DIR / "outputs"
 # 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
 MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
 LANDSCAPE_DIR = MEDICAL_BG_DIR  # 互換エイリアス
-# 〈自由文〉用の背景静止画を置くフォルダ（ファイル名＝ヒント文）
+# 〈〉 と同じ名前の jpg/png を置くフォルダ（事前作成した背景静止画）
 CUSTOM_BG_DIR = WORK_DIR / "custom_backgrounds"
-CUSTOM_BG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+# よくある誤字フォルダ名も探す（custom_bacgrounds）
+CUSTOM_BG_DIR_ALIASES = (
+    CUSTOM_BG_DIR,
+    WORK_DIR / "custom_bacgrounds",
+)
+CUSTOM_BG_EXTENSIONS = (".jpg", ".jpeg", ".png")
+# 同じ名前で複数あるときの優先順
+_CUSTOM_BG_EXT_PRIORITY = {".jpg": 0, ".jpeg": 1, ".png": 2}
 # 参考文献の前回入力（outputs/ は GitHub に上がらない）
 REFERENCE_SAVE_PATH = OUTPUT_DIR / "last_reference.txt"
 
@@ -225,7 +232,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812o"
+APP_BUILD = "ui-slim-20260812p"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -2497,21 +2504,28 @@ def ensure_landscape_images(needed: int | list[int]) -> list[Path]:
 
 
 def ensure_custom_background_dir() -> Path:
-    """自由文ヒント用の画像フォルダを用意する。"""
+    """事前作成した背景画像用フォルダ custom_backgrounds を用意する。"""
     CUSTOM_BG_DIR.mkdir(parents=True, exist_ok=True)
     guide = CUSTOM_BG_DIR / "使い方.txt"
-    if not guide.exists():
-        guide.write_text(
-            "【自由文の背景の使い方】\n"
-            "1. 台本に 〈夜の暗い手術室〉 のように書く\n"
-            "2. このフォルダに、同じ名前の画像を置く\n"
-            "   例: 夜の暗い手術室.jpg  /  夜の暗い手術室.png\n"
-            "3. アプリで「最終版（背景あり）」の MP4 を作る\n"
-            "\n"
-            "※ 画像は自分で用意するか、別の画像生成サービスで作って保存してください。\n"
-            "※ このアプリ自体は、文章から自動で絵を描きません。\n",
-            encoding="utf-8",
-        )
+    guide.write_text(
+        "【背景静止画の使い方】\n"
+        "\n"
+        "1. 背景画は別途事前に作成する\n"
+        "2. このフォルダ（custom_backgrounds）に保存する\n"
+        "   形式: .jpg または .png\n"
+        "3. ファイル名は、台本の 〈〉 内の文字と完全に同じにする\n"
+        "\n"
+        "例:\n"
+        "  台本: 〈夜の暗い手術室〉\n"
+        "  ファイル: 夜の暗い手術室.jpg\n"
+        "        または 夜の暗い手術室.png\n"
+        "\n"
+        "4. アプリで「最終版（背景あり）」の MP4 を作る\n"
+        "\n"
+        "※ フォルダ名は custom_backgrounds（backgrounds のスペルに注意）\n"
+        "※ このアプリは文章から自動で絵を描きません\n",
+        encoding="utf-8",
+    )
     return CUSTOM_BG_DIR
 
 
@@ -2535,28 +2549,43 @@ def _hint_filename_candidates(hint: str) -> list[str]:
 
 def find_custom_background_image(hint: str) -> Path | None:
     """
-    〈自由文〉に対応する画像を custom_backgrounds/ から探す。
-    ファイル名（拡張子を除く）がヒント文と一致すれば採用。
+    〈〉内の文字と同じ名前の jpg/png を custom_backgrounds から探す。
+    見つかった画像を、そのシーンの背景静止画として使う。
     """
     ensure_custom_background_dir()
     candidates = _hint_filename_candidates(hint)
     if not candidates:
         return None
-    files = [
-        p
-        for p in CUSTOM_BG_DIR.iterdir()
-        if p.is_file()
-        and p.suffix.lower() in CUSTOM_BG_EXTENSIONS
-        and not p.name.startswith(".")
-    ]
-    by_stem = {p.stem: p for p in files}
-    by_stem_lower = {p.stem.lower(): p for p in files}
+
+    files: list[Path] = []
+    for folder in CUSTOM_BG_DIR_ALIASES:
+        if not folder.is_dir():
+            continue
+        for p in folder.iterdir():
+            if (
+                p.is_file()
+                and p.suffix.lower() in CUSTOM_BG_EXTENSIONS
+                and not p.name.startswith(".")
+                and p.name != "使い方.txt"
+            ):
+                files.append(p)
+    if not files:
+        return None
+
+    # 同じ stem で jpg/png が両方あるときは jpg を優先
+    def _rank(path: Path) -> tuple[int, str]:
+        return (_CUSTOM_BG_EXT_PRIORITY.get(path.suffix.lower(), 99), path.name)
+
+    by_stem: dict[str, list[Path]] = {}
+    by_stem_lower: dict[str, list[Path]] = {}
+    for p in files:
+        by_stem.setdefault(p.stem, []).append(p)
+        by_stem_lower.setdefault(p.stem.lower(), []).append(p)
+
     for cand in candidates:
-        if cand in by_stem:
-            return by_stem[cand]
-        hit = by_stem_lower.get(cand.lower())
-        if hit is not None:
-            return hit
+        pool = by_stem.get(cand) or by_stem_lower.get(cand.lower())
+        if pool:
+            return sorted(pool, key=_rank)[0]
     return None
 
 
@@ -3773,11 +3802,10 @@ def main() -> None:
         st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
         st.caption(
             "ルビ: `{表記|よみ}` / `｛表記｜よみ｝` → 字幕は表記、VOICEVOX は読み。"
-            " 背景ヒント: 段落冒頭に `〈手術室〉`。"
-            " 自由文（例: `〈夜の暗い手術室〉`）は"
-            " `custom_backgrounds` フォルダに同名画像を置く。"
+            " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
+            " ファイル名を `〈〉` 内の文字と同一にする。"
             " 大かっこ: `[注釈]` → 字幕のみ。"
-            " 修正版 `ui-slim-20260812o`。"
+            " 修正版 `ui-slim-20260812p`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
@@ -4060,21 +4088,22 @@ def main() -> None:
             "最初と読み直しのあいだはドラフト（背景なし）。"
             " 〈〉 の背景指示を反映するには **最終版（背景あり）** を選んでください。"
         )
-        with st.expander("自由文の背景画像の置き方", expanded=False):
+        with st.expander("背景画像（custom_backgrounds）の置き方", expanded=False):
             ensure_custom_background_dir()
             st.markdown(
                 f"""
-1. 台本に `〈夜の暗い手術室〉` のように書く  
-2. Finder で次のフォルダを開く:  
-   `{CUSTOM_BG_DIR}`  
-3. **同じ名前** の画像を置く（例: `夜の暗い手術室.jpg`）  
-4. **最終版（背景あり）** で MP4 を作る  
+**ルール**
+1. 背景画は **別途事前に作成** する  
+2. フォルダ `{CUSTOM_BG_DIR}` に保存する（名前は **custom_backgrounds**）  
+3. 形式は **.jpg** または **.png**  
+4. ファイル名は台本の `〈〉` 内の文字と **同じ**  
 
-このアプリは文章から自動で絵を描きません。  
-画像は写真を使うか、別の画像生成サービスで作って保存してください。
+例: 台本が `〈夜の暗い手術室〉` なら、ファイルは `夜の暗い手術室.jpg`
+
+そのあと **最終版（背景あり）** で MP4 を作ります。
                 """.strip()
             )
-            if st.button("背景フォルダを開く準備をする", key="btn_ensure_custom_bg"):
+            if st.button("背景フォルダを今すぐ作る", key="btn_ensure_custom_bg"):
                 ensure_custom_background_dir()
                 st.success(f"用意しました: {CUSTOM_BG_DIR}")
 
