@@ -30,6 +30,10 @@ if [ -d ".git" ]; then
   echo "  枝（ブランチ）: $BRANCH"
   echo ""
 
+  # 使い方.txt など、自動生成ファイルのローカル差分で pull が止まらないようにする
+  git checkout -- "custom_backgrounds/使い方.txt" 2>/dev/null || true
+  git restore -- "custom_backgrounds/使い方.txt" 2>/dev/null || true
+
   # ローカルだけの変更が pull を邪魔することがあるので退避
   if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
     echo "注意: このフォルダに未保存の変更があります。"
@@ -40,9 +44,13 @@ if [ -d ".git" ]; then
   git fetch origin "$BRANCH" 2>&1 || git fetch origin 2>&1 || echo "警告: fetch に失敗しました（ネット確認）"
   git checkout "$BRANCH" 2>&1 || echo "警告: checkout に失敗しました"
   if ! git pull --ff-only origin "$BRANCH" 2>&1; then
-    echo "警告: 早送り pull に失敗しました。強制的に remote に合わせます…"
-    git fetch origin "$BRANCH" 2>&1 || true
-    git reset --hard "origin/$BRANCH" 2>&1 || echo "警告: reset にも失敗しました"
+    echo "警告: 早送り pull に失敗しました。使い方.txt を捨てて再試行します…"
+    git checkout -- "custom_backgrounds/使い方.txt" 2>/dev/null || true
+    if ! git pull --ff-only origin "$BRANCH" 2>&1; then
+      echo "警告: まだ失敗したので、remote に強制的に合わせます…"
+      git fetch origin "$BRANCH" 2>&1 || true
+      git reset --hard "origin/$BRANCH" 2>&1 || echo "警告: reset にも失敗しました"
+    fi
   fi
 
   echo ""
