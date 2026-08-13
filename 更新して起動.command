@@ -62,4 +62,26 @@ else
 fi
 echo ""
 
+# 自由文の背景画像フォルダを必ず用意する
+mkdir -p "./custom_backgrounds"
+if [ ! -f "./custom_backgrounds/使い方.txt" ]; then
+  cat > "./custom_backgrounds/使い方.txt" <<'EOF'
+【自由文の背景の使い方】
+1. 台本に 〈夜の暗い手術室〉 のように書く
+2. このフォルダに、同じ名前の画像を置く
+   例: 夜の暗い手術室.jpg  /  夜の暗い手術室.png
+3. アプリで「最終版（背景あり）」の MP4 を作る
+
+※ 画像は自分で用意するか、別の画像生成サービスで作って保存してください。
+※ このアプリ自体は、文章から自動で絵を描きません。
+EOF
+fi
+echo "背景画像フォルダ:"
+echo "  $(pwd)/custom_backgrounds"
+# macOS なら Finder で開く
+if command -v open >/dev/null 2>&1; then
+  open "./custom_backgrounds" || true
+fi
+echo ""
+
 exec bash "./起動する.command"

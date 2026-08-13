@@ -225,7 +225,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812n"
+APP_BUILD = "ui-slim-20260812o"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -3628,6 +3628,8 @@ def main() -> None:
     maybe_reset_session_from_query()
     wipe_session_if_legacy_editor_widget()
     init_state()
+    # 自由文背景フォルダは起動時に必ず作る（Finder で見えるようにする）
+    ensure_custom_background_dir()
     # 旧版の入力欄キーが残っていると取り込みが失敗するため、最初に消す
     purge_legacy_editor_keys()
     # ウィジェット生成前に、予約アクション → 入力欄の値反映 の順で済ませる
@@ -3719,6 +3721,10 @@ def main() -> None:
             st.error("VOICEVOX 未接続")
             st.caption(ver)
             st.info(voicevox_howto_start())
+        st.caption(f"背景画像フォルダ: `{CUSTOM_BG_DIR}`")
+        if st.button("背景フォルダを今すぐ作る", key="btn_sidebar_make_custom_bg"):
+            path = ensure_custom_background_dir()
+            st.success(f"作成しました: {path}")
 
     # ----- Step 1 -----
     st.write("1. 台本")
@@ -3771,7 +3777,7 @@ def main() -> None:
             " 自由文（例: `〈夜の暗い手術室〉`）は"
             " `custom_backgrounds` フォルダに同名画像を置く。"
             " 大かっこ: `[注釈]` → 字幕のみ。"
-            " 修正版 `ui-slim-20260812n`。"
+            " 修正版 `ui-slim-20260812o`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(

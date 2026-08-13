@@ -28,6 +28,21 @@ echo ""
 echo "起動後、ブラウザで次を開きます:"
 echo "  http://localhost:8501/?reset=1"
 echo ""
+
+# 自由文の背景画像フォルダを必ず用意する
+mkdir -p "./custom_backgrounds"
+if [ ! -f "./custom_backgrounds/使い方.txt" ]; then
+  cat > "./custom_backgrounds/使い方.txt" <<'EOF'
+【自由文の背景の使い方】
+1. 台本に 〈夜の暗い手術室〉 のように書く
+2. このフォルダに、同じ名前の画像を置く
+   例: 夜の暗い手術室.jpg  /  夜の暗い手術室.png
+3. アプリで「最終版（背景あり）」の MP4 を作る
+EOF
+fi
+echo "背景画像フォルダ:"
+echo "  $(pwd)/custom_backgrounds"
+echo ""
 echo "止めるときは、この窓で Ctrl+C を押してください。"
 echo ""
 
