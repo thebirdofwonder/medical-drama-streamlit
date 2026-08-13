@@ -2539,8 +2539,7 @@ def ensure_custom_background_dir() -> Path:
         "【背景静止画の使い方】\n"
         "\n"
         "1. 背景画は別途事前に作成する\n"
-        "2. 必ずこのフォルダに保存する:\n"
-        f"   {CUSTOM_BG_DIR}\n"
+        "2. 必ずこのフォルダ（custom_backgrounds）に保存する\n"
         "   （デスクトップや別フォルダでは読み込まれません）\n"
         "3. 形式: .jpg または .png\n"
         "4. ファイル名は、台本の 〈〉 内の文字と完全に同じ\n"
@@ -2554,7 +2553,7 @@ def ensure_custom_background_dir() -> Path:
         "5. アプリで「最終版（背景あり）」の MP4 を作る\n"
         "\n"
         "※ フォルダ名は custom_backgrounds\n"
-        "※ 見つからないときは outputs/last_bg_schedule.txt を確認\n",
+        "※ 見つからないときは outputs/last_custom_bg_debug.txt を確認\n",
         encoding="utf-8",
     )
     return CUSTOM_BG_DIR
