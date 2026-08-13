@@ -232,7 +232,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812p"
+APP_BUILD = "ui-slim-20260812q"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -1462,8 +1462,8 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
     """
     台本を「字幕用」「読み上げ用」「背景ヒント」に分ける。
     台本ファイル自体からはルビも 〈〉 も削除しない。
-    - text: 字幕（{表記|よみ} の表記部分。山括弧ヒントなし。[] 注釈は残す）
-    - tts: VOICEVOX 用（{表記|よみ} の読み部分。山括弧ヒントと [] は除く）
+    - text: 字幕（{表記|よみ} の表記。山括弧ヒントなし。[注釈] は中身だけ・かっこは出さない）
+    - tts: VOICEVOX 用（{表記|よみ} の読み。山括弧ヒントと [] 注釈は除く）
     - bg_hint: 背景画だけに使う（空文字可）
     """
     events = parse_script_background_events(script)
@@ -1512,11 +1512,13 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
             raw_chunk = strip_background_hint_segments(chunk).strip()
             if not raw_chunk:
                 continue
-            # 字幕: { と | の間（表記）。山括弧ヒントは絶対に残さない
+            # 字幕: { と | の間（表記）。山括弧ヒントなし。
+            # [注釈] は中身だけ残し、大かっこ自体は出さない
             display = strip_background_hint_segments(
                 strip_voicevox_ruby(raw_chunk)
             ).strip()
-            # 読み上げ: | と } の間（読み）。[] と山括弧ヒントは除く
+            display = keep_square_bracket_inners_for_subtitle(display).strip()
+            # 読み上げ: | と } の間（読み）。[] 注釈ごと・山括弧ヒントは除く
             tts_text = strip_background_hint_segments(
                 voicevox_tts_from_ruby_text(
                     strip_square_bracket_segments(raw_chunk).strip()
@@ -1526,8 +1528,10 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
                 if display:
                     pending_subtitle = f"{pending_subtitle}{display}"
                 continue
-            display_for_sub = strip_background_hint_segments(
-                f"{pending_subtitle}{display}"
+            display_for_sub = keep_square_bracket_inners_for_subtitle(
+                strip_background_hint_segments(
+                    f"{pending_subtitle}{display}"
+                )
             ).strip()
             pending_subtitle = ""
             if not display_for_sub:
@@ -1547,25 +1551,42 @@ def plan_narration_segments(script: str) -> list[dict[str, str]]:
             )
 
     if pending_subtitle and segments:
-        segments[-1]["text"] = strip_background_hint_segments(
-            str(segments[-1].get("text") or "") + pending_subtitle
+        segments[-1]["text"] = keep_square_bracket_inners_for_subtitle(
+            strip_background_hint_segments(
+                str(segments[-1].get("text") or "") + pending_subtitle
+            )
         ).strip()
     return segments
 
 
-# 字幕には残し、VOICEVOXには渡さない括弧（半角・全角の組み合わせを区別しない）
-_SQUARE_BRACKET_SEGMENT_RE = re.compile(r"[\[［][^\[［\]］]*[\]］]")
+# 大かっこ [] / ［］（半角・全角の組み合わせは区別しない）
+# グループ1 = 中身（字幕用）。全体マッチ = 読み上げから除去する単位。
+_SQUARE_BRACKET_SEGMENT_RE = re.compile(r"[\[［]([^\[［\]］]*)[\]］]")
 
 
 def strip_square_bracket_segments(text: str) -> str:
     """
-    [ … ] / ［ … ］ / [ … ］ / ［ … ] で囲んだ部分を取り除く。
-    （読み上げ用。字幕用テキストからは呼ばない）
+    [ … ] / ［ … ］ / [ … ］ / ［ … ] を中身ごと取り除く。
+    （VOICEVOX 読み上げ用。字幕用では使わない）
     """
     if not text:
         return ""
     out = _SQUARE_BRACKET_SEGMENT_RE.sub("", text)
-    # 取り除いたあとの余分な空白を整える
+    out = re.sub(r"[ \t\u3000]{2,}", " ", out)
+    out = re.sub(r" *\n *", "\n", out)
+    return out.strip()
+
+
+def keep_square_bracket_inners_for_subtitle(text: str) -> str:
+    """
+    字幕用: [内容] / ［内容］ は「内容」だけ残し、大かっこ自体は消す。
+    半角・全角の組み合わせ（[］ ［]）も同等。
+    """
+    if not text:
+        return ""
+    out = _SQUARE_BRACKET_SEGMENT_RE.sub(r"\1", text)
+    # 万一残った単独の大かっこも消す
+    out = re.sub(r"[\[［\]］]", "", out)
     out = re.sub(r"[ \t\u3000]{2,}", " ", out)
     out = re.sub(r" *\n *", "\n", out)
     return out.strip()
@@ -1605,8 +1626,10 @@ def expand_subtitle_cues_for_display(
     per_page = max(1, int(max_lines))
     out: list[dict[str, Any]] = []
     for cue in cues:
-        text = strip_background_hint_segments(
-            strip_voicevox_ruby(str(cue.get("text") or ""))
+        text = keep_square_bracket_inners_for_subtitle(
+            strip_background_hint_segments(
+                strip_voicevox_ruby(str(cue.get("text") or ""))
+            )
         ).strip()
         start = float(cue.get("start", 0))
         end = float(cue.get("end", 0))
@@ -1661,9 +1684,9 @@ def create_subtitle_png(
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     font = load_jp_font(SUBTITLE_FONT_SIZE, bold=True)
-    # 最終防衛: 描画直前に <> 背景ヒントを必ず除去する
-    safe_text = strip_background_hint_segments(
-        strip_voicevox_ruby(text or "")
+    # 最終防衛: 描画直前に <> 背景ヒントを除去し、大かっこは中身だけ残す
+    safe_text = keep_square_bracket_inners_for_subtitle(
+        strip_background_hint_segments(strip_voicevox_ruby(text or ""))
     ).strip()
     if lines is None:
         lines = wrap_text_to_width(safe_text, font, int(w * 0.86), draw)
@@ -1672,8 +1695,8 @@ def create_subtitle_png(
         for ln in lines:
             if ln is None:
                 continue
-            cleaned = strip_background_hint_segments(
-                strip_voicevox_ruby(str(ln))
+            cleaned = keep_square_bracket_inners_for_subtitle(
+                strip_background_hint_segments(strip_voicevox_ruby(str(ln)))
             ).strip()
             if cleaned:
                 cleaned_lines.append(cleaned)
@@ -1766,12 +1789,16 @@ def generate_narration_wav_to_file(
             if progress_callback:
                 progress_callback(i, len(segments))
             part = part_dir / f"part_{i:05d}.wav"
-            display_for_sub = strip_background_hint_segments(
-                strip_voicevox_ruby(str(seg.get("text") or ""))
+            display_for_sub = keep_square_bracket_inners_for_subtitle(
+                strip_background_hint_segments(
+                    strip_voicevox_ruby(str(seg.get("text") or ""))
+                )
             ).strip()
-            # 読み上げ: | と } の間（読み）
+            # 読み上げ: | と } の間（読み）。[] 注釈は送らない
             tts_text = strip_background_hint_segments(
-                voicevox_tts_from_ruby_text(str(seg.get("tts") or ""))
+                voicevox_tts_from_ruby_text(
+                    strip_square_bracket_segments(str(seg.get("tts") or ""))
+                )
             ).strip()
             bg_hint_for_cue = str(seg.get("bg_hint") or "").strip()
             if not tts_text or not display_for_sub:
@@ -3036,14 +3063,18 @@ def build_mp4(
         for i, cue in enumerate(display_cues):
             start = float(cue.get("start", 0))
             end = float(cue.get("end", 0))
-            text = strip_background_hint_segments(
-                strip_voicevox_ruby(str(cue.get("text") or ""))
+            text = keep_square_bracket_inners_for_subtitle(
+                strip_background_hint_segments(
+                    strip_voicevox_ruby(str(cue.get("text") or ""))
+                )
             ).strip()
             page_lines = cue.get("lines")
             if isinstance(page_lines, list):
                 page_lines = [
-                    strip_background_hint_segments(
-                        strip_voicevox_ruby(str(x))
+                    keep_square_bracket_inners_for_subtitle(
+                        strip_background_hint_segments(
+                            strip_voicevox_ruby(str(x))
+                        )
                     ).strip()
                     for x in page_lines
                 ]
@@ -3365,9 +3396,9 @@ def run_video_export(progress, pct_box, status) -> None:
     script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
     # 旧固定名も残す（互換）
     (OUTPUT_DIR / "last_script.docx").write_bytes(script_docx_path.read_bytes())
-    # ログ用: 字幕は表記のみ、読み上げはルビ残し・ヒントと [] を外す
-    subtitle_for_log = strip_voicevox_ruby(
-        strip_background_hint_segments(voice_script)
+    # ログ用: 字幕は表記＋[]中身（かっこなし）、読み上げはヒントと [] を外す
+    subtitle_for_log = keep_square_bracket_inners_for_subtitle(
+        strip_voicevox_ruby(strip_background_hint_segments(voice_script))
     )
     tts_for_log = strip_background_hint_segments(
         strip_square_bracket_segments(voicevox_tts_from_ruby_text(voice_script))
@@ -3804,8 +3835,8 @@ def main() -> None:
             "ルビ: `{表記|よみ}` / `｛表記｜よみ｝` → 字幕は表記、VOICEVOX は読み。"
             " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
             " ファイル名を `〈〉` 内の文字と同一にする。"
-            " 大かっこ: `[注釈]` → 字幕のみ。"
-            " 修正版 `ui-slim-20260812p`。"
+            " 大かっこ: `[注釈]` → 字幕は中身だけ（かっこは出さない）、VOICEVOX は読まない。"
+            " 修正版 `ui-slim-20260812q`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
@@ -4453,21 +4484,23 @@ def _self_test_background_hints() -> None:
     full = voicevox_tts_from_ruby_text("患者｛心不全｜しんふぜん｝が来た。")
     assert full == "患者しんふぜんが来た。"
 
-    # 大かっこ [] / ［］ : 字幕には残し、VOICEVOX には送らない
+    # 大かっこ [] / ［］ : 字幕は中身だけ（かっこなし）、VOICEVOX には送らない
     for raw, want_sub, want_tts in (
-        ("患者が来た。[緊急]", "患者が来た。[緊急]", "患者が来た。"),
-        ("患者が来た。［緊急］", "患者が来た。［緊急］", "患者が来た。"),
-        ("患者が来た。[緊急］", "患者が来た。[緊急］", "患者が来た。"),
-        ("患者が来た。［緊急]", "患者が来た。［緊急]", "患者が来た。"),
-        ("前置き[注]本文。", "前置き[注]本文。", "前置き本文。"),
+        ("患者が来た。[緊急]", "患者が来た。緊急", "患者が来た。"),
+        ("患者が来た。［緊急］", "患者が来た。緊急", "患者が来た。"),
+        ("患者が来た。[緊急］", "患者が来た。緊急", "患者が来た。"),
+        ("患者が来た。［緊急]", "患者が来た。緊急", "患者が来た。"),
+        ("前置き[注]本文。", "前置き注本文。", "前置き本文。"),
     ):
         br_segs = plan_narration_segments(raw)
         assert br_segs, raw
         assert br_segs[0]["text"] == want_sub, (raw, br_segs)
         assert br_segs[0]["tts"] == want_tts, (raw, br_segs)
-        assert "[" not in br_segs[0]["tts"] and "［" not in br_segs[0]["tts"]
-        assert "]" not in br_segs[0]["tts"] and "］" not in br_segs[0]["tts"]
+        for ch in "[]［］":
+            assert ch not in br_segs[0]["text"], (raw, br_segs)
+            assert ch not in br_segs[0]["tts"], (raw, br_segs)
     assert strip_square_bracket_segments("a[注]b［注2］c") == "abc"
+    assert keep_square_bracket_inners_for_subtitle("a[注]b［注2］c") == "a注b注2c"
 
 
 if __name__ == "__main__":
