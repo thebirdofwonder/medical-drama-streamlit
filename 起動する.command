@@ -3,7 +3,7 @@
 
 cd "$(dirname "$0")" || exit 1
 
-# プロキシ設定を外す（Claude API 接続のため）
+# プロキシ設定を外す（ローカル起動を安定させる）
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 unset SOCKS_PROXY SOCKS5_PROXY socks_proxy socks5_proxy
 unset GIT_HTTP_PROXY GIT_HTTPS_PROXY
@@ -27,8 +27,8 @@ pkill -f "python3 -m streamlit run app.py" 2>/dev/null || true
 sleep 1
 
 # 必須ファイル
-if [ ! -f "app.py" ] || [ ! -f "paper_pipeline.py" ]; then
-  echo "エラー: app.py または paper_pipeline.py がありません。"
+if [ ! -f "app.py" ]; then
+  echo "エラー: app.py がありません。"
   echo "先に「更新して起動.command」で最新版を取得してください。"
   read -r -p "Enter で閉じる…"
   exit 1

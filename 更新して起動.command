@@ -66,9 +66,9 @@ else
 fi
 
 # 必須ファイル確認
-if [ ! -f "paper_pipeline.py" ]; then
+if [ ! -f "app.py" ]; then
   echo "========================================"
-  echo " エラー: paper_pipeline.py がありません。"
+  echo " エラー: app.py がありません。"
   echo " 最新版の取得に失敗している可能性があります。"
   echo "========================================"
   read -r -p "Enter で閉じる…"
