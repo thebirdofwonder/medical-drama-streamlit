@@ -8,6 +8,8 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 unset SOCKS_PROXY SOCKS5_PROXY socks_proxy socks5_proxy
 unset GIT_HTTP_PROXY GIT_HTTPS_PROXY
 
+APP_URL="http://localhost:8501/?reset=1"
+
 echo "========================================"
 echo " 医学ドラマ動画メーカー を起動します"
 echo "========================================"
@@ -46,16 +48,37 @@ if [ ! -f "./custom_backgrounds/使い方.txt" ]; then
 EOF
 fi
 
-echo "起動後、ブラウザで次を開きます:"
-echo "  http://127.0.0.1:8501/?reset=1"
+echo "起動後、次のアドレスで開きます:"
+echo "  $APP_URL"
+echo "  （Cursor 内部ブラウザを優先。だめなら外部ブラウザ）"
 echo ""
 echo "止めるときは、この窓で Ctrl+C を押してください。"
 echo ""
 
+open_in_cursor_internal_browser() {
+  local url="$1"
+  local enc=""
+  enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$url" 2>/dev/null)" || return 1
+  # Cursor / VS Code の Simple Browser（内部ブラウザ）を開く
+  if open "cursor://vscode.simple-browser/show?url=${enc}" 2>/dev/null; then
+    return 0
+  fi
+  if open "vscode://vscode.simple-browser/show?url=${enc}" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 # 少し待ってからブラウザを開く（macOS）
-if command -v open >/dev/null 2>&1; then
-  (sleep 4 && open "http://127.0.0.1:8501/?reset=1") &
-fi
+(
+  sleep 4
+  if open_in_cursor_internal_browser "$APP_URL"; then
+    echo "Cursor 内部ブラウザで開く操作を送りました: $APP_URL"
+  elif command -v open >/dev/null 2>&1; then
+    echo "内部ブラウザを開けなかったので、外部ブラウザで開きます: $APP_URL"
+    open "$APP_URL"
+  fi
+) &
 
 # streamlit が無い場合の案内
 if ! python3 -c "import streamlit" 2>/dev/null; then
@@ -64,9 +87,14 @@ if ! python3 -c "import streamlit" 2>/dev/null; then
 fi
 
 set +e
+# Cursor 内部ブラウザ（iframe）でも動くよう CORS / XSRF を明示的にオフ
 python3 -m streamlit run app.py \
   --server.port 8501 \
   --server.address 127.0.0.1 \
+  --server.headless true \
+  --server.enableCORS false \
+  --server.enableXsrfProtection false \
+  --browser.serverAddress localhost \
   --browser.gatherUsageStats false
 STATUS=$?
 set -e

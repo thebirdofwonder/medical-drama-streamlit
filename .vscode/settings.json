@@ -1,0 +1,6 @@
+{
+  "workbench.externalUriOpeners": {
+    "http://localhost:8501": "simpleBrowser.open",
+    "http://127.0.0.1:8501": "simpleBrowser.open"
+  }
+}

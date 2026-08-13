@@ -1,12 +1,17 @@
 [browser]
 gatherUsageStats = false
+# Simple Browser / Cursor 内部ブラウザは localhost 向き
+serverAddress = "localhost"
 
 [server]
 headless = true
-address = "0.0.0.0"
+address = "127.0.0.1"
 port = 8501
+# Cursor 内部ブラウザ（iframe）で WebSocket / Cookie が通るよう緩和
+# ※ ローカル専用。外に公開するアプリでは使わない
 enableCORS = false
 enableXsrfProtection = false
+enableWebsocketCompression = false
 
 [runner]
 fastReruns = true
