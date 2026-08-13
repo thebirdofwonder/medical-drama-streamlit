@@ -2537,27 +2537,29 @@ def ensure_custom_background_dir() -> Path:
     """事前作成した背景画像用フォルダ custom_backgrounds を用意する。"""
     CUSTOM_BG_DIR.mkdir(parents=True, exist_ok=True)
     guide = CUSTOM_BG_DIR / "使い方.txt"
-    guide.write_text(
-        "【背景静止画の使い方】\n"
-        "\n"
-        "1. 背景画は別途事前に作成する\n"
-        "2. 必ずこのフォルダ（custom_backgrounds）に保存する\n"
-        "   （デスクトップや別フォルダでは読み込まれません）\n"
-        "3. 形式: .jpg または .png\n"
-        "4. ファイル名は、台本の 〈〉 内の文字と完全に同じ\n"
-        "\n"
-        "例:\n"
-        "  台本: 〈夜の暗い手術室〉\n"
-        "  ○ 正しい: 夜の暗い手術室.jpg\n"
-        "  × 間違い: 〈夜の暗い手術室〉.jpg  （かっこ付きは不可）\n"
-        "  × 間違い: 夜の暗い手術室 .jpg  （空白入り）\n"
-        "\n"
-        "5. アプリで「最終版（背景あり）」の MP4 を作る\n"
-        "\n"
-        "※ フォルダ名は custom_backgrounds\n"
-        "※ 見つからないときは outputs/last_custom_bg_debug.txt を確認\n",
-        encoding="utf-8",
-    )
+    # 既存ファイルは上書きしない（git pull を妨げないため）
+    if not guide.exists():
+        guide.write_text(
+            "【背景静止画の使い方】\n"
+            "\n"
+            "1. 背景画は別途事前に作成する\n"
+            "2. 必ずこのフォルダ（custom_backgrounds）に保存する\n"
+            "   （デスクトップや別フォルダでは読み込まれません）\n"
+            "3. 形式: .jpg または .png\n"
+            "4. ファイル名は、台本の 〈〉 内の文字と完全に同じ\n"
+            "\n"
+            "例:\n"
+            "  台本: 〈夜の暗い手術室〉\n"
+            "  ○ 正しい: 夜の暗い手術室.jpg\n"
+            "  × 間違い: 〈夜の暗い手術室〉.jpg  （かっこ付きは不可）\n"
+            "  × 間違い: 夜の暗い手術室 .jpg  （空白入り）\n"
+            "\n"
+            "5. アプリで「最終版（背景あり）」の MP4 を作る\n"
+            "\n"
+            "※ フォルダ名は custom_backgrounds\n"
+            "※ 見つからないときは outputs/last_custom_bg_debug.txt を確認\n",
+            encoding="utf-8",
+        )
     return CUSTOM_BG_DIR
 
 
