@@ -233,7 +233,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260813c"
+APP_BUILD = "ui-slim-20260813d"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -789,10 +789,19 @@ def _safe_force_chunks(text: str, max_chars: int) -> list[str]:
 
 
 
+def strip_code_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json|JSON)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+
 def http_session_direct() -> requests.Session:
     """
     プロキシ（通信の仲介役）を使わず、インターネットへ直接つなぐ。
-    Cursor や社内ネットのプロキシ設定があると外部通信が
+    Cursor や社内ネットのプロキシ設定があると Claude API が
     403 Forbidden で失敗することがあるため。
     """
     session = requests.Session()
@@ -3872,7 +3881,7 @@ def main() -> None:
             st.success(f"作成しました: {path}")
 
     # ----- Step 1 -----
-    st.write("1. 台本（手元のファイルを取り込む）")
+    st.write("1. 台本")
 
     script_upload = st.file_uploader(
         "台本ファイル（.txt / .docx / .pdf）",
@@ -3921,7 +3930,7 @@ def main() -> None:
             " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
             " ファイル名を `〈〉` 内の文字と同一にする。"
             " 大かっこ: `[注釈]` → 字幕は中身だけ（かっこは出さない）、VOICEVOX は読まない。"
-            " 修正版 `ui-slim-20260813c`。"
+            " 修正版 `ui-slim-20260813d`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
