@@ -74,6 +74,9 @@ OUTPUT_DIR = WORK_DIR / "outputs"
 # 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
 MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
 LANDSCAPE_DIR = MEDICAL_BG_DIR  # 互換エイリアス
+# 〈自由文〉用の背景静止画を置くフォルダ（ファイル名＝ヒント文）
+CUSTOM_BG_DIR = WORK_DIR / "custom_backgrounds"
+CUSTOM_BG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 # 参考文献の前回入力（outputs/ は GitHub に上がらない）
 REFERENCE_SAVE_PATH = OUTPUT_DIR / "last_reference.txt"
 
@@ -222,7 +225,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812m"
+APP_BUILD = "ui-slim-20260812n"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -2493,6 +2496,70 @@ def ensure_landscape_images(needed: int | list[int]) -> list[Path]:
     return [path_by_idx[i % n_urls] for i in indices]
 
 
+def ensure_custom_background_dir() -> Path:
+    """自由文ヒント用の画像フォルダを用意する。"""
+    CUSTOM_BG_DIR.mkdir(parents=True, exist_ok=True)
+    guide = CUSTOM_BG_DIR / "使い方.txt"
+    if not guide.exists():
+        guide.write_text(
+            "【自由文の背景の使い方】\n"
+            "1. 台本に 〈夜の暗い手術室〉 のように書く\n"
+            "2. このフォルダに、同じ名前の画像を置く\n"
+            "   例: 夜の暗い手術室.jpg  /  夜の暗い手術室.png\n"
+            "3. アプリで「最終版（背景あり）」の MP4 を作る\n"
+            "\n"
+            "※ 画像は自分で用意するか、別の画像生成サービスで作って保存してください。\n"
+            "※ このアプリ自体は、文章から自動で絵を描きません。\n",
+            encoding="utf-8",
+        )
+    return CUSTOM_BG_DIR
+
+
+def _hint_filename_candidates(hint: str) -> list[str]:
+    """ヒント文から、画像ファイル名（拡張子なし）の候補を作る。"""
+    raw = (hint or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    for cand in (
+        raw,
+        _compact_background_hint(raw),
+        make_title_basename(raw, fallback=""),
+        re.sub(r"\s+", "", raw),
+    ):
+        c = (cand or "").strip().strip(".")
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+def find_custom_background_image(hint: str) -> Path | None:
+    """
+    〈自由文〉に対応する画像を custom_backgrounds/ から探す。
+    ファイル名（拡張子を除く）がヒント文と一致すれば採用。
+    """
+    ensure_custom_background_dir()
+    candidates = _hint_filename_candidates(hint)
+    if not candidates:
+        return None
+    files = [
+        p
+        for p in CUSTOM_BG_DIR.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in CUSTOM_BG_EXTENSIONS
+        and not p.name.startswith(".")
+    ]
+    by_stem = {p.stem: p for p in files}
+    by_stem_lower = {p.stem.lower(): p for p in files}
+    for cand in candidates:
+        if cand in by_stem:
+            return by_stem[cand]
+        hit = by_stem_lower.get(cand.lower())
+        if hit is not None:
+            return hit
+    return None
+
+
 def _background_index_for_theme(theme: str, occurrence: int) -> int:
     """同じ物語場面に属する写真候補だけから、順番に1枚選ぶ。"""
     choices = THEME_TO_BG_INDICES.get(theme) or THEME_TO_BG_INDICES["ward"]
@@ -2578,6 +2645,7 @@ def plan_scene_schedule(
     current_theme = first_theme or "ward"
     # 段落冒頭 〈〉 で指示したあとは、次の 〈〉 まで背景を固定する
     locked_by_hint = bool(first_hint)
+    active_hint = first_hint
     scene_start = 0.0
     scene_texts: list[str] = []
     schedule: list[dict[str, Any]] = []
@@ -2588,10 +2656,13 @@ def plan_scene_schedule(
         end_time = min(max(float(end_time), scene_start + 0.5), total_duration)
         occurrence = theme_occurrences.get(current_theme, 0)
         theme_occurrences[current_theme] = occurrence + 1
+        custom_path = find_custom_background_image(active_hint) if active_hint else None
         schedule.append(
             {
                 "index": len(schedule),
                 "theme": current_theme,
+                "bg_hint": active_hint,
+                "custom_image": str(custom_path) if custom_path else "",
                 "landscape_index": _background_index_for_theme(
                     current_theme, occurrence
                 ),
@@ -2614,8 +2685,15 @@ def plan_scene_schedule(
         if explicit_hint:
             hinted = infer_theme_from_background_hint(explicit_hint)
             locked_by_hint = True
-            if hinted and hinted != current_theme:
-                # 〈〉 で明示されたヒントは最短時間を待たずに切り替える
+            hint_changed = explicit_hint != active_hint
+            if hint_changed:
+                # ヒント文が変わったら（自由文の別画像も含む）すぐ切替
+                if cue_start > scene_start:
+                    _append_scene(cue_start)
+                active_hint = explicit_hint
+                if hinted:
+                    current_theme = hinted
+            elif hinted and hinted != current_theme:
                 if cue_start > scene_start:
                     _append_scene(cue_start)
                 current_theme = hinted
@@ -2630,6 +2708,7 @@ def plan_scene_schedule(
             ):
                 _append_scene(cue_start)
                 current_theme = detected
+                active_hint = ""
             elif elapsed >= SCENE_INTERVAL_SEC:
                 _append_scene(cue_start)
         elif elapsed >= SCENE_INTERVAL_SEC:
@@ -3330,16 +3409,20 @@ def run_video_export(progress, pct_box, status) -> None:
             # デバッグ用: 〈〉 がどの背景になったかを残す
             schedule_lines = []
             for item in schedule:
+                custom = str(item.get("custom_image") or "").strip()
                 schedule_lines.append(
                     f"{float(item['duration']):5.1f}s  "
                     f"theme={item.get('theme')}  "
-                    f"hint_segment={str(item.get('segment') or '')[:40]}"
+                    f"hint={item.get('bg_hint') or '-'}  "
+                    f"custom={Path(custom).name if custom else '-'}  "
+                    f"segment={str(item.get('segment') or '')[:40]}"
                 )
             (OUTPUT_DIR / "last_bg_schedule.txt").write_text(
                 "\n".join(schedule_lines) + "\n",
                 encoding="utf-8",
             )
             _pct(52, f"物語に合う背景を準備（{len(schedule)} 場面）…")
+            ensure_custom_background_dir()
             bg_indices = [
                 int(item.get("landscape_index", item["index"])) for item in schedule
             ]
@@ -3350,7 +3433,11 @@ def run_video_export(progress, pct_box, status) -> None:
                 li = int(item.get("landscape_index", i))
                 dur = float(item["duration"])
                 frame_path = scene_dir / f"scene_{i:03d}.png"
-                land = landscapes[i % len(landscapes)]
+                custom = str(item.get("custom_image") or "").strip()
+                if custom and Path(custom).is_file():
+                    land: Path | None = Path(custom)
+                else:
+                    land = landscapes[i % len(landscapes)]
                 create_scene_frame(
                     frame_path,
                     landscape_path=land,
@@ -3680,12 +3767,12 @@ def main() -> None:
         st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
         st.caption(
             "ルビ: `{表記|よみ}` / `｛表記｜よみ｝` → 字幕は表記、VOICEVOX は読み。"
-            " 背景ヒント: 段落の冒頭に `〈手術室〉` のように書く "
-            "（次の 〈〉 までその背景を維持）。"
-            " 使える語の例: 救急外来 / 手術室 / 病棟 / ICU / CT / 検査室 / 外来 / 廊下 / 救急車。"
+            " 背景ヒント: 段落冒頭に `〈手術室〉`。"
+            " 自由文（例: `〈夜の暗い手術室〉`）は"
+            " `custom_backgrounds` フォルダに同名画像を置く。"
             " 大かっこ: `[注釈]` → 字幕のみ。"
-            " 修正版 `ui-slim-20260812m`。"
-            " 背景を見るには **最終版（背景あり）** で作り直してください。"
+            " 修正版 `ui-slim-20260812n`。"
+            " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
             EDITOR_BASE_RAW, st.session_state.raw_script
@@ -3967,6 +4054,23 @@ def main() -> None:
             "最初と読み直しのあいだはドラフト（背景なし）。"
             " 〈〉 の背景指示を反映するには **最終版（背景あり）** を選んでください。"
         )
+        with st.expander("自由文の背景画像の置き方", expanded=False):
+            ensure_custom_background_dir()
+            st.markdown(
+                f"""
+1. 台本に `〈夜の暗い手術室〉` のように書く  
+2. Finder で次のフォルダを開く:  
+   `{CUSTOM_BG_DIR}`  
+3. **同じ名前** の画像を置く（例: `夜の暗い手術室.jpg`）  
+4. **最終版（背景あり）** で MP4 を作る  
+
+このアプリは文章から自動で絵を描きません。  
+画像は写真を使うか、別の画像生成サービスで作って保存してください。
+                """.strip()
+            )
+            if st.button("背景フォルダを開く準備をする", key="btn_ensure_custom_bg"):
+                ensure_custom_background_dir()
+                st.success(f"用意しました: {CUSTOM_BG_DIR}")
 
         gen_label = (
             "3. ドラフトMP4を作成する（背景なし）"
@@ -4211,6 +4315,37 @@ def _self_test_background_hints() -> None:
     assert all(th == "surgery" for th in sticky_themes), sticky_themes
     assert infer_theme_from_background_hint("手術室の中") == "surgery"
     assert infer_theme_from_background_hint("会議室") == "consult"
+
+    # 自由文ヒント → custom_backgrounds の同名画像を使う
+    ensure_custom_background_dir()
+    free_hint = "夜の暗い手術室"
+    free_img = CUSTOM_BG_DIR / f"{free_hint}.jpg"
+    Image.new("RGB", (64, 36), (10, 20, 30)).save(free_img, format="JPEG")
+    try:
+        found = find_custom_background_image(free_hint)
+        assert found is not None and found.resolve() == free_img.resolve(), found
+        free_script = f"〈{free_hint}〉\n執刀が始まった。\n"
+        free_segs = plan_narration_segments(free_script)
+        assert free_segs and free_segs[0]["bg_hint"] == free_hint, free_segs
+        free_cues = [
+            {
+                "start": 0.0,
+                "end": 8.0,
+                "text": free_segs[0]["text"],
+                "bg_hint": free_segs[0].get("bg_hint", ""),
+            }
+        ]
+        free_schedule = plan_scene_schedule(
+            free_script, total_duration=8.0, subtitle_cues=free_cues
+        )
+        assert free_schedule, free_schedule
+        assert free_schedule[0].get("bg_hint") == free_hint, free_schedule
+        assert Path(str(free_schedule[0].get("custom_image") or "")).is_file()
+    finally:
+        try:
+            free_img.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     # 改行をまたぐ山括弧でも、中身は字幕にも音声にも出ない
     multiline = "〈\n救急外来\n〉\n患者が来た。"
