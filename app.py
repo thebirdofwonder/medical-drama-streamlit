@@ -14,6 +14,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import unicodedata
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -232,7 +233,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812q"
+APP_BUILD = "ui-slim-20260812r"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -2538,22 +2539,45 @@ def ensure_custom_background_dir() -> Path:
         "【背景静止画の使い方】\n"
         "\n"
         "1. 背景画は別途事前に作成する\n"
-        "2. このフォルダ（custom_backgrounds）に保存する\n"
-        "   形式: .jpg または .png\n"
-        "3. ファイル名は、台本の 〈〉 内の文字と完全に同じにする\n"
+        "2. 必ずこのフォルダに保存する:\n"
+        f"   {CUSTOM_BG_DIR}\n"
+        "   （デスクトップや別フォルダでは読み込まれません）\n"
+        "3. 形式: .jpg または .png\n"
+        "4. ファイル名は、台本の 〈〉 内の文字と完全に同じ\n"
         "\n"
         "例:\n"
         "  台本: 〈夜の暗い手術室〉\n"
-        "  ファイル: 夜の暗い手術室.jpg\n"
-        "        または 夜の暗い手術室.png\n"
+        "  ○ 正しい: 夜の暗い手術室.jpg\n"
+        "  × 間違い: 〈夜の暗い手術室〉.jpg  （かっこ付きは不可）\n"
+        "  × 間違い: 夜の暗い手術室 .jpg  （空白入り）\n"
         "\n"
-        "4. アプリで「最終版（背景あり）」の MP4 を作る\n"
+        "5. アプリで「最終版（背景あり）」の MP4 を作る\n"
         "\n"
-        "※ フォルダ名は custom_backgrounds（backgrounds のスペルに注意）\n"
-        "※ このアプリは文章から自動で絵を描きません\n",
+        "※ フォルダ名は custom_backgrounds\n"
+        "※ 見つからないときは outputs/last_bg_schedule.txt を確認\n",
         encoding="utf-8",
     )
     return CUSTOM_BG_DIR
+
+
+def _normalize_match_key(s: str) -> str:
+    """ファイル名と 〈〉 ヒントを同じ土俵で比べるための正規化。"""
+    text = unicodedata.normalize("NFC", s or "")
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+    text = text.replace("\u3000", "").replace(" ", "").strip()
+    # ファイル名に山括弧まで付けてしまった場合も中身で照合する
+    for open_ch, close_ch in (
+        ("〈", "〉"),
+        ("<", ">"),
+        ("＜", "＞"),
+        ("‹", "›"),
+        ("《", "》"),
+        ("「", "」"),
+    ):
+        if text.startswith(open_ch) and text.endswith(close_ch) and len(text) > 2:
+            text = text[len(open_ch) : -len(close_ch)].strip()
+            break
+    return text
 
 
 def _hint_filename_candidates(hint: str) -> list[str]:
@@ -2564,26 +2588,20 @@ def _hint_filename_candidates(hint: str) -> list[str]:
     out: list[str] = []
     for cand in (
         raw,
+        _normalize_match_key(raw),
         _compact_background_hint(raw),
         make_title_basename(raw, fallback=""),
         re.sub(r"\s+", "", raw),
     ):
-        c = (cand or "").strip().strip(".")
+        c = _normalize_match_key(cand or "")
         if c and c not in out:
             out.append(c)
     return out
 
 
-def find_custom_background_image(hint: str) -> Path | None:
-    """
-    〈〉内の文字と同じ名前の jpg/png を custom_backgrounds から探す。
-    見つかった画像を、そのシーンの背景静止画として使う。
-    """
+def list_custom_background_files() -> list[Path]:
+    """custom_backgrounds（と誤字フォルダ）内の jpg/png 一覧。"""
     ensure_custom_background_dir()
-    candidates = _hint_filename_candidates(hint)
-    if not candidates:
-        return None
-
     files: list[Path] = []
     for folder in CUSTOM_BG_DIR_ALIASES:
         if not folder.is_dir():
@@ -2596,24 +2614,70 @@ def find_custom_background_image(hint: str) -> Path | None:
                 and p.name != "使い方.txt"
             ):
                 files.append(p)
+    return files
+
+
+def find_custom_background_image(hint: str) -> Path | None:
+    """
+    〈〉内の文字と同じ名前の jpg/png を custom_backgrounds から探す。
+    macOS の文字化け相当（NFC/NFD）や、かっこ付きファイル名も吸収する。
+    """
+    candidates = _hint_filename_candidates(hint)
+    if not candidates:
+        return None
+
+    files = list_custom_background_files()
     if not files:
         return None
 
-    # 同じ stem で jpg/png が両方あるときは jpg を優先
     def _rank(path: Path) -> tuple[int, str]:
         return (_CUSTOM_BG_EXT_PRIORITY.get(path.suffix.lower(), 99), path.name)
 
-    by_stem: dict[str, list[Path]] = {}
-    by_stem_lower: dict[str, list[Path]] = {}
+    by_key: dict[str, list[Path]] = {}
     for p in files:
-        by_stem.setdefault(p.stem, []).append(p)
-        by_stem_lower.setdefault(p.stem.lower(), []).append(p)
+        key = _normalize_match_key(p.stem)
+        if not key:
+            continue
+        by_key.setdefault(key, []).append(p)
+        by_key.setdefault(key.lower(), []).append(p)
 
     for cand in candidates:
-        pool = by_stem.get(cand) or by_stem_lower.get(cand.lower())
+        pool = by_key.get(cand) or by_key.get(cand.lower())
         if pool:
-            return sorted(pool, key=_rank)[0]
+            return sorted(set(pool), key=_rank)[0]
     return None
+
+
+def diagnose_custom_backgrounds(hints: list[str]) -> str:
+    """ヒントと画像の対応を人が読める診断テキストにする。"""
+    ensure_custom_background_dir()
+    files = list_custom_background_files()
+    lines = [
+        f"背景フォルダ: {CUSTOM_BG_DIR}",
+        f"画像ファイル数: {len(files)}",
+    ]
+    if files:
+        lines.append("置いてある画像:")
+        for p in sorted(files, key=lambda x: x.name):
+            lines.append(f"  - {p.name}")
+    else:
+        lines.append("（画像が1枚もありません）")
+    lines.append("")
+    lines.append("台本の 〈〉 との対応:")
+    uniq_hints = []
+    for h in hints:
+        h = (h or "").strip()
+        if h and h not in uniq_hints:
+            uniq_hints.append(h)
+    if not uniq_hints:
+        lines.append("  （〈〉 ヒントが台本にありません）")
+    for h in uniq_hints:
+        hit = find_custom_background_image(h)
+        if hit:
+            lines.append(f"  ○ 〈{h}〉 → {hit.name}")
+        else:
+            lines.append(f"  × 〈{h}〉 → 見つかりません（同名の jpg/png を置いてください）")
+    return "\n".join(lines) + "\n"
 
 
 def _background_index_for_theme(theme: str, occurrence: int) -> int:
@@ -3466,21 +3530,45 @@ def run_video_export(progress, pct_box, status) -> None:
                 audio_sec,
                 subtitle_cues=subtitle_cues,
             )
+            # 作成直前にもう一度ファイルを探し直す（置き直し直後にも効く）
+            hint_list: list[str] = []
+            for item in schedule:
+                hint = str(item.get("bg_hint") or "").strip()
+                if hint:
+                    hint_list.append(hint)
+                found = find_custom_background_image(hint) if hint else None
+                item["custom_image"] = str(found) if found else ""
+
+            diag = diagnose_custom_backgrounds(
+                hint_list
+                + [str(c.get("bg_hint") or "") for c in subtitle_cues]
+            )
+            (OUTPUT_DIR / "last_custom_bg_debug.txt").write_text(diag, encoding="utf-8")
+
             # デバッグ用: 〈〉 がどの背景になったかを残す
             schedule_lines = []
+            missing_hints: list[str] = []
             for item in schedule:
                 custom = str(item.get("custom_image") or "").strip()
+                hint = str(item.get("bg_hint") or "").strip()
+                if hint and not custom and hint not in missing_hints:
+                    missing_hints.append(hint)
                 schedule_lines.append(
                     f"{float(item['duration']):5.1f}s  "
                     f"theme={item.get('theme')}  "
-                    f"hint={item.get('bg_hint') or '-'}  "
+                    f"hint={hint or '-'}  "
                     f"custom={Path(custom).name if custom else '-'}  "
                     f"segment={str(item.get('segment') or '')[:40]}"
                 )
             (OUTPUT_DIR / "last_bg_schedule.txt").write_text(
-                "\n".join(schedule_lines) + "\n",
+                "\n".join(schedule_lines) + "\n\n" + diag,
                 encoding="utf-8",
             )
+            if missing_hints:
+                st.session_state["_custom_bg_missing"] = missing_hints
+            else:
+                st.session_state.pop("_custom_bg_missing", None)
+
             _pct(52, f"物語に合う背景を準備（{len(schedule)} 場面）…")
             ensure_custom_background_dir()
             bg_indices = [
@@ -3493,7 +3581,12 @@ def run_video_export(progress, pct_box, status) -> None:
                 li = int(item.get("landscape_index", i))
                 dur = float(item["duration"])
                 frame_path = scene_dir / f"scene_{i:03d}.png"
+                hint = str(item.get("bg_hint") or "").strip()
                 custom = str(item.get("custom_image") or "").strip()
+                if not custom and hint:
+                    again = find_custom_background_image(hint)
+                    custom = str(again) if again else ""
+                    item["custom_image"] = custom
                 if custom and Path(custom).is_file():
                     land: Path | None = Path(custom)
                 else:
@@ -3836,7 +3929,7 @@ def main() -> None:
             " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
             " ファイル名を `〈〉` 内の文字と同一にする。"
             " 大かっこ: `[注釈]` → 字幕は中身だけ（かっこは出さない）、VOICEVOX は読まない。"
-            " 修正版 `ui-slim-20260812q`。"
+            " 修正版 `ui-slim-20260812r`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
@@ -4163,6 +4256,20 @@ def main() -> None:
             )
             st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
             st.caption(f"今回の動画: {mode_kind}")
+            missing = st.session_state.get("_custom_bg_missing") or []
+            if missing and last_mode == "final":
+                st.warning(
+                    "次の 〈〉 に対応する画像が見つかりませんでした。"
+                    " 同名の jpg/png を custom_backgrounds に置いて、"
+                    "最終版を作り直してください:\n"
+                    + "\n".join(f"- 〈{h}〉" for h in missing)
+                )
+                st.caption(f"診断ファイル: {OUTPUT_DIR / 'last_custom_bg_debug.txt'}")
+                st.caption(f"背景フォルダ: {CUSTOM_BG_DIR}")
+            dbg = OUTPUT_DIR / "last_custom_bg_debug.txt"
+            if dbg.is_file() and last_mode == "final":
+                with st.expander("背景画像の読み込み結果", expanded=bool(missing)):
+                    st.code(dbg.read_text(encoding="utf-8"))
             # 大きいMP4を毎回ディスクから読むと落ちやすい → 1回だけメモリに載せる
             if size_mb < 180:
                 mp4_stat = Path(mp4_path).stat()
@@ -4387,9 +4494,18 @@ def _self_test_background_hints() -> None:
     free_hint = "夜の暗い手術室"
     free_img = CUSTOM_BG_DIR / f"{free_hint}.jpg"
     Image.new("RGB", (64, 36), (10, 20, 30)).save(free_img, format="JPEG")
+    wrapped_img = CUSTOM_BG_DIR / f"〈別ヒント〉.png"
+    Image.new("RGB", (64, 36), (40, 50, 60)).save(wrapped_img, format="PNG")
+    nfd_name = unicodedata.normalize("NFD", "救急の廊下")
+    nfd_img = CUSTOM_BG_DIR / f"{nfd_name}.jpg"
+    Image.new("RGB", (64, 36), (70, 80, 90)).save(nfd_img, format="JPEG")
     try:
         found = find_custom_background_image(free_hint)
         assert found is not None and found.resolve() == free_img.resolve(), found
+        # ファイル名に 〈〉 が付いていても中身で一致
+        assert find_custom_background_image("別ヒント") is not None
+        # macOS 風 NFD ファイル名でも NFC ヒントで見つかる
+        assert find_custom_background_image("救急の廊下") is not None
         free_script = f"〈{free_hint}〉\n執刀が始まった。\n"
         free_segs = plan_narration_segments(free_script)
         assert free_segs and free_segs[0]["bg_hint"] == free_hint, free_segs
@@ -4407,11 +4523,14 @@ def _self_test_background_hints() -> None:
         assert free_schedule, free_schedule
         assert free_schedule[0].get("bg_hint") == free_hint, free_schedule
         assert Path(str(free_schedule[0].get("custom_image") or "")).is_file()
+        diag = diagnose_custom_backgrounds([free_hint, "存在しない背景"])
+        assert "夜の暗い手術室" in diag and "存在しない背景" in diag
     finally:
-        try:
-            free_img.unlink(missing_ok=True)
-        except Exception:
-            pass
+        for p in (free_img, wrapped_img, nfd_img):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # 改行をまたぐ山括弧でも、中身は字幕にも音声にも出ない
     multiline = "〈\n救急外来\n〉\n患者が来た。"
