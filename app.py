@@ -233,7 +233,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260812r"
+APP_BUILD = "ui-slim-20260813a"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -258,6 +258,8 @@ _PRESERVE_ON_SCRIPT_RELOAD = (
     "vvox_style_id",
     "vvox_speed_scale",
     "reference_text",
+    "anthropic_api_key",
+    "_paper_pipeline_preview",
 )
 
 
@@ -3769,6 +3771,142 @@ def wipe_session_if_legacy_editor_widget() -> None:
     st.rerun()
 
 
+def render_paper_to_drama_step() -> None:
+    """
+    アプリ先頭の工程:
+    論文PDF / URL → opening / reference / title / 台本 / タイトル画 / 背景静止画
+    """
+    from paper_pipeline import (
+        fetch_paper_from_url,
+        get_anthropic_api_key,
+        run_paper_to_drama_pipeline,
+    )
+
+    st.write("0. 論文から台本・画像を作る")
+    st.caption(
+        "論文PDFまたはURLを入れると、opening / reference / title / 台本 をデスクトップへ保存し、"
+        "タイトル画と 〈〉 背景静止画も作成してから、下の台本工程へ渡します。"
+    )
+
+    paper_pdf = st.file_uploader(
+        "論文PDFをアップロード",
+        type=["pdf"],
+        key="paper_pdf_upload",
+    )
+    paper_url = st.text_input(
+        "論文URLを入力",
+        key="paper_url_input",
+        placeholder="https://...",
+    )
+
+    if st.button(
+        "論文から一括生成する",
+        type="primary",
+        key="btn_run_paper_pipeline",
+        use_container_width=True,
+    ):
+        api_key = get_anthropic_api_key(
+            str(st.session_state.get("anthropic_api_key") or "")
+        )
+        if not api_key:
+            st.error(
+                "Claude APIキーが必要です。"
+                " 左の「設定」で ANTHROPIC_API_KEY を入力してください。"
+            )
+            return
+
+        status = st.empty()
+        try:
+            paper_text = ""
+            if paper_pdf is not None:
+                status.info("PDFを読み取り中…")
+                paper_text = extract_text_from_pdf_bytes(
+                    paper_pdf.getvalue()
+                ).strip()
+            elif (paper_url or "").strip():
+                status.info("URLから論文を取得中…")
+                paper_text = fetch_paper_from_url(
+                    paper_url.strip(),
+                    extract_text_from_pdf_bytes,
+                ).strip()
+            else:
+                st.error("論文PDFかURLのどちらかを指定してください。")
+                return
+
+            if len(paper_text) < 80:
+                st.error(
+                    "論文本文が短すぎます。"
+                    " PDFの中身が文字として取れるか、URLを確認してください。"
+                )
+                return
+
+            def _prog(msg: str) -> None:
+                status.info(msg)
+
+            result = run_paper_to_drama_pipeline(
+                paper_text,
+                api_key=api_key,
+                desktop_dir=get_desktop_dir(),
+                custom_bg_dir=ensure_custom_background_dir(),
+                video_size=VIDEO_SIZE,
+                progress=_prog,
+            )
+
+            # 後続工程へ渡す
+            script = normalize_script_keeping_ruby(
+                str(result.get("script") or "")
+            ).strip()
+            best_title = str(result.get("best_title") or "").strip()
+            reference = str(result.get("reference") or "").strip()
+            if reference:
+                apply_paper_reference_to_session(reference)
+            if best_title:
+                queue_widget_value("video_title", best_title)
+
+            desktop = get_desktop_dir()
+            bg_n = len(result.get("bg_paths") or {})
+            status.success(
+                "生成完了。"
+                f" デスクトップに opening.docx / reference.docx / title.docx / 台本.docx / タイトル画.png を保存し、"
+                f"背景 {bg_n} 枚を custom_backgrounds へ保存しました。"
+            )
+            st.session_state["_paper_pipeline_preview"] = {
+                "opening": result.get("opening"),
+                "best_title": best_title,
+                "reference": reference,
+                "hints": result.get("hints") or [],
+                "desktop": str(desktop),
+            }
+
+            schedule_script_reload(
+                script,
+                f"paper-pipeline-{len(script)}",
+                advance_plain=False,
+                citation=reference,
+                notice=(
+                    "論文から台本を作成し、後続工程へ渡しました。"
+                    " Step 2 で内容を確認して確定してください。"
+                    f" 保存先: {desktop}"
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            status.empty()
+            st.error(f"論文からの生成に失敗しました: {e}")
+
+    preview = st.session_state.get("_paper_pipeline_preview")
+    if isinstance(preview, dict) and preview:
+        with st.expander("直近の論文生成プレビュー", expanded=False):
+            st.write("推奨タイトル")
+            st.write(preview.get("best_title") or "")
+            st.write("opening")
+            st.write(preview.get("opening") or "")
+            hints = preview.get("hints") or []
+            if hints:
+                st.write("背景ヒント")
+                st.write(" / ".join(f"〈{h}〉" for h in hints))
+            st.caption(f"保存先: {preview.get('desktop')}")
+
+
 def main() -> None:
     st.set_page_config(
         page_title="医学ドラマ動画メーカー",
@@ -3878,8 +4016,35 @@ def main() -> None:
             path = ensure_custom_background_dir()
             st.success(f"作成しました: {path}")
 
+        st.write("Claude APIキー")
+        from paper_pipeline import (
+            get_anthropic_api_key,
+            save_anthropic_api_key_to_dotenv,
+        )
+
+        existing_key = get_anthropic_api_key(
+            str(st.session_state.get("anthropic_api_key") or "")
+        )
+        st.text_input(
+            "ANTHROPIC_API_KEY",
+            value=existing_key,
+            type="password",
+            key="anthropic_api_key",
+            help=".env またはここに入力（GitHubには上がりません）",
+        )
+        if st.button("APIキーをローカルに保存", key="btn_save_anthropic_key"):
+            k = str(st.session_state.get("anthropic_api_key") or "").strip()
+            if not k:
+                st.error("キーが空です。")
+            else:
+                save_anthropic_api_key_to_dotenv(k)
+                st.success(".env に保存しました（このPC内のみ）")
+
+    # ----- Step 0: 論文から作成 -----
+    render_paper_to_drama_step()
+
     # ----- Step 1 -----
-    st.write("1. 台本")
+    st.write("1. 台本（手元のファイルを取り込む）")
 
     script_upload = st.file_uploader(
         "台本ファイル（.txt / .docx / .pdf）",
@@ -3928,7 +4093,7 @@ def main() -> None:
             " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
             " ファイル名を `〈〉` 内の文字と同一にする。"
             " 大かっこ: `[注釈]` → 字幕は中身だけ（かっこは出さない）、VOICEVOX は読まない。"
-            " 修正版 `ui-slim-20260812r`。"
+            " 修正版 `ui-slim-20260813a`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
