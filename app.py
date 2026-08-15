@@ -233,7 +233,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260815b"
+APP_BUILD = "ui-slim-20260815c"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -2665,11 +2665,7 @@ def diagnose_custom_backgrounds(hints: list[str]) -> str:
         lines.append("（画像が1枚もありません）")
     lines.append("")
     lines.append("台本の 〈〉 との対応:")
-    uniq_hints = []
-    for h in hints:
-        h = (h or "").strip()
-        if h and h not in uniq_hints:
-            uniq_hints.append(h)
+    uniq_hints = unique_background_hints(hints)
     if not uniq_hints:
         lines.append("  （〈〉 ヒントが台本にありません）")
     for h in uniq_hints:
@@ -2677,8 +2673,72 @@ def diagnose_custom_backgrounds(hints: list[str]) -> str:
         if hit:
             lines.append(f"  ○ 〈{h}〉 → {hit.name}")
         else:
-            lines.append(f"  × 〈{h}〉 → 見つかりません（同名の jpg/png を置いてください）")
+            lines.append(
+                f"  × 〈{h}〉 → 不足（必要ファイル例: {expected_custom_bg_filename(h)}）"
+            )
     return "\n".join(lines) + "\n"
+
+
+def unique_background_hints(hints: list[str] | None = None, script: str = "") -> list[str]:
+    """台本またはヒント一覧から、重複なしの 〈〉 中身を順に返す。"""
+    raw_list = list(hints or [])
+    if script:
+        raw_list.extend(extract_background_hints(script))
+    out: list[str] = []
+    for h in raw_list:
+        name = (h or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def expected_custom_bg_filename(hint: str) -> str:
+    """不足案内用の推奨ファイル名（png）。"""
+    name = (hint or "").strip() or "背景"
+    # ファイル名に使えない文字だけ安全化（日本語はそのまま）
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", name).strip().strip(".")
+    return f"{safe or '背景'}.png"
+
+
+def find_missing_custom_backgrounds(
+    script: str = "",
+    hints: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """
+    台本の 〈〉 に対し、custom_backgrounds に画像が無いものを列挙する。
+    戻り値: [{"hint": "...", "expected_file": "....png"}, ...]
+    """
+    ensure_custom_background_dir()
+    uniq = unique_background_hints(hints, script)
+    missing: list[dict[str, str]] = []
+    for h in uniq:
+        if find_custom_background_image(h) is None:
+            missing.append(
+                {
+                    "hint": h,
+                    "expected_file": expected_custom_bg_filename(h),
+                }
+            )
+    return missing
+
+
+def format_missing_custom_backgrounds_message(missing: list[dict[str, str]]) -> str:
+    """不足背景を画面表示用の文章にする。"""
+    if not missing:
+        return ""
+    lines = [
+        "背景ありの MP4 を作る前に、次の背景静止画が不足しています。",
+        f"フォルダ `{CUSTOM_BG_DIR}` に、次のファイル名で置いてください"
+        "（.png 推奨。同名の .jpg でも可）。",
+        "",
+    ]
+    for item in missing:
+        hint = item.get("hint") or ""
+        fname = item.get("expected_file") or expected_custom_bg_filename(hint)
+        lines.append(f"- 〈{hint}〉 → **{fname}**")
+    lines.append("")
+    lines.append("不足をそろえてから、もう一度「最終版（背景あり）」を押してください。")
+    return "\n".join(lines)
 
 
 def _background_index_for_theme(theme: str, occurrence: int) -> int:
@@ -3376,6 +3436,7 @@ def init_state() -> None:
 def begin_video_encoding(mode: str) -> bool:
     """
     動画作成モードへ入る。VOICEVOX 未接続なら False を返し、画面に手順を出す。
+    最終版（背景あり）は、〈〉に対応する背景画像が揃うまで開始しない。
     mode: "draft" または "final"
     """
     ok_vv_now, ver_vv_now = check_voicevox()
@@ -3385,6 +3446,34 @@ def begin_video_encoding(mode: str) -> bool:
         st.caption(f"詳細: {ver_vv_now}")
         return False
     mode_norm = "final" if str(mode) == "final" else "draft"
+    if mode_norm == "final":
+        script = str(
+            st.session_state.get("final_script")
+            or st.session_state.get("raw_script")
+            or ""
+        )
+        missing = find_missing_custom_backgrounds(script=script)
+        st.session_state["_custom_bg_missing"] = [m["hint"] for m in missing]
+        if missing:
+            msg = format_missing_custom_backgrounds_message(missing)
+            st.error(msg)
+            st.session_state["_custom_bg_block_message"] = msg
+            diag = diagnose_custom_backgrounds([m["hint"] for m in missing])
+            try:
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                (OUTPUT_DIR / "last_custom_bg_debug.txt").write_text(
+                    diag, encoding="utf-8"
+                )
+            except Exception:
+                pass
+            with st.expander("不足している背景ファイル一覧", expanded=True):
+                for item in missing:
+                    st.write(
+                        f"・ 〈{item['hint']}〉 → `{item['expected_file']}`"
+                    )
+                st.caption(f"保存先フォルダ: `{CUSTOM_BG_DIR}`")
+            return False
+        st.session_state.pop("_custom_bg_block_message", None)
     # radio の key=video_export_mode は表示後に直接書き換えできない。
     # 作成ジョブ用は別キーへ。画面に戻ったとき用に radio へは予約反映する。
     st.session_state["_export_mode"] = mode_norm
@@ -3526,6 +3615,16 @@ def run_video_export(progress, pct_box, status) -> None:
         scene_clips: list[tuple[Path, float]] = []
 
         if include_background:
+            script_for_bg = str(voice_script or "")
+            missing_before = find_missing_custom_backgrounds(script=script_for_bg)
+            if missing_before:
+                msg = format_missing_custom_backgrounds_message(missing_before)
+                st.session_state["_custom_bg_missing"] = [
+                    m["hint"] for m in missing_before
+                ]
+                st.session_state["_custom_bg_block_message"] = msg
+                raise RuntimeError(msg)
+
             schedule = plan_scene_schedule(
                 voice_script,
                 audio_sec,
@@ -3930,7 +4029,7 @@ def main() -> None:
             " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
             " ファイル名を `〈〉` 内の文字と同一にする。"
             " 大かっこ: `[注釈]` → 字幕は中身だけ（かっこは出さない）、VOICEVOX は読まない。"
-            " 修正版 `ui-slim-20260815b`。"
+            " 修正版 `ui-slim-20260815c`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
@@ -4213,6 +4312,32 @@ def main() -> None:
             "最初と読み直しのあいだはドラフト（背景なし）。"
             " 〈〉 の背景指示を反映するには **最終版（背景あり）** を選んでください。"
         )
+        # 最終版の直前チェック: 〈〉 と custom_backgrounds の不足を明示
+        if str(st.session_state.get("video_export_mode") or "draft") == "final":
+            script_now = str(
+                st.session_state.get("final_script")
+                or st.session_state.get("raw_script")
+                or ""
+            )
+            hints_now = unique_background_hints(script=script_now)
+            missing_now = find_missing_custom_backgrounds(script=script_now)
+            if hints_now and not missing_now:
+                st.success(
+                    f"背景チェック OK: 〈〉 {len(hints_now)} 件すべてに画像があります。"
+                )
+            elif missing_now:
+                st.warning(format_missing_custom_backgrounds_message(missing_now))
+                with st.expander("不足している背景ファイル一覧", expanded=True):
+                    for item in missing_now:
+                        st.write(
+                            f"・ 〈{item['hint']}〉 → `{item['expected_file']}`"
+                        )
+                    st.caption(f"保存先フォルダ: `{CUSTOM_BG_DIR}`")
+            elif not hints_now:
+                st.info(
+                    "台本に 〈〉 の背景指定がありません。"
+                    " 背景ありでも既定の風景で作成されます。"
+                )
         with st.expander("背景画像（custom_backgrounds）の置き方", expanded=False):
             ensure_custom_background_dir()
             st.markdown(
@@ -4532,6 +4657,16 @@ def _self_test_background_hints() -> None:
                 p.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    # 最終版作成前: 不足している背景ファイル名を明示できる
+    miss_script = "〈不足テスト風景A〉患者が来た。〈不足テスト風景B〉検査した。"
+    missing_items = find_missing_custom_backgrounds(script=miss_script)
+    miss_names = {m["hint"] for m in missing_items}
+    assert "不足テスト風景A" in miss_names and "不足テスト風景B" in miss_names
+    assert all(m["expected_file"].endswith(".png") for m in missing_items)
+    msg = format_missing_custom_backgrounds_message(missing_items)
+    assert "不足テスト風景A.png" in msg
+    assert "不足テスト風景B.png" in msg
 
     # 改行をまたぐ山括弧でも、中身は字幕にも音声にも出ない
     multiline = "〈\n救急外来\n〉\n患者が来た。"
