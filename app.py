@@ -233,7 +233,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260815c"
+APP_BUILD = "ui-slim-20260822a"
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -258,6 +258,9 @@ _PRESERVE_ON_SCRIPT_RELOAD = (
     "vvox_style_id",
     "vvox_speed_scale",
     "reference_text",
+    # 台本のアップロード日時は、再編集でも消さない（新規アップロード時だけ上書き）
+    "script_uploaded_at",
+    "script_upload_filename",
 )
 
 
@@ -528,15 +531,20 @@ def schedule_script_reload(
     advance_plain: bool = False,
     citation: str | None = None,
     notice: str | None = None,
+    upload_filename: str | None = None,
 ) -> None:
     """原稿取り込みを次の描画の最初へ予約し、すぐ再描画する。"""
-    st.session_state["_deferred_reload_script"] = {
+    payload = {
         "text": text,
         "source_id": source_id,
         "advance_plain": bool(advance_plain),
         "citation": citation,
         "notice": notice,
     }
+    # upload_filename を渡したときだけ「アップロード日時」を更新する
+    if upload_filename is not None:
+        payload["upload_filename"] = upload_filename
+    st.session_state["_deferred_reload_script"] = payload
     st.rerun()
 
 
@@ -561,6 +569,9 @@ def run_deferred_script_actions() -> None:
 
     try:
         commit_loaded_script(script, source_id)
+        # ファイル取り込みなら、その日時を台本バージョンとして記録
+        if "upload_filename" in payload:
+            record_script_upload_meta(str(payload.get("upload_filename") or ""))
         citation = payload.get("citation")
         if citation:
             apply_paper_reference_to_session(str(citation))
@@ -844,6 +855,41 @@ def render_video_title_input() -> None:
     )
 
 
+def record_script_upload_meta(filename: str = "") -> None:
+    """台本ファイルを取り込んだ日時を記録する（バージョン表示用）。"""
+    st.session_state.script_uploaded_at = datetime.now().isoformat(timespec="seconds")
+    st.session_state.script_upload_filename = str(filename or "").strip()
+
+
+def format_script_version_label() -> str:
+    """台本バージョン（アップロード日時）の表示文。"""
+    raw = str(st.session_state.get("script_uploaded_at") or "").strip()
+    name = str(st.session_state.get("script_upload_filename") or "").strip()
+    if not raw:
+        return "台本バージョン: （まだアップロード日時がありません）"
+    try:
+        dt = datetime.fromisoformat(raw)
+        stamp = (
+            f"{dt.year}年{dt.month}月{dt.day}日 "
+            f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+        )
+    except ValueError:
+        stamp = raw
+    if name:
+        return f"台本バージョン: {stamp}（ファイル: {name}）"
+    return f"台本バージョン: {stamp}"
+
+
+def render_script_version_banner() -> None:
+    """MP4作成直前などに、台本バージョンを目立たせて出す。"""
+    st.markdown(
+        f'<div style="font-size:1.15rem;font-weight:600;margin:0.4rem 0 0.6rem 0;'
+        f'padding:0.55rem 0.75rem;background:#f3f4f6;border-radius:6px;color:#111;">'
+        f"{format_script_version_label()}</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def update_export_progress(
     progress,
     pct_box,
@@ -851,7 +897,7 @@ def update_export_progress(
     pct: int,
     message: str = "",
 ) -> None:
-    """進捗バーと％数字を同時に更新する（画面中央付近で大きく表示）。"""
+    """進捗バーと％数字を毎回必ず更新する（画面で大きく表示）。"""
     n = max(0, min(100, int(pct)))
     msg = (message or "").strip()
     bar_text = f"{n}%"
@@ -861,10 +907,16 @@ def update_export_progress(
     try:
         progress.progress(n, text=bar_text)
     except TypeError:
-        progress.progress(n / 100.0 if n <= 100 else 1.0)
+        try:
+            progress.progress(n / 100.0 if n <= 100 else 1.0)
+        except Exception:
+            try:
+                progress.progress(n)
+            except Exception:
+                pass
     pct_box.markdown(
-        f'<div style="font-size:2.4rem;font-weight:700;line-height:1.2;'
-        f'margin:0.4rem 0 0.2rem 0;color:#111;">進捗 {n}%</div>',
+        f'<div style="font-size:2.6rem;font-weight:800;line-height:1.15;'
+        f'margin:0.45rem 0 0.25rem 0;color:#111;">進捗 {n}%</div>',
         unsafe_allow_html=True,
     )
     if msg:
@@ -873,6 +925,41 @@ def update_export_progress(
         status.info(f"{n}%")
     st.session_state.export_progress_pct = n
     st.session_state.export_progress_msg = msg
+
+
+def create_export_progress_widgets(
+    *,
+    initial_pct: int | None = None,
+    initial_msg: str = "準備中…",
+):
+    """
+    MP4作成中に毎回必ず出す進捗バーと％表示を作る。
+    戻り値: (progress, pct_box, status)
+    """
+    n = (
+        int(initial_pct)
+        if initial_pct is not None
+        else int(st.session_state.get("export_progress_pct") or 0)
+    )
+    n = max(0, min(100, n))
+    msg = (
+        initial_msg
+        or str(st.session_state.get("export_progress_msg") or "")
+        or "準備中…"
+    ).strip()
+    st.markdown(
+        '<div style="font-size:1.25rem;font-weight:700;margin:0.35rem 0;">'
+        "作業の進捗（パーセント）</div>",
+        unsafe_allow_html=True,
+    )
+    try:
+        progress = st.progress(n, text=f"{n}%  {msg}")
+    except TypeError:
+        progress = st.progress(n / 100.0 if n <= 100 else 1.0)
+    pct_box = st.empty()
+    status = st.empty()
+    update_export_progress(progress, pct_box, status, n, msg)
+    return progress, pct_box, status
 
 
 # ---------------------------------------------------------------------------
@@ -3382,6 +3469,8 @@ def init_state() -> None:
         "title_decision": "",
         "export_progress_pct": 0,
         "export_progress_msg": "",
+        "script_uploaded_at": "",
+        "script_upload_filename": "",
         "ending_credits_text": "",
         "reference_text": "",
         "last_script_path": "",
@@ -3896,10 +3985,13 @@ def main() -> None:
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
         st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
-        st.markdown(
-            '<div style="font-size:1.2rem;margin-bottom:0.5rem;">'
-            "作業の進捗（パーセント）</div>",
-            unsafe_allow_html=True,
+        # 作成に入ったら、毎回必ず台本バージョンと進捗バー／％を出す
+        render_script_version_banner()
+        progress, pct_box, status = create_export_progress_widgets(
+            initial_pct=int(st.session_state.get("export_progress_pct") or 0),
+            initial_msg=str(
+                st.session_state.get("export_progress_msg") or "準備中…"
+            ),
         )
         if st.button("中止して通常画面に戻る", key="btn_cancel_video_encoding"):
             st.session_state.video_encoding = False
@@ -3907,16 +3999,25 @@ def main() -> None:
             st.rerun()
 
         job = st.session_state.get("_export_job")
-        # pending 以外（running・None・古い状態）は自動再開せず、再開／中止を選ばせる
-        # ※ running に強制変換すると「作成中のまま戻れない」状態が続きやすい
+        # pending 以外（running・None・古い状態）でも進捗表示は出したまま、
+        # 再開／中止を選ばせる（進捗バーが消えないようにする）
         if job != "pending":
             st.error("前回の作成が中断されたか、作成モードのまま残っています。")
+            update_export_progress(
+                progress,
+                pct_box,
+                status,
+                int(st.session_state.get("export_progress_pct") or 0),
+                "中断中 — 下のボタンで再開または中止",
+            )
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button(
                     "最初から再開する", type="primary", key="btn_restart_export"
                 ):
                     st.session_state._export_job = "pending"
+                    st.session_state.export_progress_pct = 0
+                    st.session_state.export_progress_msg = "準備中…"
                     st.rerun()
             with col_b:
                 if st.button("通常画面に戻る", key="btn_exit_export_stuck"):
@@ -3925,13 +4026,10 @@ def main() -> None:
                     st.rerun()
             st.stop()
 
-        # pending → 書き出し開始
+        # pending → 書き出し開始（進捗バーは上で作成済み）
         st.session_state._export_job = "running"
         st.session_state.export_progress_pct = 0
         st.session_state.export_progress_msg = "準備中…"
-        progress = st.progress(0, text="0%  準備中…")
-        pct_box = st.empty()
-        status = st.empty()
         update_export_progress(progress, pct_box, status, 0, "準備中…")
         try:
             run_video_export(progress, pct_box, status)
@@ -4014,6 +4112,7 @@ def main() -> None:
                             f"取り込み完了: {script_upload.name}"
                             f"（約 {len(script):,} 字）"
                         ),
+                        upload_filename=script_upload.name,
                     )
             except Exception as e:  # noqa: BLE001
                 st.error(f"台本の取り込みに失敗しました: {e}")
@@ -4029,7 +4128,7 @@ def main() -> None:
             " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
             " ファイル名を `〈〉` 内の文字と同一にする。"
             " 大かっこ: `[注釈]` → 字幕は中身だけ（かっこは出さない）、VOICEVOX は読まない。"
-            " 修正版 `ui-slim-20260815c`。"
+            " 修正版 `ui-slim-20260822a`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
@@ -4357,6 +4456,8 @@ def main() -> None:
                 ensure_custom_background_dir()
                 st.success(f"用意しました: {CUSTOM_BG_DIR}")
 
+        # MP4作成直前: 台本バージョン（アップロード日時）を必ず表示
+        render_script_version_banner()
         gen_label = (
             "3. ドラフトMP4を作成する（背景なし）"
             if str(st.session_state.get("video_export_mode") or "draft") == "draft"
@@ -4463,10 +4564,13 @@ def main() -> None:
                                     "修正台本を取り込みました（ルビ・〈〉は削除していません）。\n"
                                     "「ドラフトMP4を再作成」を押してください。"
                                 ),
+                                upload_filename=script_reupload.name,
                             )
                     except Exception as e:  # noqa: BLE001
                         st.error(f"台本の取り込みに失敗しました: {e}")
 
+            # MP4再作成直前: 台本バージョンを表示
+            render_script_version_banner()
             col_redraft, col_final = st.columns(2)
             with col_redraft:
                 if st.button(
@@ -4513,6 +4617,7 @@ def main() -> None:
                                     script,
                                     f"loop-{next_script.name}-{len(script)}",
                                     advance_plain=True,
+                                    upload_filename=next_script.name,
                                 )
                         except Exception as e:  # noqa: BLE001
                             if is_widget_state_conflict_error(e):
