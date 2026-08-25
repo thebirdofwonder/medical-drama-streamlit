@@ -1,0 +1,9 @@
+{
+  "start": "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; python3 -m streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false",
+  "ports": [
+    {
+      "name": "streamlit",
+      "port": 8501
+    }
+  ]
+}

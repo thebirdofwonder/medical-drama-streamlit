@@ -10,4 +10,7 @@ bgm_fallback.wav
 *.mp4
 outputs/
 outputs/landscapes/
+custom_backgrounds/*
+!custom_backgrounds/使い方.txt
+!custom_backgrounds/.gitkeep
 .DS_Store

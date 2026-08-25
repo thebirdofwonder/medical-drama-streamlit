@@ -1,17 +1,22 @@
 """
-医学論文PDFまたは台本 → 台本用意 → AIレビュー → VOICEVOX音声 → 静止画背景 → MP4 生成
+台本取り込み → 台本確定 → VOICEVOX音声 → 静止画背景 → MP4 生成
 Streamlit アプリ（macOS / Apple Silicon 向け）
 """
 
 from __future__ import annotations
 
+import html
 import io
 import json
+import math
 import os
 import re
 import shutil
 import struct
+import subprocess
+import sys
 import tempfile
+import unicodedata
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -69,15 +74,19 @@ BGM_CANDIDATE_URLS = [
 ]
 WORK_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = WORK_DIR / "outputs"
-# ルビ辞書ファイル（用語とよみの対照表）
-RUBY_DICT_PATH = WORK_DIR / "data" / "medical_ruby_dict.tsv"
-# 修正反映後のダウンロード用辞書
-RUBY_DICT_EXPORT_NAME = "ルビ辞書.txt"
-RUBY_DICT_EXPORT_PATH = OUTPUT_DIR / RUBY_DICT_EXPORT_NAME
-
 # 医療関連の著作権フリー背景（Unsplash）。旧・風景キャッシュは使わない
 MEDICAL_BG_DIR = OUTPUT_DIR / "medical_backgrounds"
 LANDSCAPE_DIR = MEDICAL_BG_DIR  # 互換エイリアス
+# 〈〉 と同じ名前の jpg/png を置くフォルダ（事前作成した背景静止画）
+CUSTOM_BG_DIR = WORK_DIR / "custom_backgrounds"
+# よくある誤字フォルダ名も探す（custom_bacgrounds）
+CUSTOM_BG_DIR_ALIASES = (
+    CUSTOM_BG_DIR,
+    WORK_DIR / "custom_bacgrounds",
+)
+CUSTOM_BG_EXTENSIONS = (".jpg", ".jpeg", ".png")
+# 同じ名前で複数あるときの優先順
+_CUSTOM_BG_EXT_PRIORITY = {".jpg": 0, ".jpeg": 1, ".png": 2}
 # 参考文献の前回入力（outputs/ は GitHub に上がらない）
 REFERENCE_SAVE_PATH = OUTPUT_DIR / "last_reference.txt"
 
@@ -94,10 +103,10 @@ def get_desktop_dir() -> Path:
 
 
 def make_desktop_mp4_filename(title: str = "", *, draft: bool = False) -> str:
-    """デスクトップ保存用のファイル名（上書きしにくいよう日時つき）。"""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    kind = "draft" if draft else "final"
-    return f"{make_title_basename(title)}_{kind}_{stamp}.mp4"
+    """デスクトップ／ダウンロード用のファイル名（動画タイトル.mp4）。"""
+    # draft は互換のため残すが、ファイル名には使わない
+    _ = draft
+    return f"{make_title_basename(title)}.mp4"
 
 
 def make_title_basename(title: str = "", fallback: str = "medical_drama") -> str:
@@ -111,6 +120,30 @@ def make_title_basename(title: str = "", fallback: str = "medical_drama") -> str
 def make_script_docx_filename(title: str = "") -> str:
     """台本 Word 用ファイル名（動画タイトルと同一）。"""
     return f"{make_title_basename(title)}.docx"
+
+
+def advance_to_video_with_script(edited: str) -> None:
+    """
+    台本確定 → 動画作成へ進める。
+    ルビも 〈〉 背景ヒントも削除・追加しない。デスクトップへ台本は保存しない。
+    """
+    script = normalize_script_keeping_ruby(edited or "").strip()
+    if not script:
+        raise ValueError("最終台本が空です。")
+    st.session_state.final_script = script
+    st.session_state.raw_script = script
+    st.session_state.script_confirmed = True
+    st.session_state.ruby_script = script
+    st.session_state.ruby_ready = True
+    st.session_state.video_export_mode = "draft"
+    st.session_state.last_plain_script_txt = ""
+    st.session_state.last_plain_script_docx = ""
+    # 新しい確認サイクルなので、前回の完成動画は消す
+    st.session_state.mp4_bytes = None
+    st.session_state.mp4_path = ""
+    st.session_state.last_video_export_mode = None
+    # 入力欄は世代更新して、final_script / raw_script から作り直す
+    bump_editor_rev()
 
 
 def load_saved_reference_text() -> str:
@@ -201,20 +234,38 @@ MAX_VOICEVOX_CHARS = 90
 # 字幕切替の時間精度（低いと最大で約 1/fps 秒ずれる）
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
-# Anthropic の現行モデル（旧 claude-sonnet-4-20250514 は引退済み）
-CLAUDE_MODEL_CANDIDATES = [
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-    "claude-sonnet-4-5",
-    "claude-haiku-4-5",
-]
-# レビュー用に送る台本の上限（長すぎると API が失敗しやすい）
-REVIEW_SCRIPT_MAX_CHARS = 12000
-# 論文PDF→台本化：論文本文の送付上限・VOICEVOX 1倍速 10〜12分目安
-PAPER_TEXT_MAX_CHARS = 100000
-# 日本語ナレーション目安 約300〜330字/分 × 10〜12分（VOICEVOX 1.0倍速）
-DRAMA_SCRIPT_TARGET_CHARS_MIN = 3000
-DRAMA_SCRIPT_TARGET_CHARS_MAX = 4000
+# 画面左で確認できる修正版番号（これが出ていれば最新）
+APP_BUILD = "ui-slim-20260825b"
+# 台本アップロードの最大サイズ（DoS / メモリ枯渇防止）
+MAX_SCRIPT_UPLOAD_BYTES = 20 * 1024 * 1024
+# 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
+EDITOR_BASE_RAW = "ta_src_a"
+EDITOR_BASE_FINAL = "ta_src_b"
+EDITOR_BASE_RUBY = "ta_src_c"
+# 旧版・世代つき入力欄の衝突対策で消す対象（いまのキー名も含む）
+_EDITOR_KEY_MARKERS = (
+    "final_script_editor_widget",
+    "raw_script_editor_widget",
+    "ruby_script_editor",
+    "final_script_box",
+    "raw_script_box",
+    "ruby_script_box",
+    "final_script_editor",
+    "ta_src_a",
+    "ta_src_b",
+    "ta_src_c",
+)
+# 台本の再取り込み時も残す設定（声優など）
+_PRESERVE_ON_SCRIPT_RELOAD = (
+    "vvox_speaker_name",
+    "vvox_style_name",
+    "vvox_style_id",
+    "vvox_speed_scale",
+    "reference_text",
+    # 台本のアップロード日時は、再編集でも消さない（新規アップロード時だけ上書き）
+    "script_uploaded_at",
+    "script_upload_filename",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -291,185 +342,328 @@ def normalize_script_keeping_ruby(text: str) -> str:
     return script
 
 
+_PENDING_WIDGET_SET = "_pending_widget__"
+_PENDING_WIDGET_DEL = "_pending_widget_delete__"
+
+
+def queue_widget_value(key: str, value: Any) -> None:
+    """
+    ウィジェット用 session_state を、次の描画の最初で入れるよう予約する。
+    （表示中のキーへ直接代入すると Streamlit がエラーにする）
+    """
+    st.session_state.pop(f"{_PENDING_WIDGET_DEL}{key}", None)
+    st.session_state[f"{_PENDING_WIDGET_SET}{key}"] = value
+
+
+def queue_widget_clear(key: str) -> None:
+    """ウィジェット用キーを次の描画の最初で消し、初期化し直せるようにする。"""
+    st.session_state.pop(f"{_PENDING_WIDGET_SET}{key}", None)
+    st.session_state[f"{_PENDING_WIDGET_DEL}{key}"] = True
+
+
+def apply_pending_widget_values() -> None:
+    """ウィジェット生成より前に、予約済みの値反映／削除を行う。"""
+    delete_keys = [
+        k
+        for k in list(st.session_state.keys())
+        if str(k).startswith(_PENDING_WIDGET_DEL)
+    ]
+    for pk in delete_keys:
+        widget_key = str(pk)[len(_PENDING_WIDGET_DEL) :]
+        st.session_state.pop(pk, None)
+        st.session_state.pop(widget_key, None)
+
+    set_keys = [
+        k
+        for k in list(st.session_state.keys())
+        if str(k).startswith(_PENDING_WIDGET_SET)
+    ]
+    for pk in set_keys:
+        widget_key = str(pk)[len(_PENDING_WIDGET_SET) :]
+        value = st.session_state.pop(pk)
+        try:
+            st.session_state[widget_key] = value
+        except Exception:
+            # 衝突時は捨てて、次の世代キーで作り直す
+            st.session_state.pop(widget_key, None)
+
+
+def editor_rev() -> int:
+    """台本入力欄の世代番号。"""
+    return int(st.session_state.get("_editor_rev") or 0)
+
+
+def _is_editor_session_key(sk: str) -> bool:
+    """台本入力欄まわりの session_state キーなら True。"""
+    for marker in _EDITOR_KEY_MARKERS:
+        if (
+            sk == marker
+            or sk.startswith(f"{marker}_v")
+            or sk.startswith(f"{_PENDING_WIDGET_SET}{marker}")
+            or sk.startswith(f"{_PENDING_WIDGET_DEL}{marker}")
+        ):
+            return True
+    return False
+
+
+def bump_editor_rev() -> int:
+    """
+    台本入力欄の名前を世代更新する。
+    表示中のキーを書き換えず、新しいキーで作り直す（衝突防止）。
+    """
+    for marker in _EDITOR_KEY_MARKERS:
+        queue_widget_clear(marker)
+    old = editor_rev()
+    for marker in _EDITOR_KEY_MARKERS:
+        queue_widget_clear(f"{marker}_v{old}")
+    new_rev = old + 1
+    st.session_state["_editor_rev"] = new_rev
+    return new_rev
+
+
+def purge_legacy_editor_keys() -> None:
+    """
+    ウィジェット生成前に、衝突しやすい古い入力欄キーを消す。
+    いまの世代の入力欄（raw_script_box_vN など）は残す。
+    """
+    current = editor_rev()
+    keep = {
+        f"{EDITOR_BASE_RAW}_v{current}",
+        f"{EDITOR_BASE_FINAL}_v{current}",
+        f"{EDITOR_BASE_RUBY}_v{current}",
+    }
+    for key in list(st.session_state.keys()):
+        sk = str(key)
+        if sk in keep:
+            continue
+        if _is_editor_session_key(sk):
+            st.session_state.pop(sk, None)
+
+
+def hard_clear_all_editor_keys() -> None:
+    """入力欄キーを世代ごとすべて消し、世代番号を進める（衝突回復用）。"""
+    for key in list(st.session_state.keys()):
+        if _is_editor_session_key(str(key)):
+            st.session_state.pop(key, None)
+    st.session_state["_editor_rev"] = editor_rev() + 1
+
+
+def is_widget_state_conflict_error(exc: BaseException) -> bool:
+    """Streamlit の入力欄キー衝突エラーなら True。"""
+    msg = str(exc)
+    name = type(exc).__name__
+    if "StreamlitAPIException" in name and (
+        "cannot be modified" in msg or "session_state" in msg
+    ):
+        return True
+    return (
+        "cannot be modified after the widget" in msg
+        or "final_script_editor_widget" in msg
+        or "raw_script_editor_widget" in msg
+        or "final_script_box" in msg
+        or "raw_script_box" in msg
+        or "ta_src_a" in msg
+        or "ta_src_b" in msg
+    )
+
+
+def upload_gen() -> int:
+    """ファイル選択欄の世代（取り込みのたびに進めて古い選択を残さない）。"""
+    return int(st.session_state.get("_upload_gen") or 0)
+
+
+def bump_upload_gen() -> int:
+    """ファイル選択欄の世代を1つ進める。"""
+    n = upload_gen() + 1
+    st.session_state["_upload_gen"] = n
+    return n
+
+
+def nuclear_reset_session_for_script_import() -> None:
+    """
+    台本取り込みの直前に、画面の記憶をほぼ全部消す。
+    （1本目のMP4のあと、2本目の台本で必ず衝突していた問題の根本対策）
+    """
+    preserved: dict[str, Any] = {}
+    for key in _PRESERVE_ON_SCRIPT_RELOAD:
+        if key in st.session_state:
+            preserved[key] = st.session_state[key]
+    retries = st.session_state.get("_script_import_retries")
+    upload_n = upload_gen()
+
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+
+    init_state()
+    for key, value in preserved.items():
+        st.session_state[key] = value
+    if retries is not None:
+        st.session_state["_script_import_retries"] = retries
+    # 新しい入力欄・ファイル選択欄として始める
+    st.session_state["_editor_rev"] = max(1, int(st.session_state.get("_editor_rev") or 0) + 1)
+    st.session_state["_upload_gen"] = upload_n + 1
+
+
+def editor_widget_key(base: str) -> str:
+    """世代つきの入力欄キー。例: ta_src_a_v3"""
+    return f"{base}_v{editor_rev()}"
+
+
+def ensure_editor_value(base: str, value: str) -> str:
+    """入力欄キーが無ければ初期値を入れ、キー名を返す。"""
+    key = editor_widget_key(base)
+    if key not in st.session_state:
+        try:
+            st.session_state[key] = value
+        except Exception:
+            hard_clear_all_editor_keys()
+            key = editor_widget_key(base)
+            st.session_state[key] = value
+    return key
+
+
+def read_editor_value(base: str, default: str = "") -> str:
+    """世代つき入力欄の現在値を読む。"""
+    key = editor_widget_key(base)
+    return str(st.session_state.get(key) or default or "")
+
+
+def schedule_script_reload(
+    text: str,
+    source_id: str,
+    *,
+    advance_plain: bool = False,
+    citation: str | None = None,
+    notice: str | None = None,
+    upload_filename: str | None = None,
+) -> None:
+    """原稿取り込みを次の描画の最初へ予約し、すぐ再描画する。"""
+    payload = {
+        "text": text,
+        "source_id": source_id,
+        "advance_plain": bool(advance_plain),
+        "citation": citation,
+        "notice": notice,
+    }
+    # upload_filename を渡したときだけ「アップロード日時」を更新する
+    if upload_filename is not None:
+        payload["upload_filename"] = upload_filename
+    st.session_state["_deferred_reload_script"] = payload
+    st.rerun()
+
+
+def run_deferred_script_actions() -> None:
+    """
+    ボタン押下と同じ描画内でウィジェットを触ると衝突するため、
+    次の描画の最初（入力欄を作る前）で原稿取り込みを実行する。
+    2本目以降も必ずセッションをやり直してから取り込む。
+    """
+    payload = st.session_state.pop("_deferred_reload_script", None)
+    if not payload or not isinstance(payload, dict):
+        return
+
+    script = normalize_script_keeping_ruby(str(payload.get("text") or ""))
+    source_id = str(payload.get("source_id") or f"deferred-{len(script)}")
+    if not script:
+        st.session_state["_script_import_notice"] = "原稿が空でした。"
+        return
+
+    # 根本対策: 取り込み前に画面状態をほぼ全部消す（1本目MP4後の衝突を防ぐ）
+    nuclear_reset_session_for_script_import()
+
+    try:
+        commit_loaded_script(script, source_id)
+        # ファイル取り込みなら、その日時を台本バージョンとして記録
+        if "upload_filename" in payload:
+            record_script_upload_meta(str(payload.get("upload_filename") or ""))
+        elif payload.get("advance_plain"):
+            record_script_upload_meta("手入力・編集確定")
+        citation = payload.get("citation")
+        if citation:
+            apply_paper_reference_to_session(str(citation))
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUTPUT_DIR / "last_script.txt").write_text(script, encoding="utf-8")
+        if payload.get("advance_plain"):
+            advance_to_video_with_script(script)
+            (OUTPUT_DIR / "last_script.txt").write_text(
+                st.session_state.final_script,
+                encoding="utf-8",
+            )
+            st.session_state["_script_import_notice"] = payload.get("notice") or (
+                "新しい原稿を取り込み、動画作成の準備をしました。"
+            )
+        else:
+            st.session_state["_script_import_notice"] = payload.get("notice") or (
+                f"原稿を取り込みました（約 {len(script):,} 字）"
+            )
+        # 修正台本の再上げは、同じファイルで何度も取り込まない
+        if source_id.startswith("reupload-"):
+            st.session_state._ruby_loop_file_id = source_id[len("reupload-") :]
+        st.session_state.pop("_script_import_retries", None)
+    except Exception as e:  # noqa: BLE001
+        if is_widget_state_conflict_error(e):
+            retries = int(st.session_state.get("_script_import_retries") or 0)
+            nuclear_reset_session_for_script_import()
+            if retries < 2:
+                st.session_state["_script_import_retries"] = retries + 1
+                st.session_state["_deferred_reload_script"] = payload
+                st.rerun()
+            st.session_state.pop("_script_import_retries", None)
+            st.session_state["_script_import_notice"] = (
+                "原稿の取り込みに失敗しました（画面の古い記憶が残っていました）。"
+                "左の「画面をリセット」を押すか、"
+                "http://localhost:8501/?reset=1 を開き直してから、もう一度取り込んでください。"
+            )
+        else:
+            st.session_state.pop("_script_import_retries", None)
+            st.session_state["_script_import_notice"] = (
+                f"原稿の取り込みに失敗しました: {e}"
+            )
+
+
 def commit_loaded_script(text: str, source_id: str) -> None:
     """
     読み込んだ台本をセッションに入れ、以降の工程を最初からにする。
     すでに付いているルビ ｛用語｜よみ｝ は削除しない。
     """
-    clear_review_decision_widgets(st.session_state.get("review"))
     script = normalize_script_keeping_ruby(text)
+    # 入力欄は新しい世代キーだけを使う（旧キーへは一切書かない）
+    bump_editor_rev()
     st.session_state.raw_script = script
     st.session_state.final_script = script
-    st.session_state.final_script_editor = script
-    st.session_state.final_script_editor_widget = script
-    st.session_state.review = None
-    st.session_state.review_done = False
-    st.session_state.skip_review = False
     st.session_state.script_confirmed = False
     st.session_state.ruby_ready = False
     st.session_state.ruby_script = ""
-    st.session_state.ruby_script_baseline = ""
-    st.session_state.ruby_skipped = False
-    st.session_state.pop("ruby_script_editor", None)
-    st.session_state.pop("raw_script_editor_widget", None)
     st.session_state.mp4_bytes = None
     st.session_state.mp4_path = ""
-    st.session_state.review_apply_log = []
-    st.session_state.review_manual_log = []
+    st.session_state.mp4_name = "medical_drama.mp4"
+    st.session_state.last_video_export_mode = None
+    st.session_state.video_encoding = False
+    st.session_state._export_job = None
+    st.session_state.pop("_mp4_cache_key", None)
+    st.session_state.pop("_mp4_cache_bytes", None)
     st.session_state._script_file_id = source_id
+    st.session_state._ruby_loop_file_id = None
+    # 旧キーが残っていても触らず捨てる
+    for bad in (
+        "final_script_editor_widget",
+        "raw_script_editor_widget",
+        "ruby_script_editor",
+        "final_script_editor",
+        "review",
+        "review_done",
+        "skip_review",
+        "review_apply_log",
+        "review_manual_log",
+        "last_voicevox_dict_import",
+        "ruby_dict_post_video_updates",
+    ):
+        st.session_state.pop(bad, None)
 
 
 # ---------------------------------------------------------------------------
-# AI レビュー（Anthropic Claude API / フォールバック簡易レビュー）
+# VOICEVOX ルビ（台本の既存ルビは削除・追加しない。字幕表示時のみ表記を使う）
 # ---------------------------------------------------------------------------
-ENV_FILE = Path(__file__).resolve().parent / ".env"
-
-
-def load_dotenv_file(path: Path | None = None) -> None:
-    """
-    .env から KEY=VALUE を読み、未設定の環境変数だけ入れる。
-    （GitHub には上げないローカル専用ファイル）
-    """
-    env_path = path or ENV_FILE
-    if not env_path.is_file():
-        return
-    try:
-        raw = env_path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip().strip('"').strip("'")
-        if not key:
-            continue
-        # すでにターミナル等で設定済みなら上書きしない
-        if os.environ.get(key, "").strip():
-            continue
-        os.environ[key] = val
-
-
-def save_api_key_to_env_file(api_key: str, path: Path | None = None) -> Path:
-    """
-    APIキーを .env に保存（または更新）。他の行はそのまま残す。
-    """
-    env_path = path or ENV_FILE
-    key_name = "ANTHROPIC_API_KEY"
-    api_key = (api_key or "").strip()
-    if not api_key:
-        raise ValueError("保存する APIキーが空です。")
-
-    lines: list[str] = []
-    found = False
-    if env_path.is_file():
-        try:
-            old = env_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            old = []
-        for line in old:
-            stripped = line.strip()
-            if stripped.startswith("#") or "=" not in stripped:
-                lines.append(line)
-                continue
-            k, _, _ = stripped.partition("=")
-            if k.strip() == key_name:
-                lines.append(f"{key_name}={api_key}")
-                found = True
-            else:
-                lines.append(line)
-    if not found:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append(f"# Anthropic Claude API（このファイルは GitHub に上げません）")
-        lines.append(f"{key_name}={api_key}")
-
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    # すぐに使えるように環境変数にも入れる
-    os.environ[key_name] = api_key
-    return env_path
-
-
-def get_api_key() -> str:
-    """
-    APIキー取得の優先順位:
-    1. 環境変数 ANTHROPIC_API_KEY（.env 読込後含む）
-    2. Streamlit secrets（.streamlit/secrets.toml）
-    コードには直書きしない。
-    """
-    load_dotenv_file()
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        return str(st.secrets.get("ANTHROPIC_API_KEY", "") or "").strip()
-    except Exception:
-        return ""
-
-
-def build_review_prompt(script: str) -> str:
-    return f"""あなたは現役の救急・集中治療に詳しい医療監修医です。
-あわせて VOICEVOX（音声合成）向けの読み付けも行います。
-以下の医学ドラマ台本を検証し、JSONオブジェクトだけを返してください。
-前後に説明文・Markdown・コードフェンスは付けないでください。
-
-厳守ルール:
-- 有効なJSONのみ（末尾カンマ禁止）
-- 文字列内に半角ダブルクォート " を書かない（必要なら『』や「」を使う）
-- 各指摘配列は最大5件
-- original は40文字以内、issue/suggestion は120文字以内
-- suggestion は「台本にそのまま差し替える完成文」だけを書く
-  （禁止例: 「編集メモを削除する」「確定文にして」「地の文として採用」などの作業手順・解説）
-
-【最重要・禁止事項（レビュー指摘について）】
-この台本では、音声合成の誤読を防ぐため、医学用語・専門用語を意図的にカタカナ表記しています。
-したがって次は絶対に指摘しないでください（medical_contradictions / awkward_for_doctors / immersion_improvements のいずれにも含めない）:
-- 医学用語・専門用語がカタカナであること
-- カタカナを漢字に直す提案
-- 「医師なら漢字で書く」「カタカナは不自然」といった表記スタイルの指摘
-内容の医学的正しさ・現場表現・臨場感のみを見てください。
-
-【VOICEVOXルビ付与（必須）】
-読み間違えやすい漢字の医学用語・専門用語・難読語について、ruby_annotations に列挙してください。
-- surface: 台本中の表記そのもの（漢字など。すでにカタカナだけの語は原則不要）
-- reading: 正しい読み（ひらがな、またはカタカナ）
-- すでに {{表記|よみ}} 形式のものがある場合は重複させない
-- 人名の難読、薬品名、疾患名、手技名、略語の読みなどを優先（最大40件）
-- 読みは実際の医療現場の読みに合わせる（例: 心筋梗塞→しんきんこうそく）
-
-観点:
-1. medical_contradictions … 医学的に矛盾している箇所
-2. awkward_for_doctors … 現役医師が聞くと違和感がある表現（カタカナ表記そのものは対象外）
-3. immersion_improvements … 臨場感が増す修正（カタカナを漢字にする案は出さない）
-4. ruby_annotations … VOICEVOX用ルビ一覧
-
-形式:
-{{
-  "medical_contradictions": [
-    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
-  ],
-  "awkward_for_doctors": [
-    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
-  ],
-  "immersion_improvements": [
-    {{"original": "引用", "issue": "問題", "suggestion": "差し替え用の完成文のみ"}}
-  ],
-  "ruby_annotations": [
-    {{"surface": "心筋梗塞", "reading": "しんきんこうそく"}}
-  ]
-}}
-
-該当が無い観点は空配列 [] にしてください。
-
-台本:
----
-{script}
----
-"""
-
-
 def normalize_voicevox_reading(reading: str) -> str:
     """ルビの読みから余計な記号を除く。"""
     reading = (reading or "").strip()
@@ -506,113 +700,6 @@ def canonicalize_voicevox_ruby_delimiters(text: str) -> str:
     return _RUBY_TAG_RE.sub(_repl, text)
 
 
-def apply_voicevox_ruby(
-    script: str,
-    annotations: list[dict[str, str]],
-    *,
-    fullwidth: bool = True,
-) -> str:
-    """
-    VOICEVOXルビを台本へ付与する。
-    fullwidth=True のとき ｛表記｜よみ｝、False のとき {表記|よみ}。
-    半角/全角の区切り記号は区別しない。既にあるルビは壊さない。
-
-    同じ位置に複数の辞書語が当てはまるときは、文字数が多い用語を優先する。
-    例: 「所」と「所見」なら「所見」を採用する。
-    """
-    text = canonicalize_voicevox_ruby_delimiters(script or "")
-    if not annotations:
-        return (
-            to_fullwidth_ruby_delimiters(text)
-            if fullwidth
-            else text
-        )
-
-    protected: dict[str, str] = {}
-
-    def _protect(match: re.Match) -> str:
-        key = f"\x00RUBY{len(protected)}\x00"
-        protected[key] = match.group(0)
-        return key
-
-    def protect_existing(src: str) -> str:
-        return _RUBY_TAG_RE.sub(_protect, src)
-
-    pairs: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for item in annotations:
-        surface = str(item.get("surface") or "").strip()
-        reading = normalize_voicevox_reading(str(item.get("reading") or ""))
-        if not surface or not reading:
-            continue
-        if surface in seen:
-            continue
-        if surface == reading:
-            continue
-        if len(reading) < 1:
-            continue
-        seen.add(surface)
-        pairs.append((surface, reading))
-
-    # 長い用語を先に試し、短い用語（例:「所」）より「所見」を優先
-    pairs.sort(key=lambda x: (len(x[0]), x[0]), reverse=True)
-    text = protect_existing(text)
-
-    # プレースホルダ以外の平文だけを、左から最長一致で置換する
-    placeholder_re = re.compile(r"\x00RUBY\d+\x00")
-    pieces: list[str] = []
-    last = 0
-    for m in placeholder_re.finditer(text):
-        if m.start() > last:
-            pieces.append(
-                _apply_ruby_longest_match(text[last:m.start()], pairs, fullwidth)
-            )
-        pieces.append(m.group(0))
-        last = m.end()
-    if last < len(text):
-        pieces.append(_apply_ruby_longest_match(text[last:], pairs, fullwidth))
-    text = "".join(pieces)
-
-    for key, val in protected.items():
-        text = text.replace(key, val)
-    text = canonicalize_voicevox_ruby_delimiters(text)
-    return to_fullwidth_ruby_delimiters(text) if fullwidth else text
-
-
-def _apply_ruby_longest_match(
-    segment: str,
-    pairs: list[tuple[str, str]],
-    fullwidth: bool,
-) -> str:
-    """
-    平文の先頭から順に見て、その位置で一致する用語のうち
-    いちばん文字数が多いものをルビにする。
-    pairs は文字数の多い順に並べておくこと。
-    """
-    if not segment or not pairs:
-        return segment
-    out: list[str] = []
-    i = 0
-    n = len(segment)
-    while i < n:
-        matched = False
-        for surface, reading in pairs:
-            length = len(surface)
-            if length <= 0 or i + length > n:
-                continue
-            if segment[i : i + length] == surface:
-                if fullwidth:
-                    out.append("｛" + surface + "｜" + reading + "｝")
-                else:
-                    out.append("{" + surface + "|" + reading + "}")
-                i += length
-                matched = True
-                break
-        if not matched:
-            out.append(segment[i])
-            i += 1
-    return "".join(out)
-
 
 def to_fullwidth_ruby_delimiters(text: str) -> str:
     """半角ルビ {表記|よみ} を全角 ｛表記｜よみ｝ にそろえる。"""
@@ -628,369 +715,9 @@ def to_fullwidth_ruby_delimiters(text: str) -> str:
     return _RUBY_TAG_RE.sub(_repl, text)
 
 
-# 組み込みの最低限辞書（ファイルが無いときの予備）
-DEFAULT_RUBY_DICT: list[tuple[str, str]] = [
-    ("心筋梗塞", "しんきんこうそく"),
-    ("心不全", "しんふぜん"),
-    ("心房細動", "しんぼうさいどう"),
-    ("心室細動", "しんしつさいどう"),
-    ("心静止", "しんせいし"),
-    ("肺塞栓", "はいそくせん"),
-    ("敗血症", "はいけつしょう"),
-    ("呼吸不全", "こきゅうふぜん"),
-    ("気管内挿管", "きかんないそうかん"),
-    ("気管挿管", "きかんそうかん"),
-    ("胸骨圧迫", "きょうこつあっぱく"),
-    ("昇圧剤", "しょうあつざい"),
-    ("降圧", "こうあつ"),
-    ("輸液", "ゆえき"),
-    ("造影剤", "ぞうえいざい"),
-    ("心電図", "しんでんず"),
-    ("動脈血", "どうみゃくけつ"),
-    ("静脈血", "じょうみゃくけつ"),
-    ("酸素飽和度", "さんそほうわど"),
-    ("意識障害", "いしきしょうがい"),
-    ("昏睡", "こんすい"),
-    ("痙攣", "けいれん"),
-    ("麻痺", "まひ"),
-    ("梗塞", "こうそく"),
-    ("出血", "しゅっけつ"),
-    ("麻酔", "ますい"),
-    ("開腹", "かいふく"),
-    ("開胸", "かいきょう"),
-    ("縫合", "ほうごう"),
-    ("抜管", "ばっかん"),
-    ("挿管", "そうかん"),
-    ("透析", "とうせき"),
-    ("血糖", "けっとう"),
-    ("白血球", "はっけっきゅう"),
-    ("赤血球", "せっけっきゅう"),
-    ("血小板", "けっしょうばん"),
-    ("凝固", "ぎょうこ"),
-    ("抗凝固", "こうぎょうこ"),
-    ("抗生剤", "こうせいざい"),
-    ("抗菌薬", "こうきんやく"),
-]
-
-
-def parse_ruby_dict_text(raw: str) -> list[tuple[str, str]]:
-    """
-    辞書テキストを読む。
-    対応:
-    - 用語<TAB>よみ
-    - 用語,よみ
-    - 用語｜よみ
-    - 用語|よみ
-    - 用語  よみ（空白2つ以上）
-    - 用語 よみ（空白1つ。右側がかな中心のとき）
-    """
-    out: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for line in (raw or "").replace("\r\n", "\n").split("\n"):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        surface = ""
-        reading = ""
-        if "\t" in line:
-            surface, _, reading = line.partition("\t")
-        elif "｜" in line:
-            surface, _, reading = line.partition("｜")
-        elif "|" in line and not line.startswith("{"):
-            surface, _, reading = line.partition("|")
-        elif "," in line:
-            surface, _, reading = line.partition(",")
-        else:
-            parts = re.split(r"\s{2,}", line, maxsplit=1)
-            if len(parts) == 2:
-                surface, reading = parts
-            else:
-                # 1つの空白区切りも、右側が「よみ」らしいときは受け入れる
-                parts = line.split()
-                if len(parts) == 2:
-                    maybe_surface, maybe_reading = parts
-                    if re.fullmatch(r"[ぁ-んァ-ンー・ヴ゛゜A-Za-z0-9]+", maybe_reading):
-                        surface, reading = maybe_surface, maybe_reading
-        surface = surface.strip().strip("「」『』\"'")
-        reading = normalize_voicevox_reading(reading)
-        if not surface or not reading or surface in seen or surface == reading:
-            continue
-        seen.add(surface)
-        out.append((surface, reading))
-    return out
-
-
-def load_ruby_dict_from_path(path: Path | None = None) -> list[tuple[str, str]]:
-    """辞書ファイル（TSVなど）を読み込む。無ければ空リスト。"""
-    p = path or RUBY_DICT_PATH
-    try:
-        if not p.is_file():
-            return []
-        return parse_ruby_dict_text(p.read_text(encoding="utf-8"))
-    except OSError:
-        return []
-
-
-def get_active_ruby_dictionary() -> list[tuple[str, str]]:
-    """
-    使うルビ辞書を返す。
-    優先: 編集で学習した語 → 画面で読み込んだ辞書 → 標準辞書 → 組み込み
-    同じ用語は先勝ち。
-    """
-    merged: list[tuple[str, str]] = []
-    seen: set[str] = set()
-
-    def _add(pairs: list[tuple[str, str]]) -> None:
-        for surface, reading in pairs:
-            surface = (surface or "").strip()
-            reading = normalize_voicevox_reading(reading)
-            if not surface or not reading or surface in seen or surface == reading:
-                continue
-            seen.add(surface)
-            merged.append((surface, reading))
-
-    learned = None
-    custom = None
-    try:
-        learned = st.session_state.get("ruby_dict_learned")
-        custom = st.session_state.get("ruby_dict_custom")
-    except Exception:
-        learned = None
-        custom = None
-    if isinstance(learned, list) and learned:
-        _add([(str(a), str(b)) for a, b in learned])
-    if isinstance(custom, list) and custom:
-        _add([(str(a), str(b)) for a, b in custom])
-    _add(load_ruby_dict_from_path(RUBY_DICT_PATH))
-    _add(DEFAULT_RUBY_DICT)
-    return merged
-
-
-def extract_ruby_pairs_from_script(script: str) -> list[tuple[str, str]]:
-    """台本中の ｛用語｜よみ｝ をすべて取り出す（同じ用語は後勝ち）。"""
-    text = canonicalize_voicevox_ruby_delimiters(script or "")
-    order: list[str] = []
-    mapping: dict[str, str] = {}
-    for m in _RUBY_TAG_RE.finditer(text):
-        surface = (m.group(1) or "").strip()
-        reading = normalize_voicevox_reading(m.group(2) or "")
-        if not surface or not reading or surface == reading:
-            continue
-        if surface not in mapping:
-            order.append(surface)
-        mapping[surface] = reading
-    return [(s, mapping[s]) for s in order]
-
-
-def is_ruby_dict_surface_allowed(surface: str) -> bool:
-    """ルビ辞書へ学習反映してよい用語かを返す。1文字語は取り込まない。"""
-    return len((surface or "").strip()) >= 2
-
-
-def find_ruby_dict_updates(
-    baseline_script: str,
-    edited_script: str,
-) -> list[tuple[str, str]]:
-    """
-    自動付与稿と修正稿を比べ、新規または読みが変わったルビを返す。
-    """
-    base_map = {s: r for s, r in extract_ruby_pairs_from_script(baseline_script)}
-    updates: list[tuple[str, str]] = []
-    for surface, reading in extract_ruby_pairs_from_script(edited_script):
-        if not is_ruby_dict_surface_allowed(surface):
-            continue
-        if base_map.get(surface) != reading:
-            updates.append((surface, reading))
-    return updates
-
-
-def find_rubies_missing_from_dictionary(
-    script: str,
-    dictionary: list[tuple[str, str]] | None = None,
-) -> list[tuple[str, str]]:
-    """
-    ルビ入り原稿にあるが、辞書に無い（または読みが違う）ルビを返す。
-    """
-    dict_map = {
-        s: r
-        for s, r in (
-            dictionary
-            if dictionary is not None
-            else get_active_ruby_dictionary()
-        )
-    }
-    missing: list[tuple[str, str]] = []
-    for surface, reading in extract_ruby_pairs_from_script(script):
-        if not is_ruby_dict_surface_allowed(surface):
-            continue
-        if dict_map.get(surface) != reading:
-            missing.append((surface, reading))
-    return missing
-
-
-def export_active_ruby_dictionary_file() -> Path:
-    """いま有効なルビ辞書を ルビ辞書.txt に書き出す。"""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    export_text = format_ruby_dict_text(get_active_ruby_dictionary())
-    RUBY_DICT_EXPORT_PATH.write_text(export_text, encoding="utf-8")
-    st.session_state.ruby_dict_export_ready = True
-    return RUBY_DICT_EXPORT_PATH
-
-
-def sync_script_rubies_into_dictionary(script: str) -> list[tuple[str, str]]:
-    """
-    ルビ入り最終原稿と辞書を比べ、足りないルビを辞書へ追加する。
-    追加後の辞書ファイルも書き出す。戻り値は今回追加した一覧。
-    """
-    missing = find_rubies_missing_from_dictionary(script)
-    applied = apply_ruby_updates_to_learned_dict(missing) if missing else []
-    # 追加がなくても、完成後にダウンロードできるよう最新版を書き出す
-    export_active_ruby_dictionary_file()
-    st.session_state.ruby_dict_post_video_updates = applied
-    return applied
-
-
-def format_ruby_dict_text(pairs: list[tuple[str, str]]) -> str:
-    """用語\\tよみ 形式の辞書テキストにする。"""
-    lines: list[str] = []
-    seen: set[str] = set()
-    for surface, reading in pairs:
-        surface = (surface or "").strip()
-        reading = normalize_voicevox_reading(reading)
-        if not surface or not reading or surface == reading or surface in seen:
-            continue
-        seen.add(surface)
-        lines.append(f"{surface}\t{reading}")
-    return ("\n".join(lines) + "\n") if lines else ""
-
-
-def apply_ruby_updates_to_learned_dict(
-    updates: list[tuple[str, str]],
-) -> list[tuple[str, str]]:
-    """
-    修正ルビを学習辞書に反映し、ルビ辞書.txt を書き出す。
-    戻り値: 今回反映した更新一覧
-    """
-    if not updates:
-        return []
-    learned_raw = st.session_state.get("ruby_dict_learned") or []
-    learned_map: dict[str, str] = {}
-    order: list[str] = []
-    for item in learned_raw:
-        try:
-            surface, reading = item[0], item[1]
-        except Exception:
-            continue
-        surface = str(surface).strip()
-        reading = normalize_voicevox_reading(str(reading))
-        if not surface or not reading:
-            continue
-        if surface not in learned_map:
-            order.append(surface)
-        learned_map[surface] = reading
-    applied: list[tuple[str, str]] = []
-    for surface, reading in updates:
-        surface = (surface or "").strip()
-        reading = normalize_voicevox_reading(reading)
-        if not surface or not reading or surface == reading:
-            continue
-        if not is_ruby_dict_surface_allowed(surface):
-            continue
-        if learned_map.get(surface) == reading:
-            continue
-        if surface not in learned_map:
-            order.append(surface)
-        learned_map[surface] = reading
-        applied.append((surface, reading))
-    st.session_state.ruby_dict_learned = [(s, learned_map[s]) for s in order]
-    # いま有効な全辞書を書き出し（学習反映後）
-    export_active_ruby_dictionary_file()
-    st.session_state.ruby_dict_last_updates = applied
-    return applied
-
-
-def collect_dictionary_ruby_annotations(
-    script: str,
-    dictionary: list[tuple[str, str]] | None = None,
-) -> list[dict[str, str]]:
-    """
-    台本中に現れる用語だけ、辞書からルビ候補を集める。
-    文字数の多い用語を先に並べる（適用時の優先と揃える）。
-    """
-    text = strip_voicevox_ruby(script or "")
-    dict_pairs = dictionary if dictionary is not None else get_active_ruby_dictionary()
-    found: list[dict[str, str]] = []
-    # 長い用語を先に（例: 「所見」を「所」より優先）
-    for surface, reading in sorted(
-        dict_pairs, key=lambda x: (len(x[0]), x[0]), reverse=True
-    ):
-        if surface in text and surface != reading:
-            found.append({"surface": surface, "reading": reading})
-    return found
-
-
-def apply_dictionary_ruby_to_script(
-    script: str,
-    dictionary: list[tuple[str, str]] | None = None,
-) -> tuple[str, int, list[dict[str, str]]]:
-    """
-    辞書を対照して ｛用語｜よみ｝ を付与する。
-    同じ位置では文字数が多い用語を優先（例: 所 < 所見）。
-    戻り値: (ルビ付き台本, 付与件数, 使った注釈一覧)
-    """
-    annotations = collect_dictionary_ruby_annotations(script, dictionary)
-    out = apply_voicevox_ruby(script, annotations, fullwidth=True)
-    return out, count_voicevox_ruby(out), annotations
-
-
-def collect_default_ruby_annotations(script: str) -> list[dict[str, str]]:
-    """互換: 辞書ルビ候補を集める。"""
-    return collect_dictionary_ruby_annotations(script)
-
-
-def merge_ruby_annotations(
-    *groups: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    """複数のルビ一覧をまとめ、同じ表記は先勝ち。"""
-    merged: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for group in groups:
-        for item in group or []:
-            surface = str(item.get("surface") or "").strip()
-            reading = normalize_voicevox_reading(str(item.get("reading") or ""))
-            if not surface or not reading or surface in seen or surface == reading:
-                continue
-            seen.add(surface)
-            merged.append({"surface": surface, "reading": reading})
-    return merged
-
 
 def count_voicevox_ruby(text: str) -> int:
     return len(_RUBY_TAG_RE.findall(canonicalize_voicevox_ruby_delimiters(text or "")))
-
-
-def prepare_script_for_voicevox(
-    script: str,
-    extra_annotations: list[dict[str, str]] | None = None,
-    enabled: bool = True,
-) -> tuple[str, int]:
-    """
-    音声生成直前にルビを整える。
-    enabled=True（既定）: 辞書ルビ＋追加注釈（レビュー等）を付与
-    enabled=False: ルビを外した文を返す
-    戻り値: (台本, ルビ件数)
-    """
-    text = canonicalize_voicevox_ruby_delimiters(script or "")
-    if not enabled:
-        plain = strip_voicevox_ruby(text)
-        return plain, 0
-    # 辞書を優先（誤読の少ないよみ）→ そのあとレビュー等の追加注釈
-    dict_ann = collect_dictionary_ruby_annotations(text)
-    annotations = merge_ruby_annotations(dict_ann, list(extra_annotations or []))
-    out = apply_voicevox_ruby(text, annotations, fullwidth=True)
-    # VOICEVOX処理のため内部は半角にそろえて件数カウント
-    out_half = canonicalize_voicevox_ruby_delimiters(out)
-    return out_half, count_voicevox_ruby(out_half)
 
 
 # 字幕折り返し／分割：行頭に置かない文字（閉じの 」 など）
@@ -1078,29 +805,6 @@ def _safe_force_chunks(text: str, max_chars: int) -> list[str]:
     return out
 
 
-def is_katakana_notation_complaint(item: dict[str, str]) -> bool:
-    """カタカナ表記そのものを問題にしている指摘なら True（除外用）。"""
-    blob = " ".join(
-        [
-            str(item.get("issue") or ""),
-            str(item.get("suggestion") or ""),
-            str(item.get("original") or ""),
-        ]
-    )
-    patterns = [
-        r"カタカナ",
-        r"漢字(に|へ|で|表記|に直|に直し|に修正|で書)",
-        r"漢字表記",
-        r"かな表記",
-        r"仮名表記",
-        r"読み仮名",
-        r"ルビ",
-        r"正式な漢字",
-        r"漢字のほうが",
-        r"漢字に(直し|変え|置換|修正)",
-    ]
-    return any(re.search(p, blob) for p in patterns)
-
 
 def strip_code_fence(text: str) -> str:
     text = text.strip()
@@ -1109,87 +813,6 @@ def strip_code_fence(text: str) -> str:
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
-
-def repair_json_text(text: str) -> str:
-    """よくある壊れ方を直してから json.loads する。"""
-    text = strip_code_fence(text)
-    # 最初の { から最後の } まで
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        text = text[start : end + 1]
-    # 末尾カンマ: ,] や ,} を除去
-    text = re.sub(r",\s*([\]}])", r"\1", text)
-    # スマートクォートを半角に
-    text = (
-        text.replace("“", '"')
-        .replace("”", '"')
-        .replace("‘", "'")
-        .replace("’", "'")
-    )
-    return text
-
-
-def parse_json_loose(text: str) -> dict[str, Any]:
-    """モデル出力から JSON をできるだけ取り出す。"""
-    candidates = [text, repair_json_text(text)]
-    errors: list[str] = []
-    for cand in candidates:
-        try:
-            data = json.loads(cand)
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError as e:
-            errors.append(str(e))
-
-    # さらに: 制御文字除去して再試行
-    cleaned = repair_json_text(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text))
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, dict):
-            return data
-    except json.JSONDecodeError as e:
-        errors.append(str(e))
-
-    raise ValueError(
-        "AIの返答をJSONとして読めませんでした。\n"
-        + (errors[-1] if errors else "")
-    )
-
-
-def ask_claude_fix_json(api_key: str, model: str, broken: str) -> str:
-    """壊れたJSONを、同じモデルに直してもらう。"""
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    body = {
-        "model": model,
-        "max_tokens": 4096,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "次のテキストを、有効なJSONオブジェクトだけに直してください。"
-                    "説明文やコードフェンスは不要です。"
-                    "キーは medical_contradictions / awkward_for_doctors / "
-                    "immersion_improvements / ruby_annotations を維持してください。"
-                    "医学用語のカタカナ表記を問題にする指摘があれば削除してください。\n\n"
-                    f"{broken[:12000]}"
-                ),
-            }
-        ],
-    }
-    resp = http_session_direct().post(url, headers=headers, json=body, timeout=120)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"JSON修正リクエスト失敗 (HTTP {resp.status_code}): {resp.text[:300]}"
-        )
-    data = resp.json()
-    parts = data.get("content", [])
-    return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 
 
 def http_session_direct() -> requests.Session:
@@ -1203,337 +826,6 @@ def http_session_direct() -> requests.Session:
     session.proxies = {"http": None, "https": None}
     return session
 
-
-def review_with_claude(script: str, api_key: str) -> dict[str, Any]:
-    """Anthropic Messages API でレビュー（APIキーは引数経由、直書きしない）。"""
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    prompt = build_review_prompt(script)
-    last_error = ""
-
-    for model in CLAUDE_MODEL_CANDIDATES:
-        body = {
-            "model": model,
-            "max_tokens": 8192,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        try:
-            resp = http_session_direct().post(
-                url, headers=headers, json=body, timeout=120
-            )
-        except requests.exceptions.ProxyError as e:
-            raise RuntimeError(
-                "プロキシ（通信の仲介）のせいで Claude に接続できませんでした。\n"
-                "ターミナルで次を実行してから、アプリを再起動してください:\n"
-                "  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy\n"
-                f"詳細: {e}"
-            ) from e
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(
-                "Claude API への通信に失敗しました。"
-                "ネット接続と APIキーを確認してください。\n"
-                f"詳細: {e}"
-            ) from e
-
-        if resp.status_code == 404 and "model" in resp.text.lower():
-            last_error = f"{model}: {resp.text[:200]}"
-            continue  # 次のモデル候補を試す
-
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Claude API エラー (HTTP {resp.status_code}): {resp.text[:500]}"
-            )
-
-        data = resp.json()
-        parts = data.get("content", [])
-        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-        if not text:
-            raise RuntimeError("Claude API から空の返答が返りました。")
-
-        try:
-            parsed = parse_json_loose(text)
-        except ValueError:
-            # 壊れたJSONを一度だけ修正依頼
-            try:
-                fixed = ask_claude_fix_json(api_key, model, text)
-                parsed = parse_json_loose(fixed)
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    "Claudeのレビュー結果を読み取れませんでした。"
-                    "もう一度『1. 台本をレビューする』を押してください。\n"
-                    f"詳細: {e}"
-                ) from e
-
-        result = normalize_review(parsed)
-        result["mode"] = "claude"
-        result["model_used"] = model
-        return result
-
-    raise RuntimeError(
-        "利用できる Claude モデルが見つかりませんでした。\n"
-        f"試したモデル: {', '.join(CLAUDE_MODEL_CANDIDATES)}\n"
-        f"最後のエラー: {last_error}"
-    )
-
-
-def build_drama_script_prompt(paper_text: str) -> str:
-    """医学論文テキストから YouTube 医学ドラマ台本を作る指示文。"""
-    paper = (paper_text or "").strip()
-    if len(paper) > PAPER_TEXT_MAX_CHARS:
-        paper = (
-            paper[:PAPER_TEXT_MAX_CHARS]
-            + "\n\n…（以下、長さ制限のため省略）"
-        )
-    return f"""あなたは医学教育向け YouTube 動画の台本作家かつ臨床医です。
-次の医学論文（または症例報告）の内容をもとに、ナレーション台本だけを書いてください。
-
-【必須条件】
-① VOICEVOX 1.0倍速で読み上げたとき約10〜12分に収まる YouTube 医学ドラマ台本にする（本文の文字数はおおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字を目安。これより長くしない）。
-② すべてナレーターが話し、ドラマが展開する。場面転換もナレーションで示す。
-③ 読み上げる台本本文以外は一切書かない。タイトル見出し、サブタイトル、シーン番号、「注釈」「解説」「制作メモ」、私への説明、前置き、後書き、Markdown記法は禁止。
-④ 教育目的。ドラマ前半では正しい診断名を決して明示しない（示唆・鑑別の提示は可。確定診断は後半）。
-⑤ 難易度は、医師免許を持つ研修医（初期研修医）が理解できるレベルにする。医学用語は使ってよいが、専門医向けの過度に高度な議論・稀少な略語の羅列は避ける。必要なら短い言い換えや文脈で意味が追えるようにする。ただし台本本文で視聴者に呼びかけない。「研修医のみなさん」「みなさん」「皆さん」などへの呼びかける表現は禁止（難易度の目安と、台詞・ナレーションの相手は別）。
-⑥ 検査値は、医学的な意味付けが変わらない範囲で異なる数字に置き換えてよい（フィクション化）。ただし単位は原文の表記をそのまま使う（例: mg/dL, mEq/L, g/dL, IU/L）。単位を日本語訳や別表記に変えない。
-⑦ 薬物名はアルファベットでもカタカナでもよい（例: vancomycin / バンコマイシン）。漢字訳にはしない。
-⑧ YouTube 字幕を想定し、各まとまりは短すぎず長すぎない長さ（おおよそ1画面に収まる程度）にする。
-⑨ 登場人物のセリフには必ずカギ括弧「」を付ける。
-⑩ 必ずしも一文ごとに改行しない。1画面の字幕に収まる長さなら、複数文を改行せずにつなげてよい。
-⑪ 次の画面（改ページ／改行）へ移るときは、原則として句読点（。、！？ など）の直後で切る。単語の途中（漢字熟語の途中、英単語や単位・薬物名の途中）では切らない。
-⑫ 鑑別診断の診断名を列挙するときは、診断名どうしを読点「、」だけで区切る。句点「。」では区切らない（禁止例: 心筋梗塞。心不全。肺炎。／正しい例: 心筋梗塞、心不全、肺炎。）。臓器名などの列挙も同様に読点でつなぎ、途中で改行しない。列挙全体の文末だけ句点で閉じる。例：胃、小腸、大腸、肝臓、胆嚢、骨盤内。
-⑬ この段階ではルビ（｛用語｜よみ｝）を付けない。漢字のまま書く（ルビは後工程で辞書から付与する）。ただし、入力側にすでにルビがある場合は消さない（この工程では新規には付けない）。
-⑭ 出力する前に、医師として医学的に違和感のある表現・論理の破綻を自分で直し、その最終稿だけを出す。
-
-【出力形式】
-- 台本本文のみ（プレーンテキスト）
-- 最初の行からナレーションを始める
-- コードブロックやJSONで囲まない
-
-【論文テキスト】
-{paper}
-"""
-
-
-def _claude_messages_text(
-    api_key: str,
-    prompt: str,
-    *,
-    max_tokens: int = 16000,
-) -> tuple[str, str]:
-    """Claude Messages API を呼び、返答テキストと使用モデル名を返す。"""
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    last_error = ""
-    for model in CLAUDE_MODEL_CANDIDATES:
-        body = {
-            "model": model,
-            "max_tokens": int(max_tokens),
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        try:
-            resp = http_session_direct().post(
-                url, headers=headers, json=body, timeout=300
-            )
-        except requests.exceptions.ProxyError as e:
-            raise RuntimeError(
-                "プロキシのせいで Claude に接続できませんでした。\n"
-                "ターミナルで proxy を解除してからアプリを再起動してください。\n"
-                f"詳細: {e}"
-            ) from e
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(
-                "Claude API への通信に失敗しました。\n"
-                f"詳細: {e}"
-            ) from e
-
-        if resp.status_code == 404 and "model" in resp.text.lower():
-            last_error = f"{model}: {resp.text[:200]}"
-            continue
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Claude API エラー (HTTP {resp.status_code}): {resp.text[:500]}"
-            )
-        data = resp.json()
-        parts = data.get("content", [])
-        text = "".join(
-            p.get("text", "") for p in parts if p.get("type") == "text"
-        ).strip()
-        if not text:
-            raise RuntimeError("Claude API から空の返答が返りました。")
-        return text, model
-
-    raise RuntimeError(
-        "利用できる Claude モデルが見つかりませんでした。\n"
-        f"試したモデル: {', '.join(CLAUDE_MODEL_CANDIDATES)}\n"
-        f"最後のエラー: {last_error}"
-    )
-
-
-def _strip_script_wrappers(text: str) -> str:
-    """台本以外の前置き・コード枠を取り除く。"""
-    text = strip_code_fence((text or "").strip())
-    # よくある前置き行を落とす
-    lines = text.replace("\r\n", "\n").split("\n")
-    drop_prefixes = (
-        "以下が",
-        "以下に",
-        "台本を作成",
-        "承知",
-        "了解",
-        "【台本】",
-        "■台本",
-        "# ",
-    )
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines:
-        first = lines[0].strip()
-        if any(first.startswith(p) for p in drop_prefixes) and len(first) < 80:
-            lines.pop(0)
-            while lines and not lines[0].strip():
-                lines.pop(0)
-            continue
-        break
-    return "\n".join(lines).strip()
-
-
-def polish_drama_script_medically(script: str, api_key: str) -> str:
-    """医師視点で違和感・論理破綻を直し、台本本文だけ返す。"""
-    prompt = f"""あなたは臨床医です。次の YouTube 医学ドラマ台本を読み、
-医学的に違和感のある表現・論理的におかしい箇所だけを直してください。
-
-【厳守】
-- 出力は修正後の台本本文のみ（説明・箇条書きの修正リストは禁止）
-- ナレーションのみの形式を維持する
-- ドラマ前半で正しい診断を明示しないルールは維持する
-- 難易度は医師免許を持つ研修医が理解できるレベルを維持する（過度に高度化しない）
-- 「研修医のみなさん」「みなさん」など視聴者への呼びかけは入れない／残っていれば削除する
-- 長さは VOICEVOX 1.0倍速で約10〜12分（おおよそ {DRAMA_SCRIPT_TARGET_CHARS_MIN}〜{DRAMA_SCRIPT_TARGET_CHARS_MAX} 字）を超えないよう、長くしすぎない
-- セリフの「」、列挙の読点ルールは崩さない
-- 鑑別診断の診断名を列挙するときは読点「、」で区切り、句点「。」では区切らない（文末の一句点だけ可）
-- 検査値の単位は原文表記のまま（mg/dL, mEq/L など）。単位を書き換えない
-- 薬物名はアルファベットでもカタカナでもよい（漢字訳にはしない）
-- 改行・改ページは原則として句読点の直後。単語・単位・薬物名の途中では切らない
-- すでに付いているルビ ｛用語｜よみ｝ は削除しない（新規には付けない）
-- 不要な前置き・後書きを付けない
-
-【台本】
-{script}
-"""
-    text, _model = _claude_messages_text(api_key, prompt, max_tokens=16000)
-    return _strip_script_wrappers(text)
-
-
-def generate_drama_script_from_paper(paper_text: str, api_key: str) -> str:
-    """
-    医学論文テキストから、VOICEVOX 1倍速で約10〜12分のナレーション台本を作る。
-    生成後に医学的な自己校正パスを1回行う。
-    """
-    paper = (paper_text or "").strip()
-    if not paper:
-        raise ValueError("論文テキストが空です。")
-    if not (api_key or "").strip():
-        raise RuntimeError(
-            "論文から台本を作るには ANTHROPIC_API_KEY（Claude用の鍵）が必要です。"
-            "画面上部でキーを入力・保存してください。"
-        )
-    draft, model_used = _claude_messages_text(
-        api_key,
-        build_drama_script_prompt(paper),
-        max_tokens=16000,
-    )
-    draft = _strip_script_wrappers(draft)
-    if not draft:
-        raise RuntimeError("台本が空でした。もう一度お試しください。")
-    try:
-        polished = polish_drama_script_medically(draft, api_key)
-        if polished.strip():
-            draft = polished
-    except Exception:
-        # 校正に失敗しても下書きは返す
-        pass
-    _ = model_used
-    return draft.strip()
-
-
-def _heuristic_vancouver_from_paper(paper_text: str) -> str:
-    """APIなし時の簡易抽出（DOIなどが見えるとき）。"""
-    text = (paper_text or "").replace("\r\n", "\n")
-    head = text[:8000]
-    doi = ""
-    m = re.search(
-        r"(?:doi[:\s]*|https?://doi\.org/)(10\.\d{4,9}/[-._;()/:A-Z0-9]+)",
-        head,
-        flags=re.I,
-    )
-    if m:
-        doi = m.group(1).rstrip(".")
-    # 先頭付近のそれらしいタイトル行
-    lines = [ln.strip() for ln in head.split("\n") if ln.strip()]
-    title = ""
-    for ln in lines[:40]:
-        if len(ln) < 20 or len(ln) > 300:
-            continue
-        if re.search(r"abstract|introduction|keywords|©|copyright", ln, re.I):
-            continue
-        if re.search(r"[A-Za-z]{4,}", ln):
-            title = ln
-            break
-    parts = []
-    if title:
-        parts.append(title.rstrip("."))
-    if doi:
-        parts.append(f"doi:{doi}")
-    if parts:
-        return ". ".join(parts) + ("." if not parts[-1].endswith(".") else "")
-    return ""
-
-
-def extract_vancouver_citation_from_paper(paper_text: str, api_key: str = "") -> str:
-    """
-    論文テキストから Vancouver 方式の参考文献1件を作る。
-    例: Author A, Author B. Title. Journal. Year;Vol(Issue):Pages. doi:...
-    """
-    paper = (paper_text or "").strip()
-    if not paper:
-        return ""
-    excerpt = paper[:PAPER_TEXT_MAX_CHARS]
-    if (api_key or "").strip():
-        prompt = f"""次の医学論文テキストから、エンディング画面用の参考文献を
-Vancouver（バンクーバー）引用様式で1件だけ書いてください。
-
-【形式の例】
-Lim J, Wenham T. An Atypical Presentation of Mycoplasma pneumoniae Infection Mimicking Acute Surgical Abdomen in an Adult. Cureus. 2024;16(11):e73665. doi:10.7759/cureus.73665
-
-【ルール】
-- 出力は引用文1行（または必要なら2行）だけ。説明・箇条書き・前後の文言は禁止
-- 著者は姓→名頭文字。3名超なら et al. を使ってよい
-- 雑誌名・年・巻号・ページ／論文番号・DOI が分かれば入れる
-- ライセンス（CC BY など）が本文にあれば末尾に「 / CC BY 4.0」のように付けてよい
-- 不明な項目は無理に作らず省略する
-- Markdownやコードブロックで囲まない
-
-【論文テキスト】
-{excerpt}
-"""
-        try:
-            text, _ = _claude_messages_text(api_key, prompt, max_tokens=800)
-            cite = _strip_script_wrappers(text)
-            # 1〜3行に収める
-            cite_lines = [ln.strip() for ln in cite.splitlines() if ln.strip()]
-            cite = " ".join(cite_lines[:3]).strip()
-            if cite:
-                return cite
-        except Exception:
-            pass
-    return _heuristic_vancouver_from_paper(paper)
 
 
 def apply_paper_reference_to_session(citation: str) -> None:
@@ -1552,117 +844,68 @@ def apply_paper_reference_to_session(citation: str) -> None:
     st.session_state._ending_prefill_sig = None
 
 
-def normalize_title_mukougawa(raw: str) -> str:
-    """タイトルを『〜の向こう側』形に整える（すでに付いていればそのまま）。"""
-    t = (raw or "").strip()
-    t = t.strip("「」『』\"'").strip()
-    t = re.sub(r"^(タイトル案|タイトル)[:：\s]*", "", t).strip()
-    if "\n" in t:
-        t = t.split("\n")[0].strip()
-    t = re.sub(r"[。．!！?？]+$", "", t).strip()
-    if not t:
-        return "診断の向こう側"
-    if t.endswith("の向こう側"):
-        return t
-    return f"{t}の向こう側"
-
-
-def _heuristic_title_from_paper(paper_text: str) -> str:
-    """APIなし時の簡潔なタイトル案。"""
-    head = (paper_text or "")[:5000]
-    # よくある疾患・病態キーワード（短いもの優先で拾う）
-    keywords = [
-        "敗血症",
-        "心筋梗塞",
-        "肺塞栓",
-        "大動脈解離",
-        "髄膜炎",
-        "脳梗塞",
-        "消化管穿孔",
-        "急性腹症",
-        "糖尿病性ケトアシドーシス",
-        "アナフィラキシー",
-        "心タンポナーデ",
-        "気胸",
-        "肺炎",
-        "虫垂炎",
-        "胆石",
-        "膵炎",
-        "腎盂腎炎",
-        "腸閉塞",
-        "心筋炎",
-        "心不全",
-        "喘息",
-        "結核",
-        "HIV",
-        "SLE",
-        "白血病",
-        "リンパ腫",
-    ]
-    for kw in keywords:
-        if kw in head:
-            return normalize_title_mukougawa(kw)
-    # 英語病名の簡易対応
-    eng = [
-        (r"\bsepsis\b", "敗血症"),
-        (r"\bpneumonia\b", "肺炎"),
-        (r"mycoplasma", "マイコプラズマ"),
-        (r"appendicitis", "虫垂炎"),
-        (r"pulmonary embolism", "肺塞栓"),
-        (r"myocardial infarction", "心筋梗塞"),
-    ]
-    for pat, jp in eng:
-        if re.search(pat, head, re.I):
-            return normalize_title_mukougawa(jp)
-    return "診断の向こう側"
-
-
-def suggest_drama_title_from_paper(paper_text: str, api_key: str = "") -> str:
-    """
-    論文内容から簡潔なタイトル案を1つ作る。
-    必ず『〜の向こう側』の形にする。
-    """
-    paper = (paper_text or "").strip()
-    if not paper:
-        return "診断の向こう側"
-    excerpt = paper[: min(20000, len(paper))]
-    if (api_key or "").strip():
-        prompt = f"""次の医学論文（症例報告など）の内容から、
-YouTube医学ドラマ用の簡潔な日本語タイトルを1つだけ考えてください。
-
-【必須形式】
-「〇〇の向こう側」
-（例: 敗血症の向こう側 / 急性腹症の向こう側 / 肺塞栓の向こう側）
-
-【ルール】
-- 出力はタイトル1行だけ。説明・箇条書き・引用符・前置きは禁止
-- 〇〇は疾患・病態・臨床テーマを短い日本語で（長くしすぎない）
-- 論文タイトルの直訳にしない。視聴者が惹かれる簡潔な言葉にする
-- 正しい診断名をネタバレしすぎない範囲で、テーマが伝わる語を選ぶ
-- Markdownやコードブロックで囲まない
-
-【論文テキスト】
-{excerpt}
-"""
-        try:
-            text, _ = _claude_messages_text(api_key, prompt, max_tokens=200)
-            title = normalize_title_mukougawa(_strip_script_wrappers(text))
-            if title:
-                return title
-        except Exception:
-            pass
-    return _heuristic_title_from_paper(paper)
-
-
 def render_video_title_input() -> None:
     """
-    タイトル手入力欄のみ（自動提案なし）。
+    MP4作成直前のタイトル入力（この画面に1つだけ）。
     一度入れた内容は、ユーザーが上書きするまで session に残る。
     """
+    st.write("動画タイトル")
     st.text_input(
-        "動画のタイトル（自分で入力）",
+        "動画のタイトル（自分で入力・あとから上書き可）",
         key="video_title",
         placeholder="ここにタイトルを入力",
+    )
+    st.caption(
+        "MP4作成の直前に1度入力します。ファイル名に使います。"
+        " あとから書き換えても大丈夫です。"
+    )
+
+
+def record_script_upload_meta(filename: str = "") -> None:
+    """台本ファイルを取り込んだ日時を記録する（バージョン表示用）。"""
+    st.session_state.script_uploaded_at = datetime.now().isoformat(timespec="seconds")
+    st.session_state.script_upload_filename = str(filename or "").strip()
+
+
+def assert_script_upload_size(raw: bytes, filename: str = "") -> None:
+    """台本ファイルが大きすぎる場合は例外を出す。"""
+    size = len(raw or b"")
+    if size > MAX_SCRIPT_UPLOAD_BYTES:
+        mb = MAX_SCRIPT_UPLOAD_BYTES / (1024 * 1024)
+        name = (filename or "ファイル").strip()
+        raise ValueError(
+            f"{name} が大きすぎます（{size / (1024 * 1024):.1f} MB）。"
+            f" {mb:.0f} MB 以下にしてください。"
+        )
+
+
+def format_script_version_label() -> str:
+    """台本バージョン（アップロード日時）の表示文。"""
+    raw = str(st.session_state.get("script_uploaded_at") or "").strip()
+    name = str(st.session_state.get("script_upload_filename") or "").strip()
+    if not raw:
+        return "台本バージョン: （まだアップロード日時がありません）"
+    try:
+        dt = datetime.fromisoformat(raw)
+        stamp = (
+            f"{dt.year}年{dt.month}月{dt.day}日 "
+            f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+        )
+    except ValueError:
+        stamp = raw
+    if name:
+        return f"台本バージョン: {stamp}（ファイル: {name}）"
+    return f"台本バージョン: {stamp}"
+
+
+def render_script_version_banner() -> None:
+    """MP4作成直前などに、台本バージョンを目立たせて出す。"""
+    label = html.escape(format_script_version_label(), quote=True)
+    st.markdown(
+        f'<div style="font-size:1.15rem;font-weight:600;margin:0.4rem 0 0.6rem 0;'
+        f'padding:0.55rem 0.75rem;background:#f3f4f6;border-radius:6px;color:#111;">'
+        f"{label}</div>",
+        unsafe_allow_html=True,
     )
 
 
@@ -1673,7 +916,7 @@ def update_export_progress(
     pct: int,
     message: str = "",
 ) -> None:
-    """進捗バーと％数字を同時に更新する（画面中央付近で大きく表示）。"""
+    """進捗バーと％数字を毎回必ず更新する（画面で大きく表示）。"""
     n = max(0, min(100, int(pct)))
     msg = (message or "").strip()
     bar_text = f"{n}%"
@@ -1683,10 +926,16 @@ def update_export_progress(
     try:
         progress.progress(n, text=bar_text)
     except TypeError:
-        progress.progress(n / 100.0 if n <= 100 else 1.0)
+        try:
+            progress.progress(n / 100.0 if n <= 100 else 1.0)
+        except Exception:
+            try:
+                progress.progress(n)
+            except Exception:
+                pass
     pct_box.markdown(
-        f'<div style="font-size:2.4rem;font-weight:700;line-height:1.2;'
-        f'margin:0.4rem 0 0.2rem 0;color:#111;">進捗 {n}%</div>',
+        f'<div style="font-size:2.6rem;font-weight:800;line-height:1.15;'
+        f'margin:0.45rem 0 0.25rem 0;color:#111;">進捗 {n}%</div>',
         unsafe_allow_html=True,
     )
     if msg:
@@ -1697,201 +946,69 @@ def update_export_progress(
     st.session_state.export_progress_msg = msg
 
 
-def heuristic_review(script: str) -> dict[str, Any]:
+def create_export_progress_widgets(
+    *,
+    initial_pct: int | None = None,
+    initial_msg: str = "準備中…",
+):
     """
-    APIキーが無いとき用の簡易レビュー。
-    本格的な医学監修の代わりではなく、プロセス確認用です。
+    MP4作成中に毎回必ず出す進捗バーと％表示を作る。
+    戻り値: (progress, pct_box, status)
     """
-    medical: list[dict[str, str]] = []
-    awkward: list[dict[str, str]] = []
-    immersion: list[dict[str, str]] = []
-
-    patterns_medical = [
-        (
-            r"血圧が\s*200[/\／]20",
-            "血圧の下の値（拡張期）が極端に低すぎる表記は非現実的です。",
-            "例: 「血圧 200/110」など臨床で起こりうる数値に修正してください。",
-        ),
-        (
-            r"心電図(が|で)?(止まっ|フラット|直線)",
-            "心停止の表現が曖昧です。波形の種類を明示した方が正確です。",
-            "「心電図は心静止（アスystole）」「心室細動（VF）」など具体名に。",
-        ),
-        (
-            r"酸素飽和度\s*(が)?\s*0%|SpO2\s*(が)?\s*0",
-            "SpO2 0% は測定不能やプローブ外れの可能性が高く、物語上も説明が必要です。",
-            "「測定不能」「プローブ外れの可能性」など状況説明を添えてください。",
-        ),
-    ]
-    for pat, issue, suggestion in patterns_medical:
-        m = re.search(pat, script)
-        if m:
-            medical.append(
-                {
-                    "original": m.group(0),
-                    "issue": issue,
-                    "suggestion": suggestion,
-                }
-            )
-
-    patterns_awkward = [
-        (
-            r"オペ(を)?しよう|オペる",
-            "現場では「オペ」単体より手技名・適応を言うことが多いです。",
-            "「緊急開腹術を開始する」「気管内挿管する」など具体的に。",
-        ),
-        (
-            r"点滴(を)?打(つ|って)",
-            "医療者は「点滴を入れる／開始する」と言うことが多いです。",
-            "「末梢ルートを確保して補液を開始」などに。",
-        ),
-        (
-            r"心臓マッサージ",
-            "現在は「胸骨圧迫」が標準的な言い方です。",
-            "「胸骨圧迫を開始」に言い換えると医師の耳に自然です。",
-        ),
-    ]
-    for pat, issue, suggestion in patterns_awkward:
-        m = re.search(pat, script)
-        if m:
-            awkward.append(
-                {
-                    "original": m.group(0),
-                    "issue": issue,
-                    "suggestion": suggestion,
-                }
-            )
-
-    if len(script) < 200:
-        immersion.append(
-            {
-                "original": script[:80] + ("…" if len(script) > 80 else ""),
-                "issue": "短いため、現場の音・時間経過・バイタルの変化が弱い可能性があります。",
-                "suggestion": "モニター音、時刻、SpO2/血圧の推移、スタッフの短い掛け声を1〜2文足す。",
-            }
-        )
-    if "…" not in script and "……" not in script and "——" not in script:
-        immersion.append(
-            {
-                "original": "（全体）",
-                "issue": "間（ま）や沈黙の描写が少なく、緊張感が平坦になりがちです。",
-                "suggestion": "重要な決断の直前に短い沈黙やモニター音だけの一瞬を入れてください。",
-            }
-        )
-    if not re.search(r"(血圧|SpO2|心拍数|脈拍|呼吸数)", script):
-        immersion.append(
-            {
-                "original": "（バイタル表記なし）",
-                "issue": "数値がないと救急シーンの臨場感が落ちます。",
-                "suggestion": "「血圧 82/40、脈 130、SpO2 88%」など具体値を1か所入れてください。",
-            }
-        )
-
-    if not medical and not awkward and not immersion:
-        immersion.append(
-            {
-                "original": "（全体）",
-                "issue": "自動チェックでは大きな問題は見つかりませんでした（簡易モード）。",
-                "suggestion": "APIキーを設定すると、Claudeによる本格レビューに切り替えられます。",
-            }
-        )
-
-    return normalize_review(
-        {
-            "medical_contradictions": medical,
-            "awkward_for_doctors": awkward,
-            "immersion_improvements": immersion,
-            # 辞書ルビの自動付与はOFF
-            "ruby_annotations": [],
-            "mode": "heuristic",
-        }
+    n = (
+        int(initial_pct)
+        if initial_pct is not None
+        else int(st.session_state.get("export_progress_pct") or 0)
     )
-
-
-def normalize_review(data: dict[str, Any]) -> dict[str, Any]:
-    def _items(key: str) -> list[dict[str, str]]:
-        raw = data.get(key, []) or []
-        out: list[dict[str, str]] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            original = str(item.get("original", "")).strip()
-            raw_suggestion = str(item.get("suggestion", "")).strip()
-            cleaned = clean_script_replacement_text(raw_suggestion, original)
-            normalized = {
-                "original": original,
-                "issue": str(item.get("issue", "")).strip(),
-                # 解説付き修正案は本文だけ残す（反映ミス防止）
-                "suggestion": cleaned or raw_suggestion,
-                "suggestion_raw": raw_suggestion,
-            }
-            # カタカナ医学用語の表記指摘は採用しない
-            if is_katakana_notation_complaint(normalized):
-                continue
-            out.append(normalized)
-        return out
-
-    ruby_out: list[dict[str, str]] = []
-    seen_surface: set[str] = set()
-    for item in data.get("ruby_annotations", []) or []:
-        if not isinstance(item, dict):
-            continue
-        surface = str(item.get("surface", "")).strip()
-        reading = normalize_voicevox_reading(str(item.get("reading", "")))
-        if not surface or not reading or surface in seen_surface:
-            continue
-        seen_surface.add(surface)
-        ruby_out.append({"surface": surface, "reading": reading})
-
-    return {
-        "medical_contradictions": _items("medical_contradictions"),
-        "awkward_for_doctors": _items("awkward_for_doctors"),
-        "immersion_improvements": _items("immersion_improvements"),
-        "ruby_annotations": ruby_out,
-        "mode": data.get("mode", "claude"),
-    }
-
-
-def run_script_review(script: str) -> dict[str, Any]:
-    api_key = get_api_key()
-    review_text = script
-    truncated = False
-    if len(script) > REVIEW_SCRIPT_MAX_CHARS:
-        review_text = (
-            script[:REVIEW_SCRIPT_MAX_CHARS]
-            + "\n\n…（以下省略。レビューは先頭部分のみ）"
-        )
-        truncated = True
-    if api_key:
-        result = review_with_claude(review_text, api_key)
-    else:
-        result = heuristic_review(review_text)
-    result["review_truncated"] = truncated
-
-    # 辞書ルビを優先し、そのあと AI 提案ルビ（同じ用語は辞書が勝つ）
-    dict_ann = collect_dictionary_ruby_annotations(script)
-    ai_ann: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for item in result.get("ruby_annotations") or []:
-        surface = str(item.get("surface") or "").strip()
-        if not surface or surface in seen:
-            continue
-        seen.add(surface)
-        ai_ann.append(
-            {
-                "surface": surface,
-                "reading": normalize_voicevox_reading(str(item.get("reading") or "")),
-            }
-        )
-    merged = merge_ruby_annotations(dict_ann, ai_ann)
-    result["ruby_annotations"] = merged
-    result["script_with_ruby"] = apply_voicevox_ruby(script, merged, fullwidth=True)
-    return result
+    n = max(0, min(100, n))
+    msg = (
+        initial_msg
+        or str(st.session_state.get("export_progress_msg") or "")
+        or "準備中…"
+    ).strip()
+    st.markdown(
+        '<div style="font-size:1.25rem;font-weight:700;margin:0.35rem 0;">'
+        "作業の進捗（パーセント）</div>",
+        unsafe_allow_html=True,
+    )
+    try:
+        progress = st.progress(n, text=f"{n}%  {msg}")
+    except TypeError:
+        progress = st.progress(n / 100.0 if n <= 100 else 1.0)
+    pct_box = st.empty()
+    status = st.empty()
+    update_export_progress(progress, pct_box, status, n, msg)
+    return progress, pct_box, status
 
 
 # ---------------------------------------------------------------------------
 # VOICEVOX
 # ---------------------------------------------------------------------------
+def voicevox_howto_start() -> str:
+    """VOICEVOX が起動していないときの、初心者向け手順。"""
+    mac_steps = (
+        "【Mac の場合】\n"
+        "1. 「アプリケーション」または Dock から **VOICEVOX** を起動する"
+        "（この Streamlit 画面とは別のアプリです）\n"
+        "2. VOICEVOX のウィンドウが開くまで待つ\n"
+    )
+    linux_steps = (
+        "【Linux / Cursor Cloud の場合】\n"
+        "1. Docker を起動する\n"
+        "2. ターミナルで次を実行:\n"
+        "   sudo docker run -d --rm --name voicevox "
+        "-p 50021:50021 voicevox/voicevox_engine:cpu-latest\n"
+        "3. 10秒ほど待つ\n"
+    )
+    common = (
+        "3. このブラウザ画面を再読み込みする（サイドバーに"
+        "「VOICEVOX OK」と出れば成功）\n"
+        "4. もう一度「動画を作成」を押す\n"
+        f"（接続先: {VOICEVOX_URL}）"
+    )
+    return mac_steps + linux_steps + common
+
+
 def check_voicevox() -> tuple[bool, str]:
     try:
         r = requests.get(f"{VOICEVOX_URL}/version", timeout=3)
@@ -1899,7 +1016,20 @@ def check_voicevox() -> tuple[bool, str]:
             return True, r.text.strip().strip('"')
         return False, f"HTTP {r.status_code}"
     except requests.RequestException as e:
-        return False, str(e)
+        detail = str(e)
+        # Connection refused = VOICEVOX が起動していないときが多い
+        if (
+            "Connection refused" in detail
+            or "Errno 61" in detail
+            or "Errno 111" in detail
+            or "Max retries exceeded" in detail
+        ):
+            return (
+                False,
+                "VOICEVOX が起動していないか、応答していません。"
+                " VOICEVOX アプリを先に起動してください。",
+            )
+        return False, detail
 
 
 def fetch_voicevox_speakers() -> list[dict[str, Any]]:
@@ -1910,7 +1040,10 @@ def fetch_voicevox_speakers() -> list[dict[str, Any]]:
     try:
         r = requests.get(f"{VOICEVOX_URL}/speakers", timeout=8)
     except requests.RequestException as e:
-        raise RuntimeError(f"VOICEVOXの声優一覧を取得できません: {e}") from e
+        raise RuntimeError(
+            "VOICEVOXの声優一覧を取得できません。\n" + voicevox_howto_start()
+            + f"\n（詳細: {e}）"
+        ) from e
     if r.status_code != 200:
         raise RuntimeError(
             f"VOICEVOXの声優一覧取得に失敗: HTTP {r.status_code} / {r.text[:200]}"
@@ -1919,6 +1052,19 @@ def fetch_voicevox_speakers() -> list[dict[str, Any]]:
     if not isinstance(data, list) or not data:
         raise RuntimeError("VOICEVOXに利用可能な声優がありません。")
     return data
+
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def check_voicevox_cached() -> tuple[bool, str]:
+    """VOICEVOX接続確認（30秒キャッシュ。毎回待つとUIが重い）。"""
+    return check_voicevox()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_voicevox_speakers_cached() -> list[dict[str, Any]]:
+    """声優一覧（60秒キャッシュ）。"""
+    return fetch_voicevox_speakers()
 
 
 def talk_styles_for_speaker(speaker: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2270,6 +1416,23 @@ def concat_wav_files(wav_paths: list[Path], out_path: Path, pause_ms: int = 350)
     return out_path
 
 
+def make_silent_wav(
+    path: Path,
+    duration_sec: float = 1.0,
+    rate: int = 24000,
+) -> Path:
+    """テスト・スモーク用の無音 WAV を作る。"""
+    duration_sec = max(0.05, float(duration_sec))
+    n = int(rate * duration_sec)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00" * n * 2)
+    return path
+
+
 def prepend_silence_to_wav(wav_path: Path, silence_sec: float) -> Path:
     """既存WAVの先頭に無音を足す（朗読開始までの余白用）。"""
     silence_sec = max(0.0, float(silence_sec))
@@ -2304,8 +1467,8 @@ def shift_subtitle_cues(
 
 def strip_voicevox_ruby(text: str) -> str:
     """
-    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ などを外し、
-    字幕・表示用に「表記」だけ残す（半角/全角の区切りは区別しない）。
+    字幕用: {表記|よみ} / ｛表記｜よみ｝ では { と | の間（表記）だけ残す。
+    半角/全角の {｛ }｝ と |｜ は区別しない。
     """
     text = canonicalize_voicevox_ruby_delimiters(text or "")
     if not text:
@@ -2317,28 +1480,364 @@ def strip_voicevox_ruby(text: str) -> str:
     )
 
 
-def expand_voicevox_ruby_to_reading(text: str) -> str:
+def voicevox_tts_from_ruby_text(text: str) -> str:
     """
-    VOICEVOXルビ {表記|よみ} / ｛表記｜よみ｝ などを外し、
-    読み上げ用に「よみ」だけ残す（半角/全角の区切りは区別しない）。
+    VOICEVOX用: {表記|よみ} / ｛表記｜よみ｝ では | と } の間（読み）だけ残す。
+    半角/全角の {｛ }｝ と |｜ は区別しない。
     """
     text = canonicalize_voicevox_ruby_delimiters(text or "")
     if not text:
         return ""
-    return re.sub(
-        r"\{[^|\n]+\|([^}\n]+)\}",
-        r"\1",
-        text,
-    )
+
+    def _repl(match: re.Match[str]) -> str:
+        surface = (match.group(1) or "").strip()
+        reading = normalize_voicevox_reading(match.group(2))
+        return reading if reading else surface
+
+    return _RUBY_TAG_RE.sub(_repl, text)
 
 
-def create_subtitle_png(text: str, path: Path) -> Path:
+# 背景指定ヒント（<> ＜＞ <＞ ＜> 〈〉 ‹› など同等）。字幕・読み上げには出さず背景切替だけ
+# 開き／閉じの混在（例: <あ＞）や見た目が似た記号（《》❮❯ «» など）も拾う
+_BG_HINT_OPEN_CHARS = "＜<〈‹《〈⟨❮«❬❰"
+_BG_HINT_CLOSE_CHARS = "＞>〉›》〉⟩❯»❭❱"
+_BACKGROUND_HINT_SEGMENT_RE = re.compile(
+    rf"[{re.escape(_BG_HINT_OPEN_CHARS)}]"
+    rf"[^{re.escape(_BG_HINT_OPEN_CHARS + _BG_HINT_CLOSE_CHARS)}]{{0,400}}"
+    rf"[{re.escape(_BG_HINT_CLOSE_CHARS)}]",
+    re.DOTALL,
+)
+# 分割で括弧が途中で切れたときの保険（未閉じ／未開始）。行内に限定して本文を消さない
+_BACKGROUND_HINT_UNCLOSED_OPEN_RE = re.compile(
+    rf"[{re.escape(_BG_HINT_OPEN_CHARS)}][^{re.escape(_BG_HINT_CLOSE_CHARS)}\n]*"
+)
+_BACKGROUND_HINT_UNCLOSED_CLOSE_RE = re.compile(
+    rf"[^{re.escape(_BG_HINT_OPEN_CHARS)}\n]*[{re.escape(_BG_HINT_CLOSE_CHARS)}]"
+)
+_BACKGROUND_HINT_LONE_BRACKET_RE = re.compile(
+    rf"[{re.escape(_BG_HINT_OPEN_CHARS + _BG_HINT_CLOSE_CHARS)}]"
+)
+
+
+def _normalize_background_hint_inner(raw: str) -> str:
+    """山括弧の中身を背景ヒント用に整える（改行・余分な空白を詰める）。"""
+    inner = (raw or "").replace("\r", "\n")
+    inner = re.sub(r"[\n\t\u3000]+", " ", inner)
+    inner = re.sub(r" +", " ", inner).strip()
+    return inner
+
+
+def extract_background_hints(text: str) -> list[str]:
+    """台本中の <> 系ヒントの中身だけを順に返す。"""
+    if not text:
+        return []
+    hints: list[str] = []
+    for m in _BACKGROUND_HINT_SEGMENT_RE.finditer(text):
+        inner = _normalize_background_hint_inner((m.group(0) or "")[1:-1])
+        if inner:
+            hints.append(inner)
+    return hints
+
+
+def strip_background_hint_segments(text: str) -> str:
+    """
+    <> / 〈〉 / ‹› / ＜＞ など背景ヒントを取り除く（字幕・読み上げ用）。
+    括弧とその中身をまとめて消す。改行をまたぐヒントも消す。
+    """
+    if not text:
+        return ""
+    out = str(text)
+    for _ in range(8):
+        nxt = _BACKGROUND_HINT_SEGMENT_RE.sub("", out)
+        if nxt == out:
+            break
+        out = nxt
+    # 分割途中で切れた 〈… や …〉 も除去（改行またぎ含む）
+    for _ in range(4):
+        nxt = _BACKGROUND_HINT_UNCLOSED_OPEN_RE.sub("", out)
+        nxt = _BACKGROUND_HINT_UNCLOSED_CLOSE_RE.sub("", nxt)
+        nxt = _BACKGROUND_HINT_LONE_BRACKET_RE.sub("", nxt)
+        if nxt == out:
+            break
+        out = nxt
+    out = re.sub(r"[ \t\u3000]{2,}", " ", out)
+    out = re.sub(r" *\n *", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def parse_script_background_events(script: str) -> list[tuple[str, str, int]]:
+    """
+    台本を「背景ヒント」と「本文」に順番どおり分解する（全文・改行またぎ対応）。
+    台本そのものから 〈〉 やルビは消さない（分解用の読み取りのみ）。
+    戻り値: [('hint', '救急外来', 行番号), ('text', '患者が…', 行番号), ...]
+    """
+    text = str(script or "")
+    events: list[tuple[str, str, int]] = []
+    pos = 0
+    while pos < len(text):
+        m = _BACKGROUND_HINT_SEGMENT_RE.search(text, pos)
+        if not m:
+            tail = text[pos:]
+            if tail.strip():
+                events.append(("text", tail, text[:pos].count("\n")))
+            break
+        if m.start() > pos:
+            chunk = text[pos : m.start()]
+            if chunk.strip():
+                events.append(("text", chunk, text[:pos].count("\n")))
+        inner = _normalize_background_hint_inner((m.group(0) or "")[1:-1])
+        if inner:
+            events.append(("hint", inner, text[: m.start()].count("\n")))
+        pos = m.end()
+    return events
+
+
+def plan_narration_segments(script: str) -> list[dict[str, str]]:
+    """
+    台本を「字幕用」「読み上げ用」「背景ヒント」に分ける。
+    台本ファイル自体からはルビも 〈〉 も削除しない。
+    - text: 字幕（{表記|よみ} の表記。山括弧ヒントなし。[注釈] は中身だけ・かっこは出さない）
+    - tts: VOICEVOX 用（{表記|よみ} の読み。山括弧ヒントと [] 注釈は除く）
+    - bg_hint: 背景画だけに使う（空文字可）
+    """
+    events = parse_script_background_events(script)
+    # ヒントが出たら、本文ブロックへ正しく紐づける
+    blocks: list[tuple[str, str]] = []
+    current_hint = ""
+    current_text_parts: list[str] = []
+
+    for kind, payload, _line_idx in events:
+        if kind == "hint":
+            has_text = bool(
+                current_text_parts and "".join(current_text_parts).strip()
+            )
+            if has_text:
+                if current_hint:
+                    # 〈救急〉本文〈手術〉 → 本文は救急、手術は次の本文へ
+                    blocks.append((current_hint, "".join(current_text_parts)))
+                    current_text_parts = []
+                    current_hint = payload
+                else:
+                    # 本文〈病棟〉 → 直後のヒントは直前の本文へ
+                    blocks.append((payload, "".join(current_text_parts)))
+                    current_text_parts = []
+                    current_hint = ""
+            else:
+                # 本文より前のヒント
+                current_hint = payload
+            continue
+        current_text_parts.append(payload)
+
+    if current_text_parts and "".join(current_text_parts).strip():
+        blocks.append((current_hint, "".join(current_text_parts)))
+    elif current_hint and blocks:
+        prev_hint, prev_body = blocks[-1]
+        blocks[-1] = (current_hint or prev_hint, prev_body)
+
+    pending_subtitle = ""
+    segments: list[dict[str, str]] = []
+
+    for bg_hint, raw_body in blocks:
+        body = strip_background_hint_segments(raw_body).strip()
+        if not body:
+            continue
+        block_hint = bg_hint
+        for chunk in split_text_for_voicevox(body):
+            raw_chunk = strip_background_hint_segments(chunk).strip()
+            if not raw_chunk:
+                continue
+            # 字幕: { と | の間（表記）。山括弧ヒントなし。
+            # [注釈] は中身だけ残し、大かっこ自体は出さない
+            display = strip_background_hint_segments(
+                strip_voicevox_ruby(raw_chunk)
+            ).strip()
+            display = keep_square_bracket_inners_for_subtitle(display).strip()
+            # 読み上げ: | と } の間（読み）。[] 注釈ごと・山括弧ヒントは除く
+            tts_text = strip_background_hint_segments(
+                voicevox_tts_from_ruby_text(
+                    strip_square_bracket_segments(raw_chunk).strip()
+                )
+            ).strip()
+            if not tts_text:
+                if display:
+                    pending_subtitle = f"{pending_subtitle}{display}"
+                continue
+            display_for_sub = keep_square_bracket_inners_for_subtitle(
+                strip_background_hint_segments(
+                    f"{pending_subtitle}{display}"
+                )
+            ).strip()
+            pending_subtitle = ""
+            if not display_for_sub:
+                continue
+            # ヒント文字列そのものが字幕／音声に混入していないことを保証
+            if block_hint and display_for_sub == block_hint:
+                continue
+            if block_hint and tts_text == block_hint:
+                continue
+            segments.append(
+                {
+                    "text": display_for_sub,
+                    "tts": tts_text,
+                    # 段落冒頭の 〈〉 は、その段落の全チャンクに同じ背景指示を付ける
+                    "bg_hint": block_hint,
+                }
+            )
+
+    if pending_subtitle and segments:
+        segments[-1]["text"] = keep_square_bracket_inners_for_subtitle(
+            strip_background_hint_segments(
+                str(segments[-1].get("text") or "") + pending_subtitle
+            )
+        ).strip()
+    return segments
+
+
+# 大かっこ [] / ［］（半角・全角の組み合わせは区別しない）
+# グループ1 = 中身（字幕用）。全体マッチ = 読み上げから除去する単位。
+_SQUARE_BRACKET_SEGMENT_RE = re.compile(r"[\[［]([^\[［\]］]*)[\]］]")
+
+
+def strip_square_bracket_segments(text: str) -> str:
+    """
+    [ … ] / ［ … ］ / [ … ］ / ［ … ] を中身ごと取り除く。
+    （VOICEVOX 読み上げ用。字幕用では使わない）
+    """
+    if not text:
+        return ""
+    out = _SQUARE_BRACKET_SEGMENT_RE.sub("", text)
+    out = re.sub(r"[ \t\u3000]{2,}", " ", out)
+    out = re.sub(r" *\n *", "\n", out)
+    return out.strip()
+
+
+def keep_square_bracket_inners_for_subtitle(text: str) -> str:
+    """
+    字幕用: [内容] / ［内容］ は「内容」だけ残し、大かっこ自体は消す。
+    半角・全角の組み合わせ（[］ ［]）も同等。
+    """
+    if not text:
+        return ""
+    out = _SQUARE_BRACKET_SEGMENT_RE.sub(r"\1", text)
+    # 万一残った単独の大かっこも消す
+    out = re.sub(r"[\[［\]］]", "", out)
+    out = re.sub(r"[ \t\u3000]{2,}", " ", out)
+    out = re.sub(r" *\n *", "\n", out)
+    return out.strip()
+
+
+
+# 1画面に出す字幕の最大行数（これを超える文は時間でページ分割する）
+MAX_SUBTITLE_LINES = 3
+SUBTITLE_FONT_SIZE = 52
+
+
+def _subtitle_measure_tools() -> tuple[ImageDraw.ImageDraw, ImageFont.ImageFont, int]:
+    """字幕の折り返し計測用（描画オブジェクト・フォント・最大幅）。"""
+    w, _h = VIDEO_SIZE
+    img = Image.new("RGBA", (w, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = load_jp_font(SUBTITLE_FONT_SIZE, bold=True)
+    return draw, font, int(w * 0.86)
+
+
+# 字幕1行あたりの目安文字数（幅計測が効かない場合の保険）
+SUBTITLE_CHARS_PER_LINE = 30
+
+
+def expand_subtitle_cues_for_display(
+    cues: list[dict[str, Any]] | None,
+    *,
+    max_lines: int = MAX_SUBTITLE_LINES,
+) -> list[dict[str, Any]]:
+    """
+    長い字幕を画面に収まる行数ごとのページに分け、表示時間を文字数比で割る。
+    （音声タイミングは変えず、同じ区間内で前半→後半と切り替える）
+    """
+    if not cues:
+        return []
+    draw, font, max_w = _subtitle_measure_tools()
+    per_page = max(1, int(max_lines))
+    out: list[dict[str, Any]] = []
+    for cue in cues:
+        text = keep_square_bracket_inners_for_subtitle(
+            strip_background_hint_segments(
+                strip_voicevox_ruby(str(cue.get("text") or ""))
+            )
+        ).strip()
+        start = float(cue.get("start", 0))
+        end = float(cue.get("end", 0))
+        if not text or end <= start:
+            continue
+        lines = wrap_text_to_width(text, font, max_w, draw)
+        # フォント幅が取れず1行のまま残る長い文は、文字数で行分割する
+        soft_limit = SUBTITLE_CHARS_PER_LINE * per_page
+        if (not lines) or (
+            len(lines) <= 1 and len(text) > soft_limit
+        ):
+            lines = []
+            for chunk in _safe_force_chunks(text, SUBTITLE_CHARS_PER_LINE):
+                chunk = chunk.strip()
+                if chunk:
+                    lines.append(chunk)
+        if not lines:
+            continue
+        pages = [
+            lines[i : i + per_page] for i in range(0, len(lines), per_page)
+        ]
+        weights = [max(1, sum(len(x) for x in page)) for page in pages]
+        total_w = float(sum(weights))
+        dur = end - start
+        t0 = start
+        for i, (page, wt) in enumerate(zip(pages, weights)):
+            if i == len(pages) - 1:
+                t1 = end
+            else:
+                t1 = t0 + dur * (wt / total_w)
+            page_cue = {
+                "start": t0,
+                "end": t1,
+                "text": "".join(page),
+                "lines": list(page),
+            }
+            if cue.get("tts"):
+                page_cue["tts"] = cue.get("tts")
+            out.append(page_cue)
+            t0 = t1
+    return out
+
+
+def create_subtitle_png(
+    text: str,
+    path: Path,
+    *,
+    lines: list[str] | None = None,
+) -> Path:
     """画面下部中央に載せる字幕PNG（透過・縁取り）。"""
     w, h = VIDEO_SIZE
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    font = load_jp_font(52, bold=True)
-    lines = wrap_text_to_width((text or "").strip(), font, int(w * 0.86), draw)[:3]
+    font = load_jp_font(SUBTITLE_FONT_SIZE, bold=True)
+    # 最終防衛: 描画直前に <> 背景ヒントを除去し、大かっこは中身だけ残す
+    safe_text = keep_square_bracket_inners_for_subtitle(
+        strip_background_hint_segments(strip_voicevox_ruby(text or ""))
+    ).strip()
+    if lines is None:
+        lines = wrap_text_to_width(safe_text, font, int(w * 0.86), draw)
+    else:
+        cleaned_lines: list[str] = []
+        for ln in lines:
+            if ln is None:
+                continue
+            cleaned = keep_square_bracket_inners_for_subtitle(
+                strip_background_hint_segments(strip_voicevox_ruby(str(ln)))
+            ).strip()
+            if cleaned:
+                cleaned_lines.append(cleaned)
+        lines = cleaned_lines
+    # 呼び出し側でページ分割済み。万一の溢れは落とさず安全側で上限だけ見る
+    lines = [ln for ln in (lines or []) if ln][:MAX_SUBTITLE_LINES]
     if not lines:
         path.parent.mkdir(parents=True, exist_ok=True)
         img.save(path, format="PNG")
@@ -2402,10 +1901,13 @@ def generate_narration_wav_to_file(
     長い台本向け: VOICEVOXで音声生成し、字幕用タイミングも返す。
     1音声区間＝1字幕。開始・終了は各WAVの実時間（よみ上げと完全同期）。
     戻り値: (wavパス, 字幕キュー[{start,end,text}, ...])
-    text は表記のみ（ルビ記号なし）。
+    text は字幕用（ルビ記号なし、<> 背景ヒントなし）。
+    tts は読み上げ用（ルビは残す。<> ヒントと [] は除く）。
+    各キューに bg_hint があれば背景切替用（字幕・読み上げには出さない）。
+    台本そのものからはルビも 〈〉 も削除しない。
     """
-    chunks = split_text_for_voicevox(script)
-    if not chunks:
+    segments = plan_narration_segments(script)
+    if not segments:
         raise ValueError("読み上げる文章が空です。")
 
     out_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -2418,17 +1920,23 @@ def generate_narration_wav_to_file(
     speed = clamp_voicevox_speed(speed_scale)
 
     try:
-        for i, chunk in enumerate(chunks):
+        for i, seg in enumerate(segments):
             if progress_callback:
-                progress_callback(i, len(chunks))
+                progress_callback(i, len(segments))
             part = part_dir / f"part_{i:05d}.wav"
-            # VOICEVOXへはよみがなのみ、字幕には表記のみ（同じ区間の実時間を共有）
-            tts_text = expand_voicevox_ruby_to_reading(chunk).strip()
-            display = strip_voicevox_ruby(chunk).strip()
-            if not tts_text:
-                tts_text = display
-            if not tts_text:
-                # 空区間はスキップ（無音も字幕も入れない）
+            display_for_sub = keep_square_bracket_inners_for_subtitle(
+                strip_background_hint_segments(
+                    strip_voicevox_ruby(str(seg.get("text") or ""))
+                )
+            ).strip()
+            # 読み上げ: | と } の間（読み）。[] 注釈は送らない
+            tts_text = strip_background_hint_segments(
+                voicevox_tts_from_ruby_text(
+                    strip_square_bracket_segments(str(seg.get("tts") or ""))
+                )
+            ).strip()
+            bg_hint_for_cue = str(seg.get("bg_hint") or "").strip()
+            if not tts_text or not display_for_sub:
                 continue
             # 連結時と同じく、前の音声のあとにだけ無音を入れる
             if part_paths:
@@ -2441,19 +1949,20 @@ def generate_narration_wav_to_file(
                 dur = w.getnframes() / float(w.getframerate())
             seg_start = t
             seg_end = t + dur
-            if display and dur > 0:
-                subtitle_cues.append(
-                    {
-                        "start": seg_start,
-                        "end": seg_end,
-                        "text": display,
-                        # 検証用: この字幕が対応する読み上げ文
-                        "tts": tts_text,
-                    }
-                )
+            if display_for_sub and dur > 0:
+                cue: dict[str, Any] = {
+                    "start": seg_start,
+                    "end": seg_end,
+                    "text": display_for_sub,
+                    # 検証用: この字幕が対応する読み上げ文
+                    "tts": tts_text,
+                }
+                if bg_hint_for_cue:
+                    cue["bg_hint"] = bg_hint_for_cue
+                subtitle_cues.append(cue)
             t = seg_end
         if progress_callback:
-            progress_callback(len(chunks), len(chunks))
+            progress_callback(len(segments), len(segments))
         if not part_paths:
             raise ValueError("読み上げる文章が空です。")
         concat_wav_files(part_paths, out_wav, pause_ms=pause_ms)
@@ -2468,15 +1977,17 @@ def generate_narration_wav_to_file(
                 cue["end"] = float(cue["end"]) * scale
             t = actual_dur
     finally:
+        # 一時パートは残すと容量を食うので消す（失敗時も）
         for p in part_paths:
             try:
                 p.unlink(missing_ok=True)
-            except OSError:
+            except Exception:
                 pass
         try:
             part_dir.rmdir()
-        except OSError:
+        except Exception:
             pass
+
     return out_wav, subtitle_cues
 
 
@@ -2552,7 +2063,7 @@ def generate_narration_wav(script: str) -> bytes:
 # 背景画像（Pillow）— YouTubeサムネ風タイトル＋VOICEVOXクレジット
 # ---------------------------------------------------------------------------
 def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
-    """macOS で使える日本語フォントを探す。"""
+    """日本語フォントを探す（macOS / Linux）。"""
     candidates = []
     if bold:
         candidates.extend(
@@ -2560,6 +2071,9 @@ def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
                 "/System/Library/Fonts/ヒラギノ角ゴシック W8.ttc",
                 "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
                 "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
             ]
         )
     candidates.extend(
@@ -2567,6 +2081,11 @@ def load_jp_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
             "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
             "/Library/Fonts/Arial Unicode.ttf",
+            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         ]
     )
     for path in candidates:
@@ -2711,6 +2230,7 @@ def load_text_from_upload(uploaded_file) -> str:
     )
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
+    assert_script_upload_size(raw, name)
     lower = name.lower()
     if not (
         lower.endswith(".txt")
@@ -2967,6 +2487,92 @@ THEME_KEYWORDS: dict[str, list[tuple[str, int]]] = {
 THEME_PRIORITY = list(THEME_KEYWORDS)
 THEME_CYCLE = list(THEME_TO_BG_INDICES)  # 自作背景の互換用
 
+# 〈〉 背景ヒントの日本語 → 場面キー（部分一致より先に使う）
+# 使える主な語: 救急外来 / 手術室 / 病棟 / ICU / CT / 検査室 / 外来 / 廊下 / 救急車 など
+BACKGROUND_HINT_ALIASES: dict[str, str] = {
+    "救急外来": "er",
+    "救命救急": "er",
+    "救急室": "er",
+    "救急": "er",
+    "初療室": "er",
+    "er": "er",
+    "ER": "er",
+    "手術室": "surgery",
+    "オペ室": "surgery",
+    "手術": "surgery",
+    "オペ": "surgery",
+    "執刀": "surgery",
+    "病棟": "ward",
+    "病室": "ward",
+    "入院": "ward",
+    "回診": "ward",
+    "ナースステーション": "ward",
+    "icu": "icu",
+    "ICU": "icu",
+    "集中治療室": "icu",
+    "ccu": "icu",
+    "CCU": "icu",
+    "ct": "imaging",
+    "CT": "imaging",
+    "ct室": "imaging",
+    "CT室": "imaging",
+    "MRI": "imaging",
+    "mri": "imaging",
+    "レントゲン": "imaging",
+    "画像": "imaging",
+    "検査室": "lab",
+    "病理": "lab",
+    "培養": "lab",
+    "採血": "lab",
+    "薬局": "pharma",
+    "投薬": "pharma",
+    "点滴": "pharma",
+    "外来": "consult",
+    "診察室": "consult",
+    "診察": "consult",
+    "説明": "consult",
+    "面談": "consult",
+    "会議室": "consult",
+    "オフィス": "consult",
+    "廊下": "corridor",
+    "受付": "corridor",
+    "待合": "corridor",
+    "待合室": "corridor",
+    "救急車": "ambulance",
+    "救急車内": "ambulance",
+    "搬送": "ambulance",
+}
+
+
+def _compact_background_hint(hint: str) -> str:
+    """ヒント文字列を照合用に整える（空白除去・末尾の『の中』などを削る）。"""
+    compact = (hint or "").replace(" ", "").replace("　", "").strip()
+    for suf in ("のなか", "の中", "にて", "での", "から", "内", "へ", "に", "で"):
+        if len(compact) > len(suf) + 1 and compact.endswith(suf):
+            compact = compact[: -len(suf)]
+            break
+    return compact
+
+
+def infer_theme_from_background_hint(hint: str) -> str | None:
+    """背景ヒント（<> / 〈〉 内の文字）から場面を決める。通常のキーワード判定より優先。"""
+    text = (hint or "").strip()
+    if not text:
+        return None
+    compact = _compact_background_hint(text)
+    key = compact.lower()
+    if key in THEME_TO_BG_INDICES:
+        return key
+    if compact in BACKGROUND_HINT_ALIASES:
+        return BACKGROUND_HINT_ALIASES[compact]
+    if key in BACKGROUND_HINT_ALIASES:
+        return BACKGROUND_HINT_ALIASES[key]
+    # 長い別名から部分一致（例: 夜の救急外来 → 救急外来）
+    for alias in sorted(BACKGROUND_HINT_ALIASES, key=len, reverse=True):
+        if alias in compact or alias.lower() in key:
+            return BACKGROUND_HINT_ALIASES[alias]
+    return infer_theme_from_text(text)
+
 
 def infer_theme_from_text(segment: str, index: int = 0) -> str | None:
     """文章から場面を判定する。手掛かりが無ければ None（ランダム選択しない）。"""
@@ -3060,6 +2666,216 @@ def ensure_landscape_images(needed: int | list[int]) -> list[Path]:
     return [path_by_idx[i % n_urls] for i in indices]
 
 
+def ensure_custom_background_dir() -> Path:
+    """事前作成した背景画像用フォルダ custom_backgrounds を用意する。"""
+    CUSTOM_BG_DIR.mkdir(parents=True, exist_ok=True)
+    guide = CUSTOM_BG_DIR / "使い方.txt"
+    # 既存ファイルは上書きしない（git pull を妨げないため）
+    if not guide.exists():
+        guide.write_text(
+            "【背景静止画の使い方】\n"
+            "\n"
+            "1. 背景画は別途事前に作成する\n"
+            "2. 必ずこのフォルダ（custom_backgrounds）に保存する\n"
+            "   （デスクトップや別フォルダでは読み込まれません）\n"
+            "3. 形式: .jpg または .png\n"
+            "4. ファイル名は、台本の 〈〉 内の文字と完全に同じ\n"
+            "\n"
+            "例:\n"
+            "  台本: 〈夜の暗い手術室〉\n"
+            "  ○ 正しい: 夜の暗い手術室.jpg\n"
+            "  × 間違い: 〈夜の暗い手術室〉.jpg  （かっこ付きは不可）\n"
+            "  × 間違い: 夜の暗い手術室 .jpg  （空白入り）\n"
+            "\n"
+            "5. アプリで「最終版（背景あり）」の MP4 を作る\n"
+            "\n"
+            "※ フォルダ名は custom_backgrounds\n"
+            "※ 見つからないときは outputs/last_custom_bg_debug.txt を確認\n",
+            encoding="utf-8",
+        )
+    return CUSTOM_BG_DIR
+
+
+def _normalize_match_key(s: str) -> str:
+    """ファイル名と 〈〉 ヒントを同じ土俵で比べるための正規化。"""
+    text = unicodedata.normalize("NFC", s or "")
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+    text = text.replace("\u3000", "").replace(" ", "").strip()
+    # ファイル名に山括弧まで付けてしまった場合も中身で照合する
+    for open_ch, close_ch in (
+        ("〈", "〉"),
+        ("<", ">"),
+        ("＜", "＞"),
+        ("‹", "›"),
+        ("《", "》"),
+        ("「", "」"),
+    ):
+        if text.startswith(open_ch) and text.endswith(close_ch) and len(text) > 2:
+            text = text[len(open_ch) : -len(close_ch)].strip()
+            break
+    return text
+
+
+def _hint_filename_candidates(hint: str) -> list[str]:
+    """ヒント文から、画像ファイル名（拡張子なし）の候補を作る。"""
+    raw = (hint or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    for cand in (
+        raw,
+        _normalize_match_key(raw),
+        _compact_background_hint(raw),
+        make_title_basename(raw, fallback=""),
+        re.sub(r"\s+", "", raw),
+    ):
+        c = _normalize_match_key(cand or "")
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+def list_custom_background_files() -> list[Path]:
+    """custom_backgrounds（と誤字フォルダ）内の jpg/png 一覧。"""
+    ensure_custom_background_dir()
+    files: list[Path] = []
+    for folder in CUSTOM_BG_DIR_ALIASES:
+        if not folder.is_dir():
+            continue
+        for p in folder.iterdir():
+            if (
+                p.is_file()
+                and p.suffix.lower() in CUSTOM_BG_EXTENSIONS
+                and not p.name.startswith(".")
+                and p.name != "使い方.txt"
+            ):
+                files.append(p)
+    return files
+
+
+def find_custom_background_image(hint: str) -> Path | None:
+    """
+    〈〉内の文字と同じ名前の jpg/png を custom_backgrounds から探す。
+    macOS の文字化け相当（NFC/NFD）や、かっこ付きファイル名も吸収する。
+    """
+    candidates = _hint_filename_candidates(hint)
+    if not candidates:
+        return None
+
+    files = list_custom_background_files()
+    if not files:
+        return None
+
+    def _rank(path: Path) -> tuple[int, str]:
+        return (_CUSTOM_BG_EXT_PRIORITY.get(path.suffix.lower(), 99), path.name)
+
+    by_key: dict[str, list[Path]] = {}
+    for p in files:
+        key = _normalize_match_key(p.stem)
+        if not key:
+            continue
+        by_key.setdefault(key, []).append(p)
+        by_key.setdefault(key.lower(), []).append(p)
+
+    for cand in candidates:
+        pool = by_key.get(cand) or by_key.get(cand.lower())
+        if pool:
+            return sorted(set(pool), key=_rank)[0]
+    return None
+
+
+def diagnose_custom_backgrounds(hints: list[str]) -> str:
+    """ヒントと画像の対応を人が読める診断テキストにする。"""
+    ensure_custom_background_dir()
+    files = list_custom_background_files()
+    lines = [
+        f"背景フォルダ: {CUSTOM_BG_DIR}",
+        f"画像ファイル数: {len(files)}",
+    ]
+    if files:
+        lines.append("置いてある画像:")
+        for p in sorted(files, key=lambda x: x.name):
+            lines.append(f"  - {p.name}")
+    else:
+        lines.append("（画像が1枚もありません）")
+    lines.append("")
+    lines.append("台本の 〈〉 との対応:")
+    uniq_hints = unique_background_hints(hints)
+    if not uniq_hints:
+        lines.append("  （〈〉 ヒントが台本にありません）")
+    for h in uniq_hints:
+        hit = find_custom_background_image(h)
+        if hit:
+            lines.append(f"  ○ 〈{h}〉 → {hit.name}")
+        else:
+            lines.append(
+                f"  × 〈{h}〉 → 不足（必要ファイル例: {expected_custom_bg_filename(h)}）"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def unique_background_hints(hints: list[str] | None = None, script: str = "") -> list[str]:
+    """台本またはヒント一覧から、重複なしの 〈〉 中身を順に返す。"""
+    raw_list = list(hints or [])
+    if script:
+        raw_list.extend(extract_background_hints(script))
+    out: list[str] = []
+    for h in raw_list:
+        name = (h or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def expected_custom_bg_filename(hint: str) -> str:
+    """不足案内用の推奨ファイル名（png）。"""
+    name = (hint or "").strip() or "背景"
+    # ファイル名に使えない文字だけ安全化（日本語はそのまま）
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", name).strip().strip(".")
+    return f"{safe or '背景'}.png"
+
+
+def find_missing_custom_backgrounds(
+    script: str = "",
+    hints: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """
+    台本の 〈〉 に対し、custom_backgrounds に画像が無いものを列挙する。
+    戻り値: [{"hint": "...", "expected_file": "....png"}, ...]
+    """
+    ensure_custom_background_dir()
+    uniq = unique_background_hints(hints, script)
+    missing: list[dict[str, str]] = []
+    for h in uniq:
+        if find_custom_background_image(h) is None:
+            missing.append(
+                {
+                    "hint": h,
+                    "expected_file": expected_custom_bg_filename(h),
+                }
+            )
+    return missing
+
+
+def format_missing_custom_backgrounds_message(missing: list[dict[str, str]]) -> str:
+    """不足背景を画面表示用の文章にする。"""
+    if not missing:
+        return ""
+    lines = [
+        "背景ありの MP4 を作る前に、次の背景静止画が不足しています。",
+        f"フォルダ `{CUSTOM_BG_DIR}` に、次のファイル名で置いてください"
+        "（.png 推奨。同名の .jpg でも可）。",
+        "",
+    ]
+    for item in missing:
+        hint = item.get("hint") or ""
+        fname = item.get("expected_file") or expected_custom_bg_filename(hint)
+        lines.append(f"- 〈{hint}〉 → **{fname}**")
+    lines.append("")
+    lines.append("不足をそろえてから、もう一度「最終版（背景あり）」を押してください。")
+    return "\n".join(lines)
+
+
 def _background_index_for_theme(theme: str, occurrence: int) -> int:
     """同じ物語場面に属する写真候補だけから、順番に1枚選ぶ。"""
     choices = THEME_TO_BG_INDICES.get(theme) or THEME_TO_BG_INDICES["ward"]
@@ -3070,17 +2886,33 @@ def _theme_from_cue_context(
     cues: list[dict[str, Any]],
     cue_index: int,
 ) -> tuple[str | None, str]:
-    """現在の字幕を優先し、手掛かりがないときだけ次の字幕も見る。"""
-    current = strip_voicevox_ruby(
-        str(cues[cue_index].get("text") or "")
+    """
+    現在の字幕の場面を決める。
+    〈〉 背景ヒントがあれば最優先。ヒントがあるのに語が未登録のときは
+    台詞キーワードで上書きせず None を返す（呼び出し側で直前背景を維持）。
+    """
+    hint = str(cues[cue_index].get("bg_hint") or "").strip()
+    if hint:
+        detected = infer_theme_from_background_hint(hint)
+        if detected:
+            return detected, hint
+        return None, hint
+    current = strip_background_hint_segments(
+        strip_voicevox_ruby(str(cues[cue_index].get("text") or ""))
     ).strip()
     detected = infer_theme_from_text(current, cue_index)
     if detected:
         return detected, current
     # 現在の文が「その後」などだけなら、直後の1字幕を先読みする
     if cue_index + 1 < len(cues):
-        following = strip_voicevox_ruby(
-            str(cues[cue_index + 1].get("text") or "")
+        next_hint = str(cues[cue_index + 1].get("bg_hint") or "").strip()
+        if next_hint:
+            detected = infer_theme_from_background_hint(next_hint)
+            if detected:
+                return detected, next_hint
+            return None, next_hint
+        following = strip_background_hint_segments(
+            strip_voicevox_ruby(str(cues[cue_index + 1].get("text") or ""))
         ).strip()
         context = " ".join(x for x in (current, following) if x)
         return infer_theme_from_text(context, cue_index), context
@@ -3093,8 +2925,8 @@ def plan_scene_schedule(
     subtitle_cues: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    字幕の実時間と物語内容から、背景を切り替えるスケジュールを作る。
-    場面語がない箇所では直前の背景を保持し、無関係な画像をランダム表示しない。
+    字幕の実時間と 〈〉 背景ヒントから、背景切替スケジュールを作る。
+    段落冒頭の 〈〉 はそのシーン全体に効く。次の 〈〉 が出るまで台詞キーワードで上書きしない。
     """
     total_duration = max(float(total_duration), 1.0)
     cues = sorted(
@@ -3120,8 +2952,16 @@ def plan_scene_schedule(
             end = (i + 1) * total_duration / n
             cues.append({"start": start, "end": end, "text": segment})
 
-    first_theme, _first_context = _theme_from_cue_context(cues, 0)
+    first_hint = str(cues[0].get("bg_hint") or "").strip() if cues else ""
+    first_theme = (
+        infer_theme_from_background_hint(first_hint) if first_hint else None
+    )
+    if not first_theme:
+        first_theme, _ = _theme_from_cue_context(cues, 0)
     current_theme = first_theme or "ward"
+    # 段落冒頭 〈〉 で指示したあとは、次の 〈〉 まで背景を固定する
+    locked_by_hint = bool(first_hint)
+    active_hint = first_hint
     scene_start = 0.0
     scene_texts: list[str] = []
     schedule: list[dict[str, Any]] = []
@@ -3132,10 +2972,13 @@ def plan_scene_schedule(
         end_time = min(max(float(end_time), scene_start + 0.5), total_duration)
         occurrence = theme_occurrences.get(current_theme, 0)
         theme_occurrences[current_theme] = occurrence + 1
+        custom_path = find_custom_background_image(active_hint) if active_hint else None
         schedule.append(
             {
                 "index": len(schedule),
                 "theme": current_theme,
+                "bg_hint": active_hint,
+                "custom_image": str(custom_path) if custom_path else "",
                 "landscape_index": _background_index_for_theme(
                     current_theme, occurrence
                 ),
@@ -3149,20 +2992,43 @@ def plan_scene_schedule(
     for i, cue in enumerate(cues):
         cue_start = max(0.0, min(float(cue.get("start", 0)), total_duration))
         cue_end = max(cue_start, min(float(cue.get("end", cue_start)), total_duration))
-        cue_text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
-        detected, _context = _theme_from_cue_context(cues, i)
+        cue_text = strip_background_hint_segments(
+            strip_voicevox_ruby(str(cue.get("text") or ""))
+        ).strip()
+        explicit_hint = str(cue.get("bg_hint") or "").strip()
         elapsed = cue_start - scene_start
 
-        # 物語上の場面が変わったら、その字幕の開始時刻で背景を切り替える。
-        if (
-            detected
-            and detected != current_theme
-            and elapsed >= SCENE_MIN_DURATION_SEC
-        ):
-            _append_scene(cue_start)
-            current_theme = detected
-        # 同じ場面が長く続く場合は、その場面に合う別写真へ切り替える。
+        if explicit_hint:
+            hinted = infer_theme_from_background_hint(explicit_hint)
+            locked_by_hint = True
+            hint_changed = explicit_hint != active_hint
+            if hint_changed:
+                # ヒント文が変わったら（自由文の別画像も含む）すぐ切替
+                if cue_start > scene_start:
+                    _append_scene(cue_start)
+                active_hint = explicit_hint
+                if hinted:
+                    current_theme = hinted
+            elif hinted and hinted != current_theme:
+                if cue_start > scene_start:
+                    _append_scene(cue_start)
+                current_theme = hinted
+            # ヒント語が未登録でも、台詞キーワードでは上書きしない
+        elif not locked_by_hint:
+            detected, _context = _theme_from_cue_context(cues, i)
+            # 〈〉 が一度も無い区間だけ、台詞から場面推定して切り替える
+            if (
+                detected
+                and detected != current_theme
+                and elapsed >= SCENE_MIN_DURATION_SEC
+            ):
+                _append_scene(cue_start)
+                current_theme = detected
+                active_hint = ""
+            elif elapsed >= SCENE_INTERVAL_SEC:
+                _append_scene(cue_start)
         elif elapsed >= SCENE_INTERVAL_SEC:
+            # 同じ 〈〉 シーンが長いときだけ、同テーマの別写真へ
             _append_scene(cue_start)
 
         if cue_text:
@@ -3199,7 +3065,13 @@ def create_scene_frame(
     w, h = VIDEO_SIZE
     if landscape_path is not None and Path(landscape_path).exists():
         try:
-            photo = Image.open(landscape_path).convert("RGB")
+            # 巨大画像によるメモリ枯渇を防ぐ（約 4000x4000 相当）
+            prev_limit = Image.MAX_IMAGE_PIXELS
+            Image.MAX_IMAGE_PIXELS = 16_000_000
+            try:
+                photo = Image.open(landscape_path).convert("RGB")
+            finally:
+                Image.MAX_IMAGE_PIXELS = prev_limit
             base = fit_image_cover(photo, VIDEO_SIZE).convert("RGBA")
         except Exception:
             base = make_fallback_landscape(landscape_index).convert("RGBA")
@@ -3260,6 +3132,71 @@ def create_plain_scene_frame(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     img.save(path, format="PNG")
     return path
+
+
+def ensure_done_chime_wav() -> Path:
+    """
+    短い『ポーン』通知音のWAVを作る（または再利用する）。
+    追加ソフトは不要。単純な減衰サイン波。
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / "done_chime.wav"
+    if path.is_file() and path.stat().st_size > 2000:
+        return path
+
+    rate = 22050
+    duration = 0.85
+    n = int(rate * duration)
+    # やや高めの「ポーン」→少し下がる感じ
+    frames = bytearray()
+    for i in range(n):
+        t = i / rate
+        # 周波数を 880Hz → 660Hz へなだらかに下げる
+        freq = 880.0 - 220.0 * min(1.0, t / 0.55)
+        # 立ち上がりを少し遅らせ、後半で減衰
+        attack = min(1.0, t / 0.02)
+        decay = math.exp(-2.8 * t)
+        amp = 0.35 * attack * decay
+        sample = int(max(-32767, min(32767, amp * 32767 * math.sin(2 * math.pi * freq * t))))
+        frames += struct.pack("<h", sample)
+
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+    return path
+
+
+def play_done_chime() -> None:
+    """
+    MP4完成を知らせる『ポーン』音を鳴らす。
+    macOS は afplay、Linux では aplay / ffplay を試す。
+    """
+    try:
+        wav = ensure_done_chime_wav()
+    except Exception:
+        return
+    play_cmds: list[list[str]] = []
+    if sys.platform == "darwin":
+        play_cmds.append(["afplay", str(wav)])
+    else:
+        play_cmds.extend(
+            [
+                ["aplay", "-q", str(wav)],
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(wav)],
+            ]
+        )
+    for cmd in play_cmds:
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except Exception:
+            continue
 
 
 def create_background_image(
@@ -3398,11 +3335,30 @@ def build_mp4(
     if subtitle_cues:
         sub_dir = subtitle_dir or (output_mp4.parent / "_subs")
         sub_dir.mkdir(parents=True, exist_ok=True)
-        for i, cue in enumerate(subtitle_cues):
+        # 長い一文は複数ページに分け、後半も字幕として出す
+        display_cues = expand_subtitle_cues_for_display(subtitle_cues)
+        for i, cue in enumerate(display_cues):
             start = float(cue.get("start", 0))
             end = float(cue.get("end", 0))
-            text = strip_voicevox_ruby(str(cue.get("text") or "")).strip()
-            if not text or end <= start:
+            text = keep_square_bracket_inners_for_subtitle(
+                strip_background_hint_segments(
+                    strip_voicevox_ruby(str(cue.get("text") or ""))
+                )
+            ).strip()
+            page_lines = cue.get("lines")
+            if isinstance(page_lines, list):
+                page_lines = [
+                    keep_square_bracket_inners_for_subtitle(
+                        strip_background_hint_segments(
+                            strip_voicevox_ruby(str(x))
+                        )
+                    ).strip()
+                    for x in page_lines
+                ]
+                page_lines = [x for x in page_lines if x]
+            else:
+                page_lines = None
+            if not text and not page_lines:
                 continue
             if start >= duration:
                 continue
@@ -3412,7 +3368,7 @@ def build_mp4(
             if end - start < min_dur:
                 end = min(duration, start + min_dur)
             png = sub_dir / f"sub_{i:05d}.png"
-            create_subtitle_png(text, png)
+            create_subtitle_png(text, png, lines=page_lines)
             sub_clips.append(
                 ImageClip(str(png), ismask=False)
                 .set_start(start)
@@ -3465,19 +3421,24 @@ def build_mp4(
 
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
     tried_errors: list[str] = []
-    encode_attempts = [
-        {
-            "codec": "h264_videotoolbox",
-            "audio_codec": "aac",
-            "ffmpeg_params": ["-b:v", "3M", "-pix_fmt", "yuv420p"],
-        },
+    encode_attempts: list[dict[str, Any]] = []
+    # Apple Silicon / macOS 専用。Linux では最初から libx264 を使う。
+    if sys.platform == "darwin":
+        encode_attempts.append(
+            {
+                "codec": "h264_videotoolbox",
+                "audio_codec": "aac",
+                "ffmpeg_params": ["-b:v", "3M", "-pix_fmt", "yuv420p"],
+            }
+        )
+    encode_attempts.append(
         {
             "codec": "libx264",
             "audio_codec": "aac",
             "preset": "ultrafast",
             "ffmpeg_params": ["-pix_fmt", "yuv420p", "-tune", "stillimage"],
-        },
-    ]
+        }
+    )
 
     last_err: Exception | None = None
     encode_logger = None
@@ -3562,241 +3523,13 @@ def build_mp4(
     return output_mp4
 
 
-# ---------------------------------------------------------------------------
-# UI ヘルパー（レビュー採否）
-# ---------------------------------------------------------------------------
-REVIEW_SECTION_DEFS = [
-    ("medical_contradictions", "(1) 医学的に矛盾している箇所"),
-    ("awkward_for_doctors", "(2) 現役の医師が聞くと違和感がある表現"),
-    ("immersion_improvements", "(3) 修正すると臨場感が増す箇所"),
-]
-
-CHOICE_ACCEPT = "accept"
-CHOICE_REJECT = "reject"
-CHOICE_REVISE = "revise"
-CHOICE_LABELS = {
-    CHOICE_ACCEPT: "①承諾（そのまま反映）",
-    CHOICE_REJECT: "②却下",
-    CHOICE_REVISE: "③別案にて修正",
-}
-
-
-def decision_widget_key(section_key: str, index: int) -> str:
-    return f"review_choice__{section_key}__{index}"
-
-
-def alt_widget_key(section_key: str, index: int) -> str:
-    return f"review_alt__{section_key}__{index}"
-
-
-def clear_review_decision_widgets(review: dict[str, Any] | None) -> None:
-    """新しいレビュー結果に合わせて、古い採否ウィジェット状態を消す。"""
-    if not review:
-        return
-    for section_key, _ in REVIEW_SECTION_DEFS:
-        items = review.get(section_key, []) or []
-        for i in range(len(items)):
-            for k in (decision_widget_key(section_key, i), alt_widget_key(section_key, i)):
-                if k in st.session_state:
-                    del st.session_state[k]
-
-
-def render_review_section_interactive(
-    section_key: str, title: str, items: list[dict[str, str]]
-) -> None:
-    """各指摘に 承諾／却下／別案 を選べるUI。"""
-    st.subheader(title)
-    if not items:
-        st.caption("該当なし")
-        return
-
-    for i, item in enumerate(items):
-        label = item.get("original") or "（箇所）"
-        with st.expander(f"{i + 1}. {label}", expanded=(i == 0)):
-            st.write(item.get("issue") or "（なし）")
-            st.write(item.get("suggestion") or "（なし）")
-
-            choice_key = decision_widget_key(section_key, i)
-            if choice_key not in st.session_state:
-                st.session_state[choice_key] = CHOICE_REJECT
-
-            st.radio(
-                "対応",
-                options=[CHOICE_ACCEPT, CHOICE_REJECT, CHOICE_REVISE],
-                format_func=lambda x: CHOICE_LABELS.get(x, x),
-                key=choice_key,
-                horizontal=True,
-            )
-
-            if st.session_state.get(choice_key) == CHOICE_ACCEPT:
-                preview = clean_script_replacement_text(
-                    item.get("suggestion") or "", item.get("original") or ""
-                )
-                if preview:
-                    st.caption(f"反映文: {preview}")
-                else:
-                    st.warning("自動反映不可。「別案」で本文を書いてください。")
-
-            if st.session_state.get(choice_key) == CHOICE_REVISE:
-                alt_key = alt_widget_key(section_key, i)
-                if alt_key not in st.session_state:
-                    st.session_state[alt_key] = item.get("suggestion") or ""
-                st.text_area(
-                    "別案",
-                    key=alt_key,
-                    height=100,
-                )
-
-
-def clean_script_replacement_text(suggestion: str, original: str = "") -> str:
-    """
-    レビュー修正案から、台本へ入れる本文だけを取り出す。
-    「編集メモを削除する」「確定文にして」などの解説・手順は捨てる。
-    """
-    text = (suggestion or "").strip()
-    if not text:
-        return ""
-
-    # 「」『』内の本文を優先（解説付き提案でよく使われる）
-    quoted = re.findall(r"[「『]([^」』]+)[」』]", text)
-    quoted = [q.strip() for q in quoted if q.strip()]
-    meta_hint = re.compile(
-        r"(編集メモ|編集注|編集コメント|確定文|地の文|削除する|してください|採用し)"
-    )
-    usable_quotes = [q for q in quoted if not meta_hint.search(q)]
-    if usable_quotes:
-        text = max(usable_quotes, key=len)
-
-    # 末尾〜文中の作業指示を除去
-    strip_patterns = [
-        r"[、,]?\s*と確定文にして編集メモを削除する。?",
-        r"[、,]?\s*と確定文に書き直し[、,]?編集メモを削除する。?",
-        r"[、,]?\s*と確定文に書き直す。?",
-        r"[、,]?\s*と確定文にして。?",
-        r"[、,]?\s*のみを地の文として採用し[、,]?編集注を削除する。?",
-        r"[、,]?\s*を地の文として採用し[、,]?編集注を削除する。?",
-        r"[、,]?\s*地の文として採用し[、,]?編集注を削除する。?",
-        r"編集メモを削除する。?",
-        r"編集注を削除する。?",
-        r"編集コメントを削除する。?",
-        r"[。．]?[、,]?\s*編集(?:メモ|注|コメント).*$",
-        r"[。．]?[、,]?\s*確定文に.*$",
-        r"[。．]?[、,]?\s*地の文として.*$",
-        r"に修正してください。?",
-        r"に言い換えてください。?",
-        r"に直してください。?",
-        r"を推奨します。?",
-        r"が自然です。?",
-        r"がよいです。?",
-        r"など具体的に。?",
-        r"など具体値を1か所入れてください。?",
-        r"してください。?",
-    ]
-    for pat in strip_patterns:
-        text = re.sub(pat, "", text)
-
-    text = text.strip(" 　\n\r\t「」『』\"'、,")
-
-    # まだ作業指示だけの文章なら空にする（自動反映しない）
-    if re.search(
-        r"(編集メモ|編集注|確定文|地の文として|削除する|してください|手修正)",
-        text,
-    ):
-        # 引用抽出に失敗し、指示文が残っている
-        if original and original in text and len(text) > len(original) + 10:
-            # 原文の後に指示が続く場合は原文側だけ残さない（危険なので空）
-            return ""
-        if not usable_quotes:
-            return ""
-
-    return text.strip()
-
-
-def apply_review_decisions_to_script(
-    script: str, review: dict[str, Any]
-) -> tuple[str, list[str], list[str]]:
-    """
-    採択／別案を台本に反映する。
-    戻り値: (新しい台本, 反映できた一覧, 手動編集が必要な一覧)
-    """
-    text = script
-    applied: list[str] = []
-    manual: list[str] = []
-
-    jobs: list[tuple[int, str, str, str]] = []
-    for section_key, section_title in REVIEW_SECTION_DEFS:
-        items = review.get(section_key, []) or []
-        for i, item in enumerate(items):
-            choice = st.session_state.get(
-                decision_widget_key(section_key, i), CHOICE_REJECT
-            )
-            if choice == CHOICE_REJECT:
-                continue
-
-            original = (item.get("original") or "").strip()
-            suggestion = (item.get("suggestion") or "").strip()
-            if choice == CHOICE_ACCEPT:
-                replacement = clean_script_replacement_text(suggestion, original)
-            else:
-                raw_alt = (
-                    st.session_state.get(alt_widget_key(section_key, i), suggestion)
-                    or ""
-                ).strip()
-                # 別案も解説文が混ざっていたら除去（ユーザーが書いた文はできるだけ残す）
-                replacement = clean_script_replacement_text(raw_alt, original)
-                if not replacement and raw_alt and not re.search(
-                    r"(編集メモ|編集注|確定文|地の文として採用)", raw_alt
-                ):
-                    replacement = raw_alt
-
-            label = f"{section_title} #{i + 1}"
-            if not original or not replacement:
-                manual.append(
-                    f"{label}: 差し替え本文を取り出せませんでした"
-                    f"（修正案に解説だけがある可能性があります。手修正してください）\n"
-                    f"→ 元の修正案: {suggestion}"
-                )
-                continue
-            if original in ("（全体）", "（バイタル表記なし）", "（箇所）"):
-                manual.append(
-                    f"{label}: 全体向けの指摘のため自動反映できません"
-                    f"（別案/修正案を手で入れてください）\n→ {replacement}"
-                )
-                continue
-            pos = text.find(original)
-            if pos < 0:
-                manual.append(
-                    f"{label}: 台本内に『{original}』が見つかりません"
-                    f"（手修正してください）\n→ {replacement}"
-                )
-                continue
-            jobs.append((pos, original, replacement, label))
-
-    jobs.sort(key=lambda x: x[0], reverse=True)
-    for pos, original, replacement, label in jobs:
-        if text[pos : pos + len(original)] != original:
-            pos2 = text.find(original)
-            if pos2 < 0:
-                manual.append(f"{label}: 反映中に原文が見つからなくなりました")
-                continue
-            pos = pos2
-        text = text[:pos] + replacement + text[pos + len(original) :]
-        applied.append(f"{label}: 『{original}』→『{replacement}』")
-
-    return text, applied, manual
-
-
 def init_state() -> None:
     defaults = {
         "raw_script": "",
-        "review": None,
         "final_script": "",
-        "review_done": False,
         "script_confirmed": False,
         "ruby_ready": False,
         "ruby_script": "",
-        "ruby_skipped": False,
-        "skip_review": False,
         "mp4_bytes": None,
         "mp4_path": "",
         "mp4_name": "medical_drama.mp4",
@@ -3804,24 +3537,22 @@ def init_state() -> None:
         "video_title": "",
         "title_suggestion": "",
         "title_decision": "",
-        "ruby_dict_custom": None,
-        "ruby_dict_source_name": "",
-        "ruby_dict_learned": [],
-        "ruby_dict_export_ready": False,
-        "ruby_dict_last_updates": [],
-        "ruby_dict_post_video_updates": [],
         "export_progress_pct": 0,
         "export_progress_msg": "",
-        "ruby_script_baseline": "",
+        "script_uploaded_at": "",
+        "script_upload_filename": "",
         "ending_credits_text": "",
         "reference_text": "",
         "last_script_path": "",
         "last_script_name": "medical_drama.docx",
         "video_encoding": False,
         "video_export_mode": "draft",  # draft=背景なし / final=背景あり
+        "last_video_export_mode": None,  # 直近に完成した draft / final
+        "_editor_rev": 0,  # 台本入力欄の世代（衝突防止）
+        "_upload_gen": 0,  # ファイル選択欄の世代（再取り込み衝突防止）
+        "last_plain_script_txt": "",
+        "last_plain_script_docx": "",
         "_export_job": None,
-        "review_apply_log": [],
-        "review_manual_log": [],
         "vvox_speaker_name": DEFAULT_SPEAKER_NAME,
         "vvox_style_name": DEFAULT_STYLE_NAME,
         "vvox_style_id": DEFAULT_SPEAKER_ID,
@@ -3861,6 +3592,68 @@ def init_state() -> None:
 # ---------------------------------------------------------------------------
 # Streamlit メイン
 # ---------------------------------------------------------------------------
+def begin_video_encoding(mode: str) -> bool:
+    """
+    動画作成モードへ入る。VOICEVOX 未接続なら False を返し、画面に手順を出す。
+    最終版（背景あり）は、〈〉に対応する背景画像が揃うまで開始しない。
+    mode: "draft" または "final"
+    """
+    ok_vv_now, ver_vv_now = check_voicevox()
+    if not ok_vv_now:
+        st.error("VOICEVOX に接続できないため、動画を作成できません。")
+        st.info(voicevox_howto_start())
+        st.caption(f"詳細: {ver_vv_now}")
+        return False
+    mode_norm = "final" if str(mode) == "final" else "draft"
+    if mode_norm == "final":
+        script = str(
+            st.session_state.get("final_script")
+            or st.session_state.get("raw_script")
+            or ""
+        )
+        missing = find_missing_custom_backgrounds(script=script)
+        st.session_state["_custom_bg_missing"] = [m["hint"] for m in missing]
+        if missing:
+            msg = format_missing_custom_backgrounds_message(missing)
+            st.error(msg)
+            st.session_state["_custom_bg_block_message"] = msg
+            diag = diagnose_custom_backgrounds([m["hint"] for m in missing])
+            try:
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                (OUTPUT_DIR / "last_custom_bg_debug.txt").write_text(
+                    diag, encoding="utf-8"
+                )
+            except Exception:
+                pass
+            with st.expander("不足している背景ファイル一覧", expanded=True):
+                for item in missing:
+                    st.write(
+                        f"・ 〈{item['hint']}〉 → `{item['expected_file']}`"
+                    )
+                st.caption(f"保存先フォルダ: `{CUSTOM_BG_DIR}`")
+            return False
+        st.session_state.pop("_custom_bg_block_message", None)
+    # radio の key=video_export_mode は表示後に直接書き換えできない。
+    # 作成ジョブ用は別キーへ。画面に戻ったとき用に radio へは予約反映する。
+    st.session_state["_export_mode"] = mode_norm
+    queue_widget_value("video_export_mode", mode_norm)
+    st.session_state.video_encoding = True
+    st.session_state._export_job = "pending"
+    st.session_state.export_progress_pct = 0
+    st.session_state.export_progress_msg = ""
+    return True
+
+
+def current_video_export_mode() -> str:
+    """今回の動画作成が draft / final のどちらかを返す。"""
+    mode = str(
+        st.session_state.get("_export_mode")
+        or st.session_state.get("video_export_mode")
+        or "draft"
+    )
+    return "final" if mode == "final" else "draft"
+
+
 # ---------------------------------------------------------------------------
 # 動画書き出し
 # ---------------------------------------------------------------------------
@@ -3875,8 +3668,9 @@ def run_video_export(progress, pct_box, status) -> None:
     ok, ver = check_voicevox()
     if not ok:
         raise RuntimeError(
-            "VOICEVOX に接続できません。アプリを起動してから再実行してください。"
-            f"（詳細: {ver}）"
+            "VOICEVOX に接続できません。\n"
+            + voicevox_howto_start()
+            + f"\n（詳細: {ver}）"
         )
 
     style_id = int(st.session_state.get("vvox_style_id", DEFAULT_SPEAKER_ID))
@@ -3898,13 +3692,12 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.get("vvox_speed_scale", VOICEVOX_SPEED_SCALE)
     )
     _pct(2, "台本を準備中…")
-    # 直前工程で確定したルビ入り原稿を使う（ここで辞書ルビを付け直さない）
-    voice_script = canonicalize_voicevox_ruby_delimiters(
+    # 台本のルビも 〈〉 も削除しない（字幕・読み上げ側でだけ外す）
+    voice_script = normalize_script_keeping_ruby(
         str(st.session_state.get("ruby_script") or st.session_state.get("final_script") or "")
     ).strip()
     if not voice_script:
-        raise RuntimeError("ルビ入り原稿が空です。先にルビ準備を完了してください。")
-    ruby_count = count_voicevox_ruby(voice_script)
+        raise RuntimeError("台本が空です。先に台本を確定してください。")
 
     save_reference_text(st.session_state.get("reference_text", ""))
 
@@ -3916,21 +3709,25 @@ def run_video_export(progress, pct_box, status) -> None:
     script_docx_path.write_bytes(text_to_docx_bytes(voice_script))
     # 旧固定名も残す（互換）
     (OUTPUT_DIR / "last_script.docx").write_bytes(script_docx_path.read_bytes())
-    tts_script = expand_voicevox_ruby_to_reading(voice_script)
-    sub_script = strip_voicevox_ruby(voice_script)
-    (OUTPUT_DIR / "last_script_tts.txt").write_text(tts_script, encoding="utf-8")
+    # ログ用: 字幕は表記＋[]中身（かっこなし）、読み上げはヒントと [] を外す
+    subtitle_for_log = keep_square_bracket_inners_for_subtitle(
+        strip_voicevox_ruby(strip_background_hint_segments(voice_script))
+    )
+    tts_for_log = strip_background_hint_segments(
+        strip_square_bracket_segments(voicevox_tts_from_ruby_text(voice_script))
+    )
+    (OUTPUT_DIR / "last_script_tts.txt").write_text(tts_for_log, encoding="utf-8")
     (OUTPUT_DIR / "last_script_subtitle.txt").write_text(
-        sub_script, encoding="utf-8"
+        subtitle_for_log, encoding="utf-8"
     )
     st.session_state.last_script_path = str(script_docx_path)
     st.session_state.last_script_name = script_docx_name
 
     with tempfile.TemporaryDirectory(prefix="meddrama_") as tmp:
         tmp_path = Path(tmp)
-        ruby_msg = f"ルビ{ruby_count}件"
         _pct(
             5,
-            f"音声生成中（{speaker_name} / {style_name}・{ruby_msg}・"
+            f"音声生成中（{speaker_name} / {style_name}・"
             f"{speed_scale:.1f}倍）…",
         )
         wav_path = tmp_path / "narration.wav"
@@ -3953,10 +3750,13 @@ def run_video_export(progress, pct_box, status) -> None:
         )
         # 同期確認は無音を足す前（朗読と字幕の対応を検査）
         sync_issues = validate_audio_subtitle_sync(wav_path, subtitle_cues)
-        if sync_issues:
+        blocking_sync = [
+            m for m in sync_issues if not str(m).startswith("注意:")
+        ]
+        if blocking_sync:
             raise RuntimeError(
                 "音声と字幕の同期チェックに失敗しました:\n"
-                + "\n".join(f"- {m}" for m in sync_issues)
+                + "\n".join(f"- {m}" for m in blocking_sync)
             )
 
         # 冒頭に無音を入れ、字幕も同じ秒数だけ後ろへずらす
@@ -3971,20 +3771,68 @@ def run_video_export(progress, pct_box, status) -> None:
         with _wave.open(str(wav_path), "rb") as wf:
             audio_sec = wf.getnframes() / float(wf.getframerate())
 
-        include_background = (
-            str(st.session_state.get("video_export_mode") or "draft") == "final"
-        )
+        include_background = current_video_export_mode() == "final"
         scene_dir = tmp_path / "scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
         scene_clips: list[tuple[Path, float]] = []
 
         if include_background:
+            script_for_bg = str(voice_script or "")
+            missing_before = find_missing_custom_backgrounds(script=script_for_bg)
+            if missing_before:
+                msg = format_missing_custom_backgrounds_message(missing_before)
+                st.session_state["_custom_bg_missing"] = [
+                    m["hint"] for m in missing_before
+                ]
+                st.session_state["_custom_bg_block_message"] = msg
+                raise RuntimeError(msg)
+
             schedule = plan_scene_schedule(
                 voice_script,
                 audio_sec,
                 subtitle_cues=subtitle_cues,
             )
+            # 作成直前にもう一度ファイルを探し直す（置き直し直後にも効く）
+            hint_list: list[str] = []
+            for item in schedule:
+                hint = str(item.get("bg_hint") or "").strip()
+                if hint:
+                    hint_list.append(hint)
+                found = find_custom_background_image(hint) if hint else None
+                item["custom_image"] = str(found) if found else ""
+
+            diag = diagnose_custom_backgrounds(
+                hint_list
+                + [str(c.get("bg_hint") or "") for c in subtitle_cues]
+            )
+            (OUTPUT_DIR / "last_custom_bg_debug.txt").write_text(diag, encoding="utf-8")
+
+            # デバッグ用: 〈〉 がどの背景になったかを残す
+            schedule_lines = []
+            missing_hints: list[str] = []
+            for item in schedule:
+                custom = str(item.get("custom_image") or "").strip()
+                hint = str(item.get("bg_hint") or "").strip()
+                if hint and not custom and hint not in missing_hints:
+                    missing_hints.append(hint)
+                schedule_lines.append(
+                    f"{float(item['duration']):5.1f}s  "
+                    f"theme={item.get('theme')}  "
+                    f"hint={hint or '-'}  "
+                    f"custom={Path(custom).name if custom else '-'}  "
+                    f"segment={str(item.get('segment') or '')[:40]}"
+                )
+            (OUTPUT_DIR / "last_bg_schedule.txt").write_text(
+                "\n".join(schedule_lines) + "\n\n" + diag,
+                encoding="utf-8",
+            )
+            if missing_hints:
+                st.session_state["_custom_bg_missing"] = missing_hints
+            else:
+                st.session_state.pop("_custom_bg_missing", None)
+
             _pct(52, f"物語に合う背景を準備（{len(schedule)} 場面）…")
+            ensure_custom_background_dir()
             bg_indices = [
                 int(item.get("landscape_index", item["index"])) for item in schedule
             ]
@@ -3995,7 +3843,16 @@ def run_video_export(progress, pct_box, status) -> None:
                 li = int(item.get("landscape_index", i))
                 dur = float(item["duration"])
                 frame_path = scene_dir / f"scene_{i:03d}.png"
-                land = landscapes[i % len(landscapes)]
+                hint = str(item.get("bg_hint") or "").strip()
+                custom = str(item.get("custom_image") or "").strip()
+                if not custom and hint:
+                    again = find_custom_background_image(hint)
+                    custom = str(again) if again else ""
+                    item["custom_image"] = custom
+                if custom and Path(custom).is_file():
+                    land: Path | None = Path(custom)
+                else:
+                    land = landscapes[i % len(landscapes)]
                 create_scene_frame(
                     frame_path,
                     landscape_path=land,
@@ -4053,22 +3910,19 @@ def run_video_export(progress, pct_box, status) -> None:
         st.session_state.mp4_path = str(desktop_path)
         st.session_state.mp4_name = desktop_name
         st.session_state.mp4_bytes = None
-        # ルビ入り最終原稿 ↔ 辞書を比較し、足りないルビを追加
-        _pct(99, "ルビ辞書を更新中…")
-        applied = sync_script_rubies_into_dictionary(voice_script)
+        st.session_state.last_video_export_mode = (
+            "final" if include_background else "draft"
+        )
+        # 辞書の自動アップデートは行わない
         mode_label = "最終版（背景あり）" if include_background else "ドラフト（背景なし）"
-        if applied:
-            _pct(
-                100,
-                f"完了・{mode_label}（辞書にルビを {len(applied)} 件追加）",
-            )
-        else:
-            _pct(100, f"完了・{mode_label}")
+        _pct(100, f"完了・{mode_label}")
         status.success(f"完了（{mode_label}）: {desktop_path}")
+        # 完成を耳で知らせる（ポーン）
+        play_done_chime()
 
 
 def inject_app_theme() -> None:
-    """余計な装飾を抑え、読みやすい白背景にする。"""
+    """余計な装飾を抑え、読みやすい白背景にする。選択UIは小さく横並び向き。"""
     st.markdown(
         """
 <style>
@@ -4077,10 +3931,105 @@ def inject_app_theme() -> None:
   [data-testid="stSidebar"] { background: #fafafa; }
   h1, h2, h3, h4 { font-size: 1rem !important; font-weight: 600 !important; }
   div[data-testid="stAlert"] { border: 1px solid #ccc !important; }
+
+  /* 選択ラジオ: 小さく横並び */
+  div[data-testid="stRadio"] > label { font-size: 0.85rem !important; }
+  div[data-testid="stRadio"] div[role="radiogroup"] {
+    gap: 0.35rem 0.55rem !important;
+    flex-wrap: wrap !important;
+  }
+  div[data-testid="stRadio"] div[role="radiogroup"] > label {
+    min-height: 1.6rem !important;
+    padding: 0.1rem 0.45rem !important;
+    font-size: 0.82rem !important;
+    margin-right: 0 !important;
+  }
+  div[data-testid="stRadio"] div[role="radiogroup"] p {
+    font-size: 0.82rem !important;
+  }
+
+  /* ボタン: 小さめ */
+  div[data-testid="stButton"] > button {
+    min-height: 1.85rem !important;
+    padding: 0.15rem 0.65rem !important;
+    font-size: 0.85rem !important;
+  }
+
+  /* 声優・声調・速度などコンパクト欄 */
+  div[data-testid="stSelectbox"] {
+    max-width: 210px !important;
+  }
+  div[data-testid="stSelectbox"] label,
+  div[data-testid="stSlider"] label {
+    font-size: 0.8rem !important;
+  }
+  div[data-testid="stSlider"] {
+    max-width: 240px !important;
+    padding-bottom: 0.15rem !important;
+  }
+  div[data-testid="stSlider"] [data-baseweb="slider"] {
+    margin-top: 0.1rem !important;
+  }
 </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def maybe_reset_session_from_query() -> None:
+    """
+    アドレスに ?reset=1 が付いていたら、保存中の画面状態を全部消す。
+    （古い入力欄の名残で取り込みが失敗するとき用）
+    """
+    try:
+        reset = str(st.query_params.get("reset", "") or "").strip().lower()
+    except Exception:
+        reset = ""
+    if reset not in ("1", "true", "yes"):
+        return
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+    try:
+        st.query_params.clear()
+    except Exception:
+        try:
+            st.query_params.from_dict({})
+        except Exception:
+            pass
+    st.rerun()
+
+
+def wipe_session_if_legacy_editor_widget() -> None:
+    """
+    旧入力欄キー final_script_editor_widget などが残っていたら、
+    セッションを消してやり直す（回数制限つき）。
+    """
+    has_legacy = False
+    for key in list(st.session_state.keys()):
+        sk = str(key)
+        if (
+            sk == "final_script_editor_widget"
+            or sk.startswith("final_script_editor_widget")
+            or sk == "raw_script_editor_widget"
+            or sk.startswith("raw_script_editor_widget")
+        ):
+            has_legacy = True
+            break
+    if not has_legacy:
+        return
+    wipe_n = int(st.session_state.get("_legacy_wipe_count") or 0)
+    if wipe_n >= 3:
+        return
+    pending = st.session_state.get("_deferred_reload_script")
+    retries = st.session_state.get("_script_import_retries")
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+    st.session_state["_legacy_wipe_count"] = wipe_n + 1
+    if pending is not None:
+        st.session_state["_deferred_reload_script"] = pending
+    if retries is not None:
+        st.session_state["_script_import_retries"] = retries
+    st.rerun()
 
 
 def main() -> None:
@@ -4090,604 +4039,244 @@ def main() -> None:
         layout="wide",
     )
     inject_app_theme()
+    # 古い画面状態を消してから開始（?reset=1 または旧キー検知）
+    maybe_reset_session_from_query()
+    wipe_session_if_legacy_editor_widget()
     init_state()
+    # 自由文背景フォルダは起動時に必ず作る（Finder で見えるようにする）
+    ensure_custom_background_dir()
+    # 旧版の入力欄キーが残っていると取り込みが失敗するため、最初に消す
+    purge_legacy_editor_keys()
+    # ウィジェット生成前に、予約アクション → 入力欄の値反映 の順で済ませる
+    run_deferred_script_actions()
+    apply_pending_widget_values()
+
+    import_notice = st.session_state.pop("_script_import_notice", None)
 
     # MP4作成中は他UIを出さず、誤操作を防ぐ
     # Stop／再読み込みで中断されたあとも通常画面に戻れるようにする
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
         st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
-        st.markdown(
-            '<div style="font-size:1.2rem;margin-bottom:0.5rem;">'
-            "作業の進捗（パーセント）</div>",
-            unsafe_allow_html=True,
-        )
+        render_script_version_banner()
         if st.button("中止して通常画面に戻る", key="btn_cancel_video_encoding"):
             st.session_state.video_encoding = False
             st.session_state._export_job = None
             st.rerun()
 
         job = st.session_state.get("_export_job")
-        # pending / running 以外（古い状態・不明）は自動再開せず中断扱いにする
-        if job not in ("pending", "running"):
-            job = "running"
-        # Stop などで中断されたあと：自動再開せず、再開／中止を選ばせる
-        if job == "running":
+        # pending 以外（running・None・古い状態）でも進捗表示は出したまま、
+        # 再開／中止を選ばせる（進捗バーが消えないようにする）
+        if job != "pending":
             st.error("前回の作成が中断されたか、作成モードのまま残っています。")
-            if st.button("最初から再開する", type="primary", key="btn_restart_export"):
-                st.session_state._export_job = "pending"
-                st.rerun()
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button(
+                    "最初から再開する", type="primary", key="btn_restart_export"
+                ):
+                    st.session_state._export_job = "pending"
+                    st.session_state.export_progress_pct = 0
+                    st.session_state.export_progress_msg = "準備中…"
+                    st.rerun()
+            with col_b:
+                if st.button("通常画面に戻る", key="btn_exit_export_stuck"):
+                    st.session_state.video_encoding = False
+                    st.session_state._export_job = None
+                    st.rerun()
+            # 進捗バー／％は画面の一番下に出す
+            create_export_progress_widgets(
+                initial_pct=int(st.session_state.get("export_progress_pct") or 0),
+                initial_msg="中断中 — 下のボタンで再開または中止",
+            )
             st.stop()
 
-        # pending → 書き出し開始
+        # pending → 書き出し開始（進捗バーは画面下に出してからエンコード）
         st.session_state._export_job = "running"
         st.session_state.export_progress_pct = 0
         st.session_state.export_progress_msg = "準備中…"
-        progress = st.progress(0, text="0%  準備中…")
-        pct_box = st.empty()
-        status = st.empty()
-        update_export_progress(progress, pct_box, status, 0, "準備中…")
+        progress, pct_box, status = create_export_progress_widgets(
+            initial_pct=0,
+            initial_msg="準備中…",
+        )
         try:
             run_video_export(progress, pct_box, status)
         except Exception as e:  # noqa: BLE001
+            import traceback
+
             st.session_state.mp4_path = ""
             st.session_state.mp4_bytes = None
             st.session_state.video_encoding = False
             st.session_state._export_job = None
             st.error(f"動画生成に失敗しました: {e}")
-            st.exception(e)
+            try:
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                err_path = OUTPUT_DIR / "last_export_error.txt"
+                err_path.write_text(traceback.format_exc(), encoding="utf-8")
+                st.caption(f"技術的な詳細は `{err_path}` に保存しました。")
+            except OSError:
+                pass
             st.stop()
         st.session_state.video_encoding = False
         st.session_state._export_job = None
         st.rerun()
 
     st.write("医学ドラマ動画メーカー")
+    if import_notice:
+        if str(import_notice).startswith("原稿の取り込みに失敗"):
+            st.error(import_notice)
+        else:
+            st.success(import_notice)
 
     with st.sidebar:
         st.write("設定")
-        ok, ver = check_voicevox()
+        st.caption(f"修正版: `{APP_BUILD}`")
+        if st.button("画面をリセット", key="btn_sidebar_reset_ui"):
+            # 古い入力欄の名残も含め、画面の記憶を全部消す
+            for key in list(st.session_state.keys()):
+                st.session_state.pop(key, None)
+            try:
+                check_voicevox_cached.clear()
+                fetch_voicevox_speakers_cached.clear()
+            except Exception:
+                pass
+            st.rerun()
+        ok, ver = check_voicevox_cached()
         if ok:
             st.caption(f"VOICEVOX OK（{ver}）")
         else:
-            st.error(f"VOICEVOX 未接続: {ver}")
-
-        load_dotenv_file()
-        has_saved = bool(get_api_key())
-        typed = st.text_input(
-            "APIキー",
-            type="password",
-            placeholder="ANTHROPIC_API_KEY",
-            help="保存済み" if has_saved else "未設定",
-        )
-        if typed.strip():
-            os.environ["ANTHROPIC_API_KEY"] = typed.strip()
-
-        if st.button("キーを保存"):
-            to_save = typed.strip() or get_api_key()
-            if not to_save:
-                st.error("先にキーを入力してください。")
-            else:
-                try:
-                    saved_path = save_api_key_to_env_file(to_save)
-                    st.success(f"保存: `{saved_path.name}`")
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"保存失敗: {e}")
+            st.error("VOICEVOX 未接続")
+            st.caption(ver)
+            st.info(voicevox_howto_start())
+        st.caption(f"背景画像フォルダ: `{CUSTOM_BG_DIR}`")
+        if st.button("背景フォルダを今すぐ作る", key="btn_sidebar_make_custom_bg"):
+            path = ensure_custom_background_dir()
+            st.success(f"作成しました: {path}")
 
     # ----- Step 1 -----
     st.write("1. 台本")
 
-    input_mode = st.radio(
-        "入力方法",
-        options=["paper", "script"],
-        format_func=lambda x: (
-            "論文PDFから作る"
-            if x == "paper"
-            else "台本ファイルを取り込む"
-        ),
-        key="step1_input_mode",
-        horizontal=False,
-        label_visibility="collapsed",
+    script_upload = st.file_uploader(
+        "台本ファイル（.txt / .docx / .pdf）",
+        type=["txt", "docx", "pdf"],
+        key=f"ready_script_u{upload_gen()}",
     )
-
-    if input_mode == "paper":
-        paper_pdf = st.file_uploader(
-            "医学論文PDF",
-            type=["pdf"],
-            key="paper_pdf_upload",
-        )
-        if st.button(
-            "PDFから台本を作成",
-            type="primary",
-            key="btn_pdf_to_script",
-            use_container_width=True,
-        ):
-            api_key = get_api_key()
-            if not api_key:
-                st.error("先にAPIキーを入力・保存してください。")
-            elif paper_pdf is None:
-                st.error("PDFを選んでください。")
-            else:
-                try:
-                    with st.spinner("PDFの文字を読み取っています…"):
-                        raw = paper_pdf.getvalue()
-                        paper_text = extract_text_from_pdf_bytes(raw)
-                    with st.spinner(
-                        "台本を作成中です（数分かかることがあります）…"
-                    ):
-                        script = generate_drama_script_from_paper(paper_text, api_key)
-                    if not script.strip():
-                        st.error("台本が空でした。別のPDFで試してください。")
-                    else:
-                        # 既存ルビがあれば残して取り込む
-                        script = normalize_script_keeping_ruby(script)
-                        commit_loaded_script(
-                            script,
-                            f"pdf-{paper_pdf.name}-{len(script)}",
-                        )
-                        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                        (OUTPUT_DIR / "last_script.txt").write_text(
-                            script, encoding="utf-8"
-                        )
-                        # 論文から Vancouver 方式の参考文献を作り、エンディングへ反映
-                        with st.spinner("参考文献を作成中…"):
-                            citation = extract_vancouver_citation_from_paper(
-                                paper_text, api_key
-                            )
-                        if citation:
-                            apply_paper_reference_to_session(citation)
-                        else:
-                            apply_paper_reference_to_session(
-                                f"（PDFより作成・書誌情報を確認してください）{paper_pdf.name}"
-                            )
-                        n_ruby = count_voicevox_ruby(script)
-                        ruby_note = f"・ルビ {n_ruby} 件" if n_ruby else ""
-                        st.success(
-                            f"取り込み完了: {paper_pdf.name}"
-                            f"（約 {len(script):,} 字{ruby_note}）"
-                        )
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"台本作成に失敗しました: {e}")
-
-    else:
-        script_upload = st.file_uploader(
-            "台本ファイル（.docx / .pdf）",
-            type=["docx", "pdf"],
-            key="ready_script_upload",
-        )
-        if st.button(
-            "台本を取り込む",
-            type="primary",
-            key="btn_import_ready_script",
-            use_container_width=True,
-        ):
-            if script_upload is None:
-                st.error("台本ファイルを選んでください。")
-            else:
-                try:
-                    with st.spinner("台本を読み取っています…"):
-                        raw = script_upload.getvalue()
-                        script = extract_text_from_bytes(
-                            script_upload.name, raw
-                        ).strip()
-                    if not script:
-                        st.error("台本が空でした。")
-                    else:
-                        script = normalize_script_keeping_ruby(script)
-                        commit_loaded_script(
-                            script,
-                            f"script-{script_upload.name}-{len(script)}",
-                        )
-                        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                        (OUTPUT_DIR / "last_script.txt").write_text(
-                            script, encoding="utf-8"
-                        )
-                        n_ruby = count_voicevox_ruby(script)
-                        ruby_note = f"・ルビ {n_ruby} 件" if n_ruby else ""
-                        st.success(
-                            f"取り込み完了: {script_upload.name}"
-                            f"（約 {len(script):,} 字{ruby_note}）"
-                        )
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"台本の取り込みに失敗しました: {e}")
-
-    # タイトルは手入力のみ（提案しない）。値は上書きするまで保持。
-    if st.session_state.get("raw_script") and not st.session_state.get(
-        "script_confirmed"
+    if st.button(
+        "台本を取り込む",
+        type="primary",
+        key="btn_import_ready_script",
+        use_container_width=True,
     ):
-        render_video_title_input()
+        if script_upload is None:
+            st.error("台本ファイルを選んでください。")
+        else:
+            try:
+                with st.spinner("台本を読み取っています…"):
+                    raw = script_upload.getvalue()
+                    assert_script_upload_size(raw, script_upload.name)
+                    script = extract_text_from_bytes(
+                        script_upload.name, raw
+                    ).strip()
+                if not script:
+                    st.error("台本が空でした。")
+                else:
+                    # 既存ルビは削除も追加もしない
+                    script = normalize_script_keeping_ruby(script)
+                    schedule_script_reload(
+                        script,
+                        f"script-{script_upload.name}-{len(script)}",
+                        notice=(
+                            f"取り込み完了: {script_upload.name}"
+                            f"（約 {len(script):,} 字）"
+                        ),
+                        upload_filename=script_upload.name,
+                    )
+            except Exception as e:  # noqa: BLE001
+                st.error(f"台本の取り込みに失敗しました: {e}")
 
-    if st.session_state.raw_script:
+    # ----- Step 2: 台本を確定 -----
+    if st.session_state.raw_script and not st.session_state.script_confirmed:
+        st.write("2. 台本を確定")
         n_chars = len(st.session_state.raw_script)
         est_min = max(1, round(n_chars / 320))
-        n_ruby_raw = count_voicevox_ruby(st.session_state.raw_script)
-        ruby_cap = f"・ルビ {n_ruby_raw} 件" if n_ruby_raw else ""
-        st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分{ruby_cap}")
-        # 台本表示窓は常に編集・上書き可能
-        if "raw_script_editor_widget" not in st.session_state:
-            st.session_state.raw_script_editor_widget = st.session_state.raw_script
+        st.caption(f"{n_chars:,} 字 ／ 目安 {est_min} 分")
+        st.caption(
+            "ルビ: `{表記|よみ}` / `｛表記｜よみ｝` → 字幕は表記、VOICEVOX は読み。"
+            " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
+            " ファイル名を `〈〉` 内の文字と同一にする。"
+            " 大かっこ: `[注釈]` → 字幕は中身だけ（かっこは出さない）、VOICEVOX は読まない。"
+            f" 修正版 `{APP_BUILD}`。"
+            " 背景は **最終版（背景あり）** で作り直してください。"
+        )
+        raw_key = ensure_editor_value(
+            EDITOR_BASE_RAW, st.session_state.raw_script
+        )
         st.text_area(
             "台本（編集・上書き可）",
             height=280,
-            key="raw_script_editor_widget",
+            key=raw_key,
         )
         if st.button("この内容で台本を上書き", key="btn_overwrite_raw_script"):
             edited_raw = normalize_script_keeping_ruby(
-                st.session_state.get("raw_script_editor_widget") or ""
-            )
+                read_editor_value(EDITOR_BASE_RAW)
+            ).strip()
             if not edited_raw:
                 st.error("台本が空です。")
             else:
-                st.session_state.raw_script = edited_raw
-                st.session_state.final_script = edited_raw
-                st.session_state.final_script_editor = edited_raw
-                # 表示中の最終台本ウィジェットは触らず、次回初期化用だけ更新
-                st.session_state.pop("final_script_editor_widget", None)
-                st.success("台本を上書きしました（既存ルビは残しています）。")
-                st.rerun()
-
-        col_rev, col_skip = st.columns(2)
-        with col_rev:
-            review_clicked = st.button(
-                "1. レビューする",
-                type="primary",
-                disabled=not bool(st.session_state.raw_script.strip()),
-                use_container_width=True,
-                key="btn_do_review",
-            )
-        with col_skip:
-            skip_clicked = st.button(
-                "1′. レビューせず進む",
-                type="secondary",
-                disabled=not bool(st.session_state.raw_script.strip()),
-                use_container_width=True,
-                key="btn_skip_review",
-            )
-    else:
-        review_clicked = False
-        skip_clicked = False
-
-    if review_clicked:
-        with st.spinner("台本をレビューしています…"):
-            try:
-                # 古い採否の選択を消してから新しいレビューを入れる
-                clear_review_decision_widgets(st.session_state.get("review"))
-                # レビュー用は読みやすい平文、保存用は既存ルビを残す
-                kept = normalize_script_keeping_ruby(st.session_state.raw_script)
-                review_plain = strip_voicevox_ruby(kept)
-                st.session_state.review = run_script_review(review_plain)
-                st.session_state.review_done = True
-                st.session_state.skip_review = False
-                st.session_state.script_confirmed = False
-                st.session_state.ruby_ready = False
-                st.session_state.mp4_bytes = None
-                st.session_state.mp4_path = ""
-                st.session_state.review_apply_log = []
-                st.session_state.review_manual_log = []
-                st.session_state.last_error = ""
-                st.session_state.final_script = kept
-                st.session_state.final_script_editor = kept
-                st.session_state.pop("final_script_editor_widget", None)
-            except Exception as e:  # noqa: BLE001
-                st.session_state.last_error = str(e)
-                st.error(f"レビューに失敗しました: {e}")
-
-    if skip_clicked:
-        clear_review_decision_widgets(st.session_state.get("review"))
-        kept = normalize_script_keeping_ruby(st.session_state.raw_script)
-        st.session_state.review = None
-        st.session_state.review_done = True
-        st.session_state.skip_review = True
-        st.session_state.script_confirmed = False
-        st.session_state.ruby_ready = False
-        st.session_state.mp4_bytes = None
-        st.session_state.mp4_path = ""
-        st.session_state.review_apply_log = []
-        st.session_state.review_manual_log = []
-        st.session_state.last_error = ""
-        st.session_state.final_script = kept
-        st.session_state.final_script_editor = kept
-        st.session_state.pop("final_script_editor_widget", None)
-        st.success("レビューをスキップしました（既存ルビは残しています）")
-
-    # ----- Step 2: レビュー結果と採否／またはスキップ後の確認 -----
-    if st.session_state.review_done:
-        if st.session_state.get("skip_review"):
-            st.write("2. 原稿を確定")
-            if "final_script_editor_widget" not in st.session_state:
-                st.session_state.final_script_editor_widget = (
-                    st.session_state.final_script or st.session_state.raw_script
-                )
-            st.text_area(
-                "最終台本（編集・上書き可）",
-                height=320,
-                key="final_script_editor_widget",
-            )
-            if st.button("2. 確定してルビ準備へ", type="primary", key="btn_confirm_skip"):
-                edited = normalize_script_keeping_ruby(
-                    (st.session_state.get("final_script_editor_widget") or "").strip()
-                )
-                if not edited:
-                    st.error("最終台本が空です。")
-                else:
-                    st.session_state.final_script = edited
-                    st.session_state.final_script_editor = edited
-                    st.session_state.raw_script = edited
-                    st.session_state.script_confirmed = True
-                    st.session_state.ruby_ready = False
-                    st.session_state.ruby_script = ""
-                    st.session_state.pop("ruby_script_editor", None)
-                    st.rerun()
-
-        elif st.session_state.review:
-            st.write("2. レビュー")
-            review = st.session_state.review
-            mode = review.get("mode", "claude")
-            if mode == "heuristic":
-                st.caption("簡易レビュー")
-            if review.get("review_truncated"):
-                st.warning("長い台本のため、レビューは先頭部分のみです。")
-
-            for section_key, section_title in REVIEW_SECTION_DEFS:
-                render_review_section_interactive(
-                    section_key,
-                    section_title,
-                    review.get(section_key, []),
+                # 入力欄表示中にキーを触らない。次の描画の最初で反映する
+                schedule_script_reload(
+                    edited_raw,
+                    f"overwrite-{len(edited_raw)}-{editor_rev()}",
+                    notice="台本を上書きしました。",
                 )
 
-            if st.button("採択・別案を台本に反映", type="secondary"):
-                base = (
-                    st.session_state.get("final_script_editor_widget")
-                    or st.session_state.get("final_script")
-                    or st.session_state.raw_script
+        if st.button(
+            "2. 確定して動画作成へ",
+            type="primary",
+            disabled=not bool(st.session_state.raw_script.strip()),
+            use_container_width=True,
+            key="btn_confirm_to_video",
+        ):
+            edited = normalize_script_keeping_ruby(
+                read_editor_value(EDITOR_BASE_RAW) or st.session_state.raw_script
+            ).strip()
+            if not edited:
+                st.error("台本が空です。")
+            else:
+                schedule_script_reload(
+                    edited,
+                    f"confirm-{len(edited)}-{editor_rev()}",
+                    advance_plain=True,
                 )
-                new_text, applied, manual = apply_review_decisions_to_script(
-                    base, review
-                )
-                new_text = normalize_script_keeping_ruby(new_text)
-                st.session_state.final_script = new_text
-                st.session_state.final_script_editor = new_text
-                # 表示中の入力欄キーは触らず、消してから再表示する
-                st.session_state.pop("final_script_editor_widget", None)
-                st.session_state.review_apply_log = applied
-                st.session_state.review_manual_log = manual
-                if applied:
-                    st.success(f"{len(applied)} 件を反映しました")
-                else:
-                    st.info("自動反映できる項目はありませんでした")
-                if manual:
-                    st.warning("手修正が必要な項目があります")
-                st.rerun()
 
-            if st.session_state.get("review_apply_log"):
-                with st.expander("反映した内容", expanded=False):
-                    for line in st.session_state.review_apply_log:
-                        st.write(f"- {line}")
-            if st.session_state.get("review_manual_log"):
-                with st.expander("手修正が必要な内容", expanded=True):
-                    for line in st.session_state.review_manual_log:
-                        st.write(f"- {line}")
-
-            if "final_script_editor_widget" not in st.session_state:
-                st.session_state.final_script_editor_widget = (
-                    st.session_state.final_script or st.session_state.raw_script
-                )
-            st.text_area(
-                "最終台本（編集・上書き可）",
-                height=320,
-                key="final_script_editor_widget",
-            )
-
-            if st.button(
-                "2. 確定してルビ準備へ",
-                type="primary",
-                key="btn_confirm_review",
-            ):
-                edited = normalize_script_keeping_ruby(
-                    (st.session_state.get("final_script_editor_widget") or "").strip()
-                )
-                if not edited:
-                    st.error("最終台本が空です。")
-                else:
-                    st.session_state.final_script = edited
-                    st.session_state.final_script_editor = edited
-                    st.session_state.raw_script = edited
-                    st.session_state.script_confirmed = True
-                    st.session_state.ruby_ready = False
-                    st.session_state.ruby_script = ""
-                    st.session_state.pop("ruby_script_editor", None)
-                    st.rerun()
-
-    # ----- Step 3: ルビ準備 → 動画生成 -----
+    # ----- Step 3: 動画作成 -----
     if st.session_state.script_confirmed:
         st.write("3. 動画")
-        render_video_title_input()
 
-        st.write("ルビ準備（動画の直前）")
-        st.caption("①辞書 → ②ルビ作成（またはルビなしで進む）→ ③修正 → 確定、のあと動画へ")
+        voice_now = normalize_script_keeping_ruby(
+            str(
+                st.session_state.get("ruby_script")
+                or st.session_state.get("final_script")
+                or ""
+            )
+        ).strip()
+        # 台本のルビは削除も追加もしない
+        st.session_state.ruby_script = voice_now
+        st.session_state.ruby_ready = bool(voice_now)
+        mode_now = str(st.session_state.get("video_export_mode") or "draft")
 
-        # ① 辞書読み込み
-        st.write("① 辞書読み込み")
-        dict_file = st.file_uploader(
-            "追加辞書（.tsv / .txt / .csv）",
-            type=["tsv", "txt", "csv"],
-            key="ruby_dict_upload",
+        st.write("作業の流れ")
+        st.markdown(
+            """
+1. **A. 最初の確認** … ドラフトMP4（背景なし）を作る  
+2. **B. 読み直し** … 読みがおかしければ台本を直して、ドラフトを作り直す  
+3. **C. 仕上げ** … 固まったら最終版（背景あり）を作る  
+            """.strip()
         )
-        if dict_file is not None:
-            try:
-                raw_dict = dict_file.getvalue().decode("utf-8", errors="replace")
-                pairs = parse_ruby_dict_text(raw_dict)
-                if not pairs:
-                    st.warning("辞書から用語を読み取れませんでした。")
-                else:
-                    file_id = f"{dict_file.name}-{dict_file.size}-{len(pairs)}"
-                    if st.session_state.get("_ruby_dict_file_id") != file_id:
-                        st.session_state.ruby_dict_custom = pairs
-                        st.session_state.ruby_dict_source_name = dict_file.name
-                        st.session_state._ruby_dict_file_id = file_id
-                        st.session_state.ruby_ready = False
-                        st.success(
-                            f"追加辞書: {dict_file.name}（{len(pairs)} 語）"
-                        )
-            except Exception as e:  # noqa: BLE001
-                st.error(f"辞書の読込失敗: {e}")
-        active_n = len(get_active_ruby_dictionary())
-        src_name = st.session_state.get("ruby_dict_source_name") or (
-            RUBY_DICT_PATH.name if RUBY_DICT_PATH.is_file() else "組み込み"
-        )
-        learned_n = len(st.session_state.get("ruby_dict_learned") or [])
-        st.caption(
-            f"辞書: 標準 + {src_name}（{active_n} 語"
-            + (f"・修正反映 {learned_n} 語" if learned_n else "")
-            + "）"
-        )
-        if st.session_state.get("ruby_dict_export_ready") and RUBY_DICT_EXPORT_PATH.is_file():
-            st.download_button(
-                "ルビ辞書.txt をダウンロード",
-                data=RUBY_DICT_EXPORT_PATH.read_bytes(),
-                file_name=RUBY_DICT_EXPORT_NAME,
-                mime="text/plain",
-                key="dl_ruby_dict_pre_video",
-            )
+        st.caption(f"動画種類の初期値: {mode_now}")
 
-        # ② ルビ入り原稿を作成（スキップ可）
-        st.write("② ルビ入り原稿を作成")
-        col_ruby_on, col_ruby_skip = st.columns(2)
-        with col_ruby_on:
-            apply_ruby_clicked = st.button(
-                "辞書でルビを付ける",
-                type="primary",
-                key="btn_apply_dict_ruby_pre_video",
-                use_container_width=True,
-            )
-        with col_ruby_skip:
-            skip_ruby_clicked = st.button(
-                "ルビなしで進む",
-                key="btn_skip_ruby_pre_video",
-                use_container_width=True,
-            )
-
-        if apply_ruby_clicked:
-            # 既存ルビは消さず、辞書ルビを足す
-            base = normalize_script_keeping_ruby(
-                st.session_state.get("final_script") or ""
-            )
-            if not base:
-                st.error("原稿が空です。先に台本を確定してください。")
-            else:
-                with st.spinner("辞書でルビを付けています…"):
-                    ruby_script, ruby_n, _ = apply_dictionary_ruby_to_script(base)
-                st.session_state.ruby_script = ruby_script
-                st.session_state.ruby_script_baseline = ruby_script
-                st.session_state.pop("ruby_script_editor", None)
-                st.session_state.ruby_ready = False
-                st.session_state.ruby_skipped = False
-                st.rerun()
-
-        if skip_ruby_clicked:
-            # 既存ルビがあればそのまま残す
-            base = normalize_script_keeping_ruby(
-                st.session_state.get("final_script") or ""
-            )
-            if not base:
-                st.error("原稿が空です。先に台本を確定してください。")
-            else:
-                st.session_state.ruby_script = base
-                st.session_state.ruby_script_baseline = base
-                st.session_state.pop("ruby_script_editor", None)
-                st.session_state.ruby_ready = True
-                st.session_state.ruby_skipped = not bool(count_voicevox_ruby(base))
-                st.session_state.ruby_dict_last_updates = []
-                st.rerun()
-
-        # ③ ルビ入り原稿を修正（確定後も上書き可）
-        st.write("③ ルビ入り原稿を修正")
-        has_ruby_draft = bool(
-            (st.session_state.get("ruby_script") or "").strip()
-            or (st.session_state.get("ruby_script_editor") or "").strip()
-        )
-        if not has_ruby_draft:
-            st.info("②でルビを付けたあと、ここで直して確定します。")
-        else:
-            if "ruby_script_editor" not in st.session_state:
-                st.session_state.ruby_script_editor = (
-                    st.session_state.get("ruby_script") or ""
-                )
-            elif st.session_state.get("ruby_ready") and not (
-                st.session_state.get("ruby_script_editor") or ""
-            ).strip():
-                st.session_state.ruby_script_editor = (
-                    st.session_state.get("ruby_script") or ""
-                )
-
-            if st.session_state.get("ruby_ready"):
-                n_ruby = count_voicevox_ruby(
-                    st.session_state.get("ruby_script") or ""
-                )
-                if st.session_state.get("ruby_skipped"):
-                    st.write("確定済み（ルビなしで進行）。必要なら下の欄で追記・上書きできます。")
-                else:
-                    st.write(f"確定済み（ルビ {n_ruby} 件）。下の欄で上書きできます。")
-                last_updates = st.session_state.get("ruby_dict_last_updates") or []
-                if last_updates:
-                    st.caption(
-                        "辞書に反映した修正: "
-                        + "、".join(f"{s}→{r}" for s, r in last_updates[:12])
-                        + ("…" if len(last_updates) > 12 else "")
-                    )
-
-            st.text_area(
-                "ルビ入り原稿（編集・上書き可）",
-                height=320,
-                key="ruby_script_editor",
-            )
-            confirm_label = (
-                "上書きして確定"
-                if st.session_state.get("ruby_ready")
-                else "ルビ入り原稿を確定して動画設定へ"
-            )
-            if st.button(
-                confirm_label,
-                type="primary",
-                key="btn_confirm_ruby_script",
-            ):
-                edited_ruby = normalize_script_keeping_ruby(
-                    st.session_state.get("ruby_script_editor") or ""
-                )
-                if not edited_ruby:
-                    st.error("ルビ入り原稿が空です。")
-                else:
-                    baseline = str(
-                        st.session_state.get("ruby_script_baseline")
-                        or st.session_state.get("ruby_script")
-                        or ""
-                    )
-                    updates = find_ruby_dict_updates(baseline, edited_ruby)
-                    applied = apply_ruby_updates_to_learned_dict(updates)
-                    st.session_state.ruby_script = edited_ruby
-                    # ruby_script_editor は text_area の key なので、ここでは書き換えない
-                    st.session_state.ruby_ready = True
-                    st.session_state.ruby_skipped = False
-                    st.session_state.ruby_dict_last_updates = applied
-                    st.rerun()
-
-            if RUBY_DICT_EXPORT_PATH.is_file():
-                st.download_button(
-                    "ルビ辞書.txt をダウンロード",
-                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
-                    file_name=RUBY_DICT_EXPORT_NAME,
-                    mime="text/plain",
-                    key="dl_ruby_dict_after_confirm",
-                )
-            if st.session_state.get("ruby_ready") and st.button(
-                "ルビ準備をやり直す",
-                key="btn_reset_ruby_ready",
-            ):
-                st.session_state.ruby_ready = False
-                st.session_state.ruby_skipped = False
-                st.rerun()
-
-        if not st.session_state.get("ruby_ready"):
-            st.caption("①②③が終わるまで、動画生成には進めません。")
+        # 台本が空なら止める
+        if not voice_now:
+            st.warning("台本が空です。Step 2 で台本を確定してください。")
             st.stop()
 
         st.write("参考文献")
@@ -4730,25 +4319,6 @@ def main() -> None:
             on_change=persist_reference_from_widget,
             label_visibility="collapsed",
         )
-        ref_now = (st.session_state.get("reference_text") or "").strip()
-        if ref_now:
-            c_ref_txt, c_ref_docx = st.columns(2)
-            with c_ref_txt:
-                st.download_button(
-                    "参考文献 .txt",
-                    data=ref_now.encode("utf-8"),
-                    file_name="reference.txt",
-                    mime="text/plain",
-                    key="dl_reference_txt",
-                )
-            with c_ref_docx:
-                st.download_button(
-                    "参考文献 .docx",
-                    data=text_to_docx_bytes(ref_now),
-                    file_name="reference.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key="dl_reference_docx",
-                )
 
         st.write("読み上げ")
         selected_style_id = int(
@@ -4761,11 +4331,16 @@ def main() -> None:
             st.session_state.get("vvox_style_name", DEFAULT_STYLE_NAME)
         )
         try:
-            ok_vv, _ver = check_voicevox()
+            ok_vv, _ver = check_voicevox_cached()
             if not ok_vv:
-                st.warning("VOICEVOXに接続できません。起動して再読み込みしてください。")
+                st.warning(
+                    "VOICEVOX に接続できません。"
+                    " 先に VOICEVOX アプリを起動してから、"
+                    "ブラウザを再読み込みしてください。"
+                )
+                st.info(voicevox_howto_start())
             else:
-                speakers = fetch_voicevox_speakers()
+                speakers = fetch_voicevox_speakers_cached()
                 speaker_names = [
                     str(s.get("name") or "").strip()
                     for s in speakers
@@ -4782,7 +4357,7 @@ def main() -> None:
                         cur_name = default_name
                     name_index = speaker_names.index(cur_name)
 
-                    col_a, col_b = st.columns(2)
+                    col_a, col_b, _spacer = st.columns([1.1, 1.1, 2.3])
                     with col_a:
                         chosen_name = st.selectbox(
                             "声優",
@@ -4850,14 +4425,16 @@ def main() -> None:
             selected_speaker_name = DEFAULT_SPEAKER_NAME
             selected_style_name = DEFAULT_STYLE_NAME
 
-        st.slider(
-            "読み上げ速度",
-            min_value=float(VOICEVOX_SPEED_MIN),
-            max_value=float(VOICEVOX_SPEED_MAX),
-            step=float(VOICEVOX_SPEED_STEP),
-            key="vvox_speed_scale",
-            format="%.1f倍",
-        )
+        speed_col, _speed_spacer = st.columns([1.4, 3.1])
+        with speed_col:
+            st.slider(
+                "速度",
+                min_value=float(VOICEVOX_SPEED_MIN),
+                max_value=float(VOICEVOX_SPEED_MAX),
+                step=float(VOICEVOX_SPEED_STEP),
+                key="vvox_speed_scale",
+                format="%.1f倍",
+            )
 
         # ----- ④ エンディング画面の確認・修正 -----
         st.write("エンディング")
@@ -4890,41 +4467,122 @@ def main() -> None:
             height=280,
         )
 
+        # 動画タイトルは MP4 作成直前にだけ出す（他ステップには出さない）
+        render_video_title_input()
+
         st.write("動画の種類")
         st.radio(
             "背景の有無",
             options=["draft", "final"],
             format_func=lambda x: (
-                "ドラフト（背景なし・台本確認用）"
+                "ドラフト（背景なし）"
                 if x == "draft"
                 else "最終版（背景あり）"
             ),
             key="video_export_mode",
-            horizontal=False,
+            horizontal=True,
+            label_visibility="collapsed",
         )
         st.caption(
-            "ドラフトは黒い画面＋字幕＋音声だけです。"
-            "最終版台本が固まったら、背景ありを選んでください。"
+            "最初と読み直しのあいだはドラフト（背景なし）。"
+            " 〈〉 の背景指示を反映するには **最終版（背景あり）** を選んでください。"
         )
+        # 最終版の直前チェック: 〈〉 と custom_backgrounds の不足を明示
+        if str(st.session_state.get("video_export_mode") or "draft") == "final":
+            script_now = str(
+                st.session_state.get("final_script")
+                or st.session_state.get("raw_script")
+                or ""
+            )
+            hints_now = unique_background_hints(script=script_now)
+            missing_now = find_missing_custom_backgrounds(script=script_now)
+            if hints_now and not missing_now:
+                st.success(
+                    f"背景チェック OK: 〈〉 {len(hints_now)} 件すべてに画像があります。"
+                )
+            elif missing_now:
+                st.warning(format_missing_custom_backgrounds_message(missing_now))
+                with st.expander("不足している背景ファイル一覧", expanded=True):
+                    for item in missing_now:
+                        st.write(
+                            f"・ 〈{item['hint']}〉 → `{item['expected_file']}`"
+                        )
+                    st.caption(f"保存先フォルダ: `{CUSTOM_BG_DIR}`")
+            elif not hints_now:
+                st.info(
+                    "台本に 〈〉 の背景指定がありません。"
+                    " 背景ありでも既定の風景で作成されます。"
+                )
+        with st.expander("背景画像（custom_backgrounds）の置き方", expanded=False):
+            ensure_custom_background_dir()
+            st.markdown(
+                f"""
+**ルール**
+1. 背景画は **別途事前に作成** する  
+2. フォルダ `{CUSTOM_BG_DIR}` に保存する（名前は **custom_backgrounds**）  
+3. 形式は **.jpg** または **.png**  
+4. ファイル名は台本の `〈〉` 内の文字と **同じ**  
 
-        if st.button("3. 動画を生成する", type="primary"):
-            # 次の描画で作業専用画面にし、他ボタンを出さない
-            st.session_state.video_encoding = True
-            st.session_state._export_job = "pending"
-            st.session_state.ruby_dict_post_video_updates = []
-            st.session_state.export_progress_pct = 0
-            st.session_state.export_progress_msg = ""
-            st.rerun()
+例: 台本が `〈夜の暗い手術室〉` なら、ファイルは `夜の暗い手術室.jpg`
+
+そのあと **最終版（背景あり）** で MP4 を作ります。
+                """.strip()
+            )
+            if st.button("背景フォルダを今すぐ作る", key="btn_ensure_custom_bg"):
+                ensure_custom_background_dir()
+                st.success(f"用意しました: {CUSTOM_BG_DIR}")
+
+        # MP4作成直前: 台本バージョン（アップロード日時）を必ず表示
+        render_script_version_banner()
+        gen_label = (
+            "3. ドラフトMP4を作成する（背景なし）"
+            if str(st.session_state.get("video_export_mode") or "draft") == "draft"
+            else "3. 最終版MP4を作成する（背景あり）"
+        )
+        if st.button(gen_label, type="primary"):
+            mode_now = str(st.session_state.get("video_export_mode") or "draft")
+            if begin_video_encoding(mode_now):
+                st.rerun()
 
         mp4_path = st.session_state.get("mp4_path") or ""
         if mp4_path and Path(mp4_path).exists():
             size_mb = Path(mp4_path).stat().st_size / (1024 * 1024)
+            last_mode = str(
+                st.session_state.get("last_video_export_mode")
+                or st.session_state.get("video_export_mode")
+                or "draft"
+            )
+            mode_kind = (
+                "最終版（背景あり）"
+                if last_mode == "final"
+                else "ドラフト（背景なし）"
+            )
             st.write(f"完成: `{mp4_path}` （約 {size_mb:.1f} MB）")
-            # 大きいMP4を毎回メモリに載せると落ちやすいので上限を設ける
+            st.caption(f"今回の動画: {mode_kind}")
+            missing = st.session_state.get("_custom_bg_missing") or []
+            if missing and last_mode == "final":
+                st.warning(
+                    "次の 〈〉 に対応する画像が見つかりませんでした。"
+                    " 同名の jpg/png を custom_backgrounds に置いて、"
+                    "最終版を作り直してください:\n"
+                    + "\n".join(f"- 〈{h}〉" for h in missing)
+                )
+                st.caption(f"診断ファイル: {OUTPUT_DIR / 'last_custom_bg_debug.txt'}")
+                st.caption(f"背景フォルダ: {CUSTOM_BG_DIR}")
+            dbg = OUTPUT_DIR / "last_custom_bg_debug.txt"
+            if dbg.is_file() and last_mode == "final":
+                with st.expander("背景画像の読み込み結果", expanded=bool(missing)):
+                    st.code(dbg.read_text(encoding="utf-8"))
+            # 大きいMP4を毎回ディスクから読むと落ちやすい → 1回だけメモリに載せる
             if size_mb < 180:
+                mp4_stat = Path(mp4_path).stat()
+                cache_key = (mp4_path, mp4_stat.st_mtime_ns, mp4_stat.st_size)
+                if st.session_state.get("_mp4_cache_key") != cache_key:
+                    st.session_state._mp4_cache_bytes = Path(mp4_path).read_bytes()
+                    st.session_state._mp4_cache_key = cache_key
                 st.download_button(
                     label="MP4をダウンロード",
-                    data=Path(mp4_path).read_bytes(),
+                    data=st.session_state._mp4_cache_bytes,
                     file_name=st.session_state.mp4_name,
                     mime="video/mp4",
                     type="primary",
@@ -4953,79 +4611,100 @@ def main() -> None:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-            # 動画作成後: ルビ入り最終原稿と辞書の差分を反映済み
-            post_ruby = st.session_state.get("ruby_dict_post_video_updates") or []
-            st.write("ルビ辞書（動画作成後）")
-            if post_ruby:
-                st.success(
-                    f"ルビ入り最終原稿にあって辞書になかったルビを "
-                    f"{len(post_ruby)} 件、辞書へ追加しました。"
-                )
-                preview = "、".join(f"{s}（{r}）" for s, r in post_ruby[:15])
-                if len(post_ruby) > 15:
-                    preview += "…"
-                st.caption(preview)
-            else:
-                st.caption(
-                    "今回、辞書に足りないルビはありませんでした"
-                    "（原稿のルビはすべて辞書にありました）。"
-                )
-            if RUBY_DICT_EXPORT_PATH.is_file():
-                st.download_button(
-                    label="ルビ辞書.txt をダウンロード",
-                    data=RUBY_DICT_EXPORT_PATH.read_bytes(),
-                    file_name=RUBY_DICT_EXPORT_NAME,
-                    mime="text/plain",
-                    key="dl_ruby_dict_after_video",
-                )
-
-            # 次の原稿 → もう一度 MP4 を作るループ
-            st.write("次の動画")
-            next_script = st.file_uploader(
-                "次の原稿（.txt / .docx）",
-                type=["txt", "docx"],
-                key="next_loop_script_upload",
+            # 読み直し: 台本を手直ししてから作り直す
+            st.write("読み直し・仕上げ")
+            st.caption(
+                "読みがおかしいときは、修正した台本を上げてから作り直してください。"
             )
-            if st.button(
-                "この原稿で次の動画を作る",
-                type="primary",
-                key="btn_next_video_loop",
-            ):
-                if next_script is None:
-                    st.error("原稿ファイル（.txt または .docx）を選んでください。")
-                else:
+            script_reupload = st.file_uploader(
+                "修正した台本（.txt / .docx）",
+                type=["txt", "docx"],
+                key=f"reupload_script_u{upload_gen()}",
+            )
+            if script_reupload is not None:
+                file_id = f"{script_reupload.name}-{script_reupload.size}"
+                if st.session_state.get("_ruby_loop_file_id") != file_id:
                     try:
-                        loaded = load_text_from_upload(next_script).strip()
-                        script = normalize_script_keeping_ruby(loaded)
+                        loaded = load_text_from_upload(script_reupload).strip()
+                        script = normalize_script_keeping_ruby(loaded).strip()
                         if not script:
-                            st.error("原稿が空でした。")
+                            st.error("台本が空でした。")
                         else:
-                            commit_loaded_script(
+                            # 入力欄表示中にキーを触らない。次描画の最初で反映する
+                            st.session_state._ruby_loop_file_id = file_id
+                            schedule_script_reload(
                                 script,
-                                f"loop-{next_script.name}-{len(script)}",
+                                f"reupload-{file_id}",
+                                advance_plain=True,
+                                notice=(
+                                    "修正台本を取り込みました（ルビ・〈〉は削除していません）。\n"
+                                    "「ドラフトMP4を再作成」を押してください。"
+                                ),
+                                upload_filename=script_reupload.name,
                             )
-                            # レビューを飛ばしてルビ準備へ（ループ用）
-                            st.session_state.review_done = True
-                            st.session_state.skip_review = True
-                            st.session_state.script_confirmed = True
-                            st.session_state.ruby_ready = False
-                            st.session_state.ruby_skipped = False
-                            # 既存ルビがあればルビ原稿としても保持
-                            st.session_state.ruby_script = script
-                            st.session_state.ruby_script_baseline = script
-                            st.session_state.pop("ruby_script_editor", None)
-                            st.session_state.mp4_bytes = None
-                            st.session_state.mp4_path = ""
-                            st.session_state.final_script = script
-                            st.session_state.final_script_editor = script
-                            st.session_state.pop("final_script_editor_widget", None)
-                            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                            (OUTPUT_DIR / "last_script.txt").write_text(
-                                script, encoding="utf-8"
-                            )
-                            st.rerun()
                     except Exception as e:  # noqa: BLE001
-                        st.error(f"原稿の取り込みに失敗しました: {e}")
+                        st.error(f"台本の取り込みに失敗しました: {e}")
+
+            # MP4再作成直前: 台本バージョンを表示
+            render_script_version_banner()
+            col_redraft, col_final = st.columns(2)
+            with col_redraft:
+                if st.button(
+                    "ドラフトMP4を再作成（背景なし）",
+                    type="primary",
+                    key="btn_recreate_draft_mp4",
+                    use_container_width=True,
+                ):
+                    if begin_video_encoding("draft"):
+                        st.rerun()
+            with col_final:
+                if st.button(
+                    "最終版MP4を作成（背景あり）",
+                    type="secondary",
+                    key="btn_create_final_mp4",
+                    use_container_width=True,
+                ):
+                    if begin_video_encoding("final"):
+                        st.rerun()
+
+            # 別作品用の次原稿
+            with st.expander("別の原稿で新しい動画を始める", expanded=False):
+                next_script = st.file_uploader(
+                    "次の原稿（.txt / .docx）",
+                    type=["txt", "docx"],
+                    key=f"next_script_u{upload_gen()}",
+                )
+                if st.button(
+                    "この原稿で最初から作り直す",
+                    key=f"btn_next_video_loop_u{upload_gen()}",
+                ):
+                    if next_script is None:
+                        st.error("原稿ファイル（.txt または .docx）を選んでください。")
+                    else:
+                        try:
+                            loaded = load_text_from_upload(next_script).strip()
+                            script = normalize_script_keeping_ruby(loaded)
+                            if not script:
+                                st.error("原稿が空でした。")
+                            else:
+                                # 同じ描画内で入力欄キーを触らない。
+                                # 次の描画の最初で取り込み＋動画準備を行う。
+                                schedule_script_reload(
+                                    script,
+                                    f"loop-{next_script.name}-{len(script)}",
+                                    advance_plain=True,
+                                    upload_filename=next_script.name,
+                                )
+                        except Exception as e:  # noqa: BLE001
+                            if is_widget_state_conflict_error(e):
+                                nuclear_reset_session_for_script_import()
+                                st.error(
+                                    "原稿の取り込みに失敗しました（画面の古い記憶が残っていました）。"
+                                    "左の「画面をリセット」を押すか、"
+                                    "アドレスを http://localhost:8501/?reset=1 にして開き直してください。"
+                                )
+                            else:
+                                st.error(f"原稿の取り込みに失敗しました: {e}")
         elif st.session_state.mp4_bytes:
             st.download_button(
                 label="MP4をダウンロード",
@@ -5037,5 +4716,297 @@ def main() -> None:
             st.video(st.session_state.mp4_bytes)
 
 
+def _self_test_background_hints() -> None:
+    """<> / 〈〉 背景ヒントの除去・テーマ判定（開発用）。"""
+    samples = [
+        ("<>", ""),
+        ("<ER>救急室", "救急室"),
+        ("＜病棟＞", ""),
+        ("<あ＞い", "い"),
+        ("＜あ>う", "う"),
+        ("〈手術室〉", ""),
+        ("〈手術室〉執刀", "執刀"),
+        ("‹外来›", ""),
+        ("《病棟》回診", "回診"),
+        ("[注]<ER>テスト", "[注]テスト"),
+        ("〈手術室", ""),  # 閉じ忘れ
+        ("手術室〉執刀", "執刀"),  # 開き忘れ
+        ("〈\n救急外来\n〉患者", "患者"),  # 改行またぎ
+        ("«病棟»回診", "回診"),
+    ]
+    for raw, expected in samples:
+        got = strip_background_hint_segments(raw)
+        assert got == expected, f"strip: {raw!r} -> {got!r}, want {expected!r}"
+    assert extract_background_hints("<ER><病棟>") == ["ER", "病棟"]
+    assert extract_background_hints("〈ER〉〈病棟〉") == ["ER", "病棟"]
+    assert extract_background_hints("〈\n救急外来\n〉") == ["救急外来"]
+    assert infer_theme_from_background_hint("ER") == "er"
+    assert infer_theme_from_background_hint("救急外来") == "er"
+
+    script = (
+        "〈救急外来〉\n"
+        "患者が運ばれてきた。[緊急]\n"
+        "〈手術室〉\n"
+        "執刀が始まった。\n"
+        "執刀〈病棟〉\n"
+        "回診を始めた。\n"
+    )
+    segs = plan_narration_segments(script)
+    assert len(segs) >= 3, segs
+    for seg in segs:
+        for ch in "<>＜＞〈〉‹›《》«»":
+            assert ch not in seg["text"], seg
+            assert ch not in seg["tts"], seg
+        # ヒントの中身そのものが字幕・音声になっていないこと
+        for hint_word in ("救急外来", "手術室"):
+            if seg.get("bg_hint") == hint_word:
+                assert seg["text"] != hint_word, seg
+                assert seg["tts"] != hint_word, seg
+    assert segs[0]["bg_hint"] == "救急外来", segs
+    assert segs[1]["bg_hint"] == "手術室", segs
+    assert any(s.get("bg_hint") == "病棟" for s in segs), segs
+
+    # 段落冒頭 〈〉 は、同じ段落の続き文でも背景を維持（台詞キーワードで上書きしない）
+    sticky_script = (
+        "〈手術室〉\n"
+        "患者は病棟で経過観察されていたが、急変した。"
+        "ベッドサイドで看護師が対応した。\n"
+    )
+    sticky_segs = plan_narration_segments(sticky_script)
+    assert len(sticky_segs) >= 2, sticky_segs
+    assert all(s.get("bg_hint") == "手術室" for s in sticky_segs), sticky_segs
+    sticky_cues = []
+    t_sticky = 0.0
+    for seg in sticky_segs:
+        sticky_cues.append(
+            {
+                "start": t_sticky,
+                "end": t_sticky + 12.0,
+                "text": seg["text"],
+                "bg_hint": seg.get("bg_hint", ""),
+            }
+        )
+        t_sticky += 12.0
+    sticky_schedule = plan_scene_schedule(
+        sticky_script, total_duration=t_sticky, subtitle_cues=sticky_cues
+    )
+    sticky_themes = [item["theme"] for item in sticky_schedule]
+    assert sticky_themes, sticky_themes
+    assert all(th == "surgery" for th in sticky_themes), sticky_themes
+    assert infer_theme_from_background_hint("手術室の中") == "surgery"
+    assert infer_theme_from_background_hint("会議室") == "consult"
+
+    # 自由文ヒント → custom_backgrounds の同名画像を使う
+    ensure_custom_background_dir()
+    free_hint = "夜の暗い手術室"
+    free_img = CUSTOM_BG_DIR / f"{free_hint}.jpg"
+    Image.new("RGB", (64, 36), (10, 20, 30)).save(free_img, format="JPEG")
+    wrapped_img = CUSTOM_BG_DIR / f"〈別ヒント〉.png"
+    Image.new("RGB", (64, 36), (40, 50, 60)).save(wrapped_img, format="PNG")
+    nfd_name = unicodedata.normalize("NFD", "救急の廊下")
+    nfd_img = CUSTOM_BG_DIR / f"{nfd_name}.jpg"
+    Image.new("RGB", (64, 36), (70, 80, 90)).save(nfd_img, format="JPEG")
+    try:
+        found = find_custom_background_image(free_hint)
+        assert found is not None and found.resolve() == free_img.resolve(), found
+        # ファイル名に 〈〉 が付いていても中身で一致
+        assert find_custom_background_image("別ヒント") is not None
+        # macOS 風 NFD ファイル名でも NFC ヒントで見つかる
+        assert find_custom_background_image("救急の廊下") is not None
+        free_script = f"〈{free_hint}〉\n執刀が始まった。\n"
+        free_segs = plan_narration_segments(free_script)
+        assert free_segs and free_segs[0]["bg_hint"] == free_hint, free_segs
+        free_cues = [
+            {
+                "start": 0.0,
+                "end": 8.0,
+                "text": free_segs[0]["text"],
+                "bg_hint": free_segs[0].get("bg_hint", ""),
+            }
+        ]
+        free_schedule = plan_scene_schedule(
+            free_script, total_duration=8.0, subtitle_cues=free_cues
+        )
+        assert free_schedule, free_schedule
+        assert free_schedule[0].get("bg_hint") == free_hint, free_schedule
+        assert Path(str(free_schedule[0].get("custom_image") or "")).is_file()
+        diag = diagnose_custom_backgrounds([free_hint, "存在しない背景"])
+        assert "夜の暗い手術室" in diag and "存在しない背景" in diag
+    finally:
+        for p in (free_img, wrapped_img, nfd_img):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # 最終版作成前: 不足している背景ファイル名を明示できる
+    miss_script = "〈不足テスト風景A〉患者が来た。〈不足テスト風景B〉検査した。"
+    missing_items = find_missing_custom_backgrounds(script=miss_script)
+    miss_names = {m["hint"] for m in missing_items}
+    assert "不足テスト風景A" in miss_names and "不足テスト風景B" in miss_names
+    assert all(m["expected_file"].endswith(".png") for m in missing_items)
+    msg = format_missing_custom_backgrounds_message(missing_items)
+    assert "不足テスト風景A.png" in msg
+    assert "不足テスト風景B.png" in msg
+
+    # 改行をまたぐ山括弧でも、中身は字幕にも音声にも出ない
+    multiline = "〈\n救急外来\n〉\n患者が来た。"
+    ml_segs = plan_narration_segments(multiline)
+    assert ml_segs, ml_segs
+    assert ml_segs[0]["bg_hint"] == "救急外来", ml_segs
+    assert "救急外来" not in ml_segs[0]["text"], ml_segs
+    assert "救急外来" not in ml_segs[0]["tts"], ml_segs
+    assert "患者が来た" in ml_segs[0]["text"], ml_segs
+
+    # 半角・全角・混在の山括弧はすべて同等
+    for raw in (
+        "<手術室>執刀",
+        "＜手術室＞執刀",
+        "<手術室＞執刀",
+        "＜手術室>執刀",
+        "〈手術室〉執刀",
+        "‹手術室›執刀",
+    ):
+        mixed = plan_narration_segments(raw)
+        assert mixed and mixed[0]["bg_hint"] == "手術室", (raw, mixed)
+        assert "手術室" not in mixed[0]["text"], (raw, mixed)
+        assert "執刀" in mixed[0]["text"], (raw, mixed)
+
+    cues = []
+    t = 0.0
+    for seg in segs:
+        cues.append(
+            {
+                "start": t,
+                "end": t + 10.0,
+                "text": seg["text"],
+                "tts": seg["tts"],
+                "bg_hint": seg.get("bg_hint", ""),
+            }
+        )
+        t += 10.0
+    schedule = plan_scene_schedule(script, total_duration=t, subtitle_cues=cues)
+    themes = [item["theme"] for item in schedule]
+    assert themes[0] == "er", themes
+    assert "surgery" in themes, themes
+    assert "ward" in themes, themes
+
+    # 台本そのものから 〈〉 / ルビを消していないこと、
+    # 字幕には出さず・読み上げは読みだけ
+    ruby_script = (
+        "〈救急外来〉\n"
+        "｛心不全｜しんふぜん｝が進行した。\n"
+    )
+    assert "〈救急外来〉" in ruby_script
+    assert "しんふぜん" in ruby_script
+    events = parse_script_background_events(ruby_script)
+    assert any(k == "hint" and p == "救急外来" for k, p, _ in events)
+    assert any(k == "text" and ("心不全" in p) for k, p, _ in events)
+    ruby_segs = plan_narration_segments(ruby_script)
+    assert ruby_segs, ruby_segs
+    assert ruby_segs[0]["bg_hint"] == "救急外来"
+    assert "心不全" in ruby_segs[0]["text"]
+    assert "{" not in ruby_segs[0]["text"] and "｛" not in ruby_segs[0]["text"]
+    assert "〈" not in ruby_segs[0]["text"] and "〈" not in ruby_segs[0]["tts"]
+    assert "救急外来" not in ruby_segs[0]["text"]
+    assert "救急外来" not in ruby_segs[0]["tts"]
+    assert "しんふぜん" in ruby_segs[0]["tts"]
+    assert "心不全" not in ruby_segs[0]["tts"]
+
+    half = voicevox_tts_from_ruby_text("患者{心不全|しんふぜん}が来た。")
+    sub_half = strip_voicevox_ruby("患者{心不全|しんふぜん}が来た。")
+    assert sub_half == "患者心不全が来た。"
+    assert half == "患者しんふぜんが来た。"
+    full = voicevox_tts_from_ruby_text("患者｛心不全｜しんふぜん｝が来た。")
+    assert full == "患者しんふぜんが来た。"
+
+    # 大かっこ [] / ［］ : 字幕は中身だけ（かっこなし）、VOICEVOX には送らない
+    for raw, want_sub, want_tts in (
+        ("患者が来た。[緊急]", "患者が来た。緊急", "患者が来た。"),
+        ("患者が来た。［緊急］", "患者が来た。緊急", "患者が来た。"),
+        ("患者が来た。[緊急］", "患者が来た。緊急", "患者が来た。"),
+        ("患者が来た。［緊急]", "患者が来た。緊急", "患者が来た。"),
+        ("前置き[注]本文。", "前置き注本文。", "前置き本文。"),
+    ):
+        br_segs = plan_narration_segments(raw)
+        assert br_segs, raw
+        assert br_segs[0]["text"] == want_sub, (raw, br_segs)
+        assert br_segs[0]["tts"] == want_tts, (raw, br_segs)
+        for ch in "[]［］":
+            assert ch not in br_segs[0]["text"], (raw, br_segs)
+            assert ch not in br_segs[0]["tts"], (raw, br_segs)
+    assert strip_square_bracket_segments("a[注]b［注2］c") == "abc"
+    assert keep_square_bracket_inners_for_subtitle("a[注]b［注2］c") == "a注b注2c"
+
+
+def _smoke_check() -> None:
+    """
+    起動前の簡易スモークテスト（VOICEVOX / ドラフトMP4）。
+    VOICEVOX 未接続時も MP4 エンコード部分は無音 WAV で試す。
+    """
+    print(f"APP_BUILD={APP_BUILD}")
+    ok, ver = check_voicevox()
+    with tempfile.TemporaryDirectory(prefix="smoke_") as tmp:
+        tmp_path = Path(tmp)
+        wav_path = tmp_path / "narration.wav"
+        dur = 1.5
+
+        if ok:
+            print(f"VOICEVOX: OK ({ver})")
+            script = "これはスモークテストです。短い読み上げを確認します。"
+            print("TTS: generating short narration…")
+            generate_narration_wav_to_file(
+                script,
+                wav_path,
+                speaker=DEFAULT_SPEAKER_ID,
+                speed_scale=VOICEVOX_SPEED_SCALE,
+            )
+            import wave as _wave
+
+            with _wave.open(str(wav_path), "rb") as wf:
+                dur = wf.getnframes() / float(wf.getframerate())
+            print(f"TTS: OK ({dur:.2f}s)")
+        else:
+            print(f"VOICEVOX: 未接続 ({ver})")
+            print("SKIP: TTS smoke test")
+            make_silent_wav(wav_path, duration_sec=dur)
+
+        frame_path = tmp_path / "scene.png"
+        create_plain_scene_frame(frame_path)
+        out_mp4 = tmp_path / "smoke_draft.mp4"
+        print("MP4: encoding draft…")
+        build_mp4(wav_path, [(frame_path, dur)], out_mp4, subtitle_cues=[])
+        size_kb = out_mp4.stat().st_size / 1024
+        print(f"MP4: OK ({size_kb:.1f} KB) -> {out_mp4}")
+    print("OK: smoke check passed")
+
+
+def _run_all_tests() -> None:
+    """unittest 一式を実行（--test-all 用）。"""
+    import unittest
+
+    tests_dir = Path(__file__).resolve().parent / "tests"
+    if not tests_dir.is_dir():
+        raise SystemExit(f"tests フォルダがありません: {tests_dir}")
+    suite = unittest.defaultTestLoader.discover(str(tests_dir), pattern="test_*.py")
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if not result.wasSuccessful():
+        raise SystemExit(1)
+    print("OK: all tests passed")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--test-bg-hints":
+        _self_test_background_hints()
+        print("OK: background hint tests passed")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--smoke-check":
+        _smoke_check()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test-all":
+        _self_test_background_hints()
+        print("OK: background hint tests passed")
+        _run_all_tests()
+        _smoke_check()
+    else:
+        main()
