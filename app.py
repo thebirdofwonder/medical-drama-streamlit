@@ -235,7 +235,7 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260825a"
+APP_BUILD = "ui-slim-20260825b"
 # 台本アップロードの最大サイズ（DoS / メモリ枯渇防止）
 MAX_SCRIPT_UPLOAD_BYTES = 20 * 1024 * 1024
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
@@ -576,6 +576,8 @@ def run_deferred_script_actions() -> None:
         # ファイル取り込みなら、その日時を台本バージョンとして記録
         if "upload_filename" in payload:
             record_script_upload_meta(str(payload.get("upload_filename") or ""))
+        elif payload.get("advance_plain"):
+            record_script_upload_meta("手入力・編集確定")
         citation = payload.get("citation")
         if citation:
             apply_paper_reference_to_session(str(citation))
@@ -984,16 +986,27 @@ def create_export_progress_widgets(
 # ---------------------------------------------------------------------------
 def voicevox_howto_start() -> str:
     """VOICEVOX が起動していないときの、初心者向け手順。"""
-    return (
-        "【やること】\n"
-        "1. Mac の「アプリケーション」または Dock から **VOICEVOX** を起動する"
+    mac_steps = (
+        "【Mac の場合】\n"
+        "1. 「アプリケーション」または Dock から **VOICEVOX** を起動する"
         "（この Streamlit 画面とは別のアプリです）\n"
         "2. VOICEVOX のウィンドウが開くまで待つ\n"
+    )
+    linux_steps = (
+        "【Linux / Cursor Cloud の場合】\n"
+        "1. Docker を起動する\n"
+        "2. ターミナルで次を実行:\n"
+        "   sudo docker run -d --rm --name voicevox "
+        "-p 50021:50021 voicevox/voicevox_engine:cpu-latest\n"
+        "3. 10秒ほど待つ\n"
+    )
+    common = (
         "3. このブラウザ画面を再読み込みする（サイドバーに"
         "「VOICEVOX OK」と出れば成功）\n"
         "4. もう一度「動画を作成」を押す\n"
         f"（接続先: {VOICEVOX_URL}）"
     )
+    return mac_steps + linux_steps + common
 
 
 def check_voicevox() -> tuple[bool, str]:
@@ -1401,6 +1414,23 @@ def concat_wav_files(wav_paths: list[Path], out_path: Path, pause_ms: int = 350)
                     silence = b"\x00" * n * params.nchannels * params.sampwidth
                     out_w.writeframes(silence)
     return out_path
+
+
+def make_silent_wav(
+    path: Path,
+    duration_sec: float = 1.0,
+    rate: int = 24000,
+) -> Path:
+    """テスト・スモーク用の無音 WAV を作る。"""
+    duration_sec = max(0.05, float(duration_sec))
+    n = int(rate * duration_sec)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00" * n * 2)
+    return path
 
 
 def prepend_silence_to_wav(wav_path: Path, silence_sec: float) -> Path:
@@ -4071,12 +4101,20 @@ def main() -> None:
         try:
             run_video_export(progress, pct_box, status)
         except Exception as e:  # noqa: BLE001
+            import traceback
+
             st.session_state.mp4_path = ""
             st.session_state.mp4_bytes = None
             st.session_state.video_encoding = False
             st.session_state._export_job = None
             st.error(f"動画生成に失敗しました: {e}")
-            st.exception(e)
+            try:
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                err_path = OUTPUT_DIR / "last_export_error.txt"
+                err_path.write_text(traceback.format_exc(), encoding="utf-8")
+                st.caption(f"技術的な詳細は `{err_path}` に保存しました。")
+            except OSError:
+                pass
             st.stop()
         st.session_state.video_encoding = False
         st.session_state._export_job = None
@@ -4904,32 +4942,34 @@ def _self_test_background_hints() -> None:
 def _smoke_check() -> None:
     """
     起動前の簡易スモークテスト（VOICEVOX / ドラフトMP4）。
-    VOICEVOX 未接続時は接続チェックのみで終了コード 0。
+    VOICEVOX 未接続時も MP4 エンコード部分は無音 WAV で試す。
     """
     print(f"APP_BUILD={APP_BUILD}")
     ok, ver = check_voicevox()
-    if not ok:
-        print(f"VOICEVOX: 未接続 ({ver})")
-        print("SKIP: draft MP4 smoke test (VOICEVOX required)")
-        return
-
-    print(f"VOICEVOX: OK ({ver})")
-    script = "これはスモークテストです。短い読み上げを確認します。"
     with tempfile.TemporaryDirectory(prefix="smoke_") as tmp:
         tmp_path = Path(tmp)
         wav_path = tmp_path / "narration.wav"
-        print("TTS: generating short narration…")
-        generate_narration_wav_to_file(
-            script,
-            wav_path,
-            speaker=DEFAULT_SPEAKER_ID,
-            speed_scale=VOICEVOX_SPEED_SCALE,
-        )
-        import wave as _wave
+        dur = 1.5
 
-        with _wave.open(str(wav_path), "rb") as wf:
-            dur = wf.getnframes() / float(wf.getframerate())
-        print(f"TTS: OK ({dur:.2f}s)")
+        if ok:
+            print(f"VOICEVOX: OK ({ver})")
+            script = "これはスモークテストです。短い読み上げを確認します。"
+            print("TTS: generating short narration…")
+            generate_narration_wav_to_file(
+                script,
+                wav_path,
+                speaker=DEFAULT_SPEAKER_ID,
+                speed_scale=VOICEVOX_SPEED_SCALE,
+            )
+            import wave as _wave
+
+            with _wave.open(str(wav_path), "rb") as wf:
+                dur = wf.getnframes() / float(wf.getframerate())
+            print(f"TTS: OK ({dur:.2f}s)")
+        else:
+            print(f"VOICEVOX: 未接続 ({ver})")
+            print("SKIP: TTS smoke test")
+            make_silent_wav(wav_path, duration_sec=dur)
 
         frame_path = tmp_path / "scene.png"
         create_plain_scene_frame(frame_path)
@@ -4941,6 +4981,20 @@ def _smoke_check() -> None:
     print("OK: smoke check passed")
 
 
+def _run_all_tests() -> None:
+    """unittest 一式を実行（--test-all 用）。"""
+    import unittest
+
+    tests_dir = Path(__file__).resolve().parent / "tests"
+    if not tests_dir.is_dir():
+        raise SystemExit(f"tests フォルダがありません: {tests_dir}")
+    suite = unittest.defaultTestLoader.discover(str(tests_dir), pattern="test_*.py")
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if not result.wasSuccessful():
+        raise SystemExit(1)
+    print("OK: all tests passed")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -4948,6 +5002,11 @@ if __name__ == "__main__":
         _self_test_background_hints()
         print("OK: background hint tests passed")
     elif len(sys.argv) > 1 and sys.argv[1] == "--smoke-check":
+        _smoke_check()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test-all":
+        _self_test_background_hints()
+        print("OK: background hint tests passed")
+        _run_all_tests()
         _smoke_check()
     else:
         main()
