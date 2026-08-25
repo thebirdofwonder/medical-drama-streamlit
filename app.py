@@ -5,6 +5,7 @@ Streamlit アプリ（macOS / Apple Silicon 向け）
 
 from __future__ import annotations
 
+import html
 import io
 import json
 import math
@@ -13,6 +14,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unicodedata
 import wave
@@ -233,7 +235,9 @@ MAX_VOICEVOX_CHARS = 90
 SUBTITLE_VIDEO_FPS = 8
 DEFAULT_FOOTNOTE = ""
 # 画面左で確認できる修正版番号（これが出ていれば最新）
-APP_BUILD = "ui-slim-20260822a"
+APP_BUILD = "ui-slim-20260825a"
+# 台本アップロードの最大サイズ（DoS / メモリ枯渇防止）
+MAX_SCRIPT_UPLOAD_BYTES = 20 * 1024 * 1024
 # 入力欄キー（過去の final_script_editor_widget / raw_script_box とは別名にして衝突を断つ）
 EDITOR_BASE_RAW = "ta_src_a"
 EDITOR_BASE_FINAL = "ta_src_b"
@@ -861,6 +865,18 @@ def record_script_upload_meta(filename: str = "") -> None:
     st.session_state.script_upload_filename = str(filename or "").strip()
 
 
+def assert_script_upload_size(raw: bytes, filename: str = "") -> None:
+    """台本ファイルが大きすぎる場合は例外を出す。"""
+    size = len(raw or b"")
+    if size > MAX_SCRIPT_UPLOAD_BYTES:
+        mb = MAX_SCRIPT_UPLOAD_BYTES / (1024 * 1024)
+        name = (filename or "ファイル").strip()
+        raise ValueError(
+            f"{name} が大きすぎます（{size / (1024 * 1024):.1f} MB）。"
+            f" {mb:.0f} MB 以下にしてください。"
+        )
+
+
 def format_script_version_label() -> str:
     """台本バージョン（アップロード日時）の表示文。"""
     raw = str(st.session_state.get("script_uploaded_at") or "").strip()
@@ -882,10 +898,11 @@ def format_script_version_label() -> str:
 
 def render_script_version_banner() -> None:
     """MP4作成直前などに、台本バージョンを目立たせて出す。"""
+    label = html.escape(format_script_version_label(), quote=True)
     st.markdown(
         f'<div style="font-size:1.15rem;font-weight:600;margin:0.4rem 0 0.6rem 0;'
         f'padding:0.55rem 0.75rem;background:#f3f4f6;border-radius:6px;color:#111;">'
-        f"{format_script_version_label()}</div>",
+        f"{label}</div>",
         unsafe_allow_html=True,
     )
 
@@ -2183,6 +2200,7 @@ def load_text_from_upload(uploaded_file) -> str:
     )
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
+    assert_script_upload_size(raw, name)
     lower = name.lower()
     if not (
         lower.endswith(".txt")
@@ -3017,7 +3035,13 @@ def create_scene_frame(
     w, h = VIDEO_SIZE
     if landscape_path is not None and Path(landscape_path).exists():
         try:
-            photo = Image.open(landscape_path).convert("RGB")
+            # 巨大画像によるメモリ枯渇を防ぐ（約 4000x4000 相当）
+            prev_limit = Image.MAX_IMAGE_PIXELS
+            Image.MAX_IMAGE_PIXELS = 16_000_000
+            try:
+                photo = Image.open(landscape_path).convert("RGB")
+            finally:
+                Image.MAX_IMAGE_PIXELS = prev_limit
             base = fit_image_cover(photo, VIDEO_SIZE).convert("RGBA")
         except Exception:
             base = make_fallback_landscape(landscape_index).convert("RGBA")
@@ -3117,21 +3141,32 @@ def ensure_done_chime_wav() -> Path:
 def play_done_chime() -> None:
     """
     MP4完成を知らせる『ポーン』音を鳴らす。
-    このアプリは同じMac上で動かす想定なので、macOSの afplay を使う。
+    macOS は afplay、Linux では aplay / ffplay を試す。
     """
     try:
         wav = ensure_done_chime_wav()
     except Exception:
         return
-    try:
-        subprocess.Popen(
-            ["afplay", str(wav)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    play_cmds: list[list[str]] = []
+    if sys.platform == "darwin":
+        play_cmds.append(["afplay", str(wav)])
+    else:
+        play_cmds.extend(
+            [
+                ["aplay", "-q", str(wav)],
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(wav)],
+            ]
         )
-    except Exception:
-        # 音が出せなくても動画作成自体は成功扱い
-        pass
+    for cmd in play_cmds:
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except Exception:
+            continue
 
 
 def create_background_image(
@@ -3356,19 +3391,24 @@ def build_mp4(
 
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
     tried_errors: list[str] = []
-    encode_attempts = [
-        {
-            "codec": "h264_videotoolbox",
-            "audio_codec": "aac",
-            "ffmpeg_params": ["-b:v", "3M", "-pix_fmt", "yuv420p"],
-        },
+    encode_attempts: list[dict[str, Any]] = []
+    # Apple Silicon / macOS 専用。Linux では最初から libx264 を使う。
+    if sys.platform == "darwin":
+        encode_attempts.append(
+            {
+                "codec": "h264_videotoolbox",
+                "audio_codec": "aac",
+                "ffmpeg_params": ["-b:v", "3M", "-pix_fmt", "yuv420p"],
+            }
+        )
+    encode_attempts.append(
         {
             "codec": "libx264",
             "audio_codec": "aac",
             "preset": "ultrafast",
             "ffmpeg_params": ["-pix_fmt", "yuv420p", "-tune", "stillimage"],
-        },
-    ]
+        }
+    )
 
     last_err: Exception | None = None
     encode_logger = None
@@ -3680,10 +3720,13 @@ def run_video_export(progress, pct_box, status) -> None:
         )
         # 同期確認は無音を足す前（朗読と字幕の対応を検査）
         sync_issues = validate_audio_subtitle_sync(wav_path, subtitle_cues)
-        if sync_issues:
+        blocking_sync = [
+            m for m in sync_issues if not str(m).startswith("注意:")
+        ]
+        if blocking_sync:
             raise RuntimeError(
                 "音声と字幕の同期チェックに失敗しました:\n"
-                + "\n".join(f"- {m}" for m in sync_issues)
+                + "\n".join(f"- {m}" for m in blocking_sync)
             )
 
         # 冒頭に無音を入れ、字幕も同じ秒数だけ後ろへずらす
@@ -3985,14 +4028,7 @@ def main() -> None:
     if st.session_state.get("video_encoding"):
         st.write("医学ドラマ動画メーカー")
         st.warning("動画作成中です。完了するまでこのページを閉じないでください。")
-        # 作成に入ったら、毎回必ず台本バージョンと進捗バー／％を出す
         render_script_version_banner()
-        progress, pct_box, status = create_export_progress_widgets(
-            initial_pct=int(st.session_state.get("export_progress_pct") or 0),
-            initial_msg=str(
-                st.session_state.get("export_progress_msg") or "準備中…"
-            ),
-        )
         if st.button("中止して通常画面に戻る", key="btn_cancel_video_encoding"):
             st.session_state.video_encoding = False
             st.session_state._export_job = None
@@ -4003,13 +4039,6 @@ def main() -> None:
         # 再開／中止を選ばせる（進捗バーが消えないようにする）
         if job != "pending":
             st.error("前回の作成が中断されたか、作成モードのまま残っています。")
-            update_export_progress(
-                progress,
-                pct_box,
-                status,
-                int(st.session_state.get("export_progress_pct") or 0),
-                "中断中 — 下のボタンで再開または中止",
-            )
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button(
@@ -4024,13 +4053,21 @@ def main() -> None:
                     st.session_state.video_encoding = False
                     st.session_state._export_job = None
                     st.rerun()
+            # 進捗バー／％は画面の一番下に出す
+            create_export_progress_widgets(
+                initial_pct=int(st.session_state.get("export_progress_pct") or 0),
+                initial_msg="中断中 — 下のボタンで再開または中止",
+            )
             st.stop()
 
-        # pending → 書き出し開始（進捗バーは上で作成済み）
+        # pending → 書き出し開始（進捗バーは画面下に出してからエンコード）
         st.session_state._export_job = "running"
         st.session_state.export_progress_pct = 0
         st.session_state.export_progress_msg = "準備中…"
-        update_export_progress(progress, pct_box, status, 0, "準備中…")
+        progress, pct_box, status = create_export_progress_widgets(
+            initial_pct=0,
+            initial_msg="準備中…",
+        )
         try:
             run_video_export(progress, pct_box, status)
         except Exception as e:  # noqa: BLE001
@@ -4097,6 +4134,7 @@ def main() -> None:
             try:
                 with st.spinner("台本を読み取っています…"):
                     raw = script_upload.getvalue()
+                    assert_script_upload_size(raw, script_upload.name)
                     script = extract_text_from_bytes(
                         script_upload.name, raw
                     ).strip()
@@ -4128,7 +4166,7 @@ def main() -> None:
             " 背景: 事前作成した jpg/png を `custom_backgrounds` に置き、"
             " ファイル名を `〈〉` 内の文字と同一にする。"
             " 大かっこ: `[注釈]` → 字幕は中身だけ（かっこは出さない）、VOICEVOX は読まない。"
-            " 修正版 `ui-slim-20260822a`。"
+            f" 修正版 `{APP_BUILD}`。"
             " 背景は **最終版（背景あり）** で作り直してください。"
         )
         raw_key = ensure_editor_value(
@@ -4863,11 +4901,53 @@ def _self_test_background_hints() -> None:
     assert keep_square_bracket_inners_for_subtitle("a[注]b［注2］c") == "a注b注2c"
 
 
+def _smoke_check() -> None:
+    """
+    起動前の簡易スモークテスト（VOICEVOX / ドラフトMP4）。
+    VOICEVOX 未接続時は接続チェックのみで終了コード 0。
+    """
+    print(f"APP_BUILD={APP_BUILD}")
+    ok, ver = check_voicevox()
+    if not ok:
+        print(f"VOICEVOX: 未接続 ({ver})")
+        print("SKIP: draft MP4 smoke test (VOICEVOX required)")
+        return
+
+    print(f"VOICEVOX: OK ({ver})")
+    script = "これはスモークテストです。短い読み上げを確認します。"
+    with tempfile.TemporaryDirectory(prefix="smoke_") as tmp:
+        tmp_path = Path(tmp)
+        wav_path = tmp_path / "narration.wav"
+        print("TTS: generating short narration…")
+        generate_narration_wav_to_file(
+            script,
+            wav_path,
+            speaker=DEFAULT_SPEAKER_ID,
+            speed_scale=VOICEVOX_SPEED_SCALE,
+        )
+        import wave as _wave
+
+        with _wave.open(str(wav_path), "rb") as wf:
+            dur = wf.getnframes() / float(wf.getframerate())
+        print(f"TTS: OK ({dur:.2f}s)")
+
+        frame_path = tmp_path / "scene.png"
+        create_plain_scene_frame(frame_path)
+        out_mp4 = tmp_path / "smoke_draft.mp4"
+        print("MP4: encoding draft…")
+        build_mp4(wav_path, [(frame_path, dur)], out_mp4, subtitle_cues=[])
+        size_kb = out_mp4.stat().st_size / 1024
+        print(f"MP4: OK ({size_kb:.1f} KB) -> {out_mp4}")
+    print("OK: smoke check passed")
+
+
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "--test-bg-hints":
         _self_test_background_hints()
         print("OK: background hint tests passed")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--smoke-check":
+        _smoke_check()
     else:
         main()
